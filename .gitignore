@@ -1,0 +1,12 @@
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Logs
+*.log
+
+# PHP
+/.phpunit.result.cache
+/vendor/
