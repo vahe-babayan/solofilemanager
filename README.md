@@ -2,12 +2,14 @@
 
 **SoloFM** is a single-file PHP file manager for small self-hosted setups (XAMPP, shared hosting, VPS, etc.). Drop one PHP file into a directory and manage files from the browser.
 
+Current version: **1.0.1**
+
 ## Quick start
 
 1. Copy `solofm.php` into the directory you want to manage (or into a web-accessible folder pointing at your target root).
 2. Open it in the browser, e.g. `http://localhost/solofm.php`
-3. On first run, SoloFM asks you to **rename** the file to a random 30–40 character name (security / obscurity).
-4. Log in with the default password **`admin`**, then immediately change `$PASSWORD_HASH` at the top of the script.
+3. On first run, SoloFM asks you to **rename** the file. You can pick a pure random name (harder to find) or a `solofm_`-prefixed name (easier to spot in the folder).
+4. Log in with the default password **`admin`**. SoloFM then asks you to **set a new password** (new + confirm only — no need to retype `admin`). It tries to update `$PASSWORD_HASH` in the same PHP file; if the file is not writable, it shows a hash to paste manually.
 
 ### Requirements
 
@@ -47,7 +49,7 @@
 - Upload, download, get info, copy paths
 - Configuration popup (columns, permissions display, folder-size behavior)
 - Keyboard shortcuts, server info
-- Optional terminal-here (disabled by default — enable only on trusted hosts)
+- Optional terminal-here (disabled by default — open the terminal icon for Terminal settings: Standard / Manual / Advanced, password to save; or edit the `$FM_ENABLE_TERMINAL_*` flags; trusted hosts only)
 
 ## Configuration
 
@@ -56,23 +58,26 @@ Edit the config block at the top of `solofm.php`:
 | Setting | Purpose |
 |---------|---------|
 | `$ROOT_DIR` | Root path users may browse (default: script directory) |
-| `$ENABLE_AUTH` / `$PASSWORD_HASH` | Session login (keep auth on) |
-| `$FM_FILE_OPS_MODE` | `'auto'`, `'php'`, or `'os'` for heavy file operations |
+| `$ENABLE_AUTH` / `$PASSWORD_HASH` | Session login (keep auth on). Prefer changing the password in the UI (key icon); manual hash paste is the fallback |
+| `$FM_FILE_OPS_MODE` | `'auto'`, `'php'`, or `'os'` for heavy file operations. Prefer changing from **Configuration** (password to save); file edit is the fallback |
 | `$FM_VERBOSE_PROGRESS_MIN_ITEMS` | When to show detailed progress for large jobs |
 | `$FM_TRASH_BASENAME` | Hidden recycle folder under root (default `.trash`) |
-| `$FM_ENABLE_TERMINAL_*` | Terminal features (all **false** by default) |
+| `$FM_ENABLE_TERMINAL_HERE` | Standard terminal-here (**false** by default). Prefer Terminal settings from the terminal icon (password); or set `true` in the file on trusted hosts only |
+| `$FM_ENABLE_TERMINAL_MANUAL` / `$FM_ENABLE_TERMINAL_ADVANCED` | Manual / advanced modes (**false** by default). Same Terminal settings UI (gear in the terminal popup), or edit the file |
 
-Generate a new password hash with:
+Manual password-hash recovery (only if the in-app update cannot write the file):
 
 ```php
 echo password_hash('your-strong-password', PASSWORD_DEFAULT);
 ```
 
+Paste the result into `$PASSWORD_HASH` near the top of the script.
+
 ## Security
 
 SoloFM can create, rename, and delete files. Treat it as **high risk** if exposed on the public internet.
 
-- Keep `$ENABLE_AUTH = true` and set your own `$PASSWORD_HASH`
+- Keep `$ENABLE_AUTH = true` and change the default `admin` password on first login
 - Do not rely on the random filename alone
 - Prefer HTTPS, IP allowlists, and/or HTTP Basic Auth at the web server
 

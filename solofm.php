@@ -7,6 +7,9 @@ declare(strict_types=1);
  * Built from the SoloFM development sources; do not edit by hand unless necessary.
  */
 
+/** Product version (semver). Shown in UI / server info. */
+const SOLOFM_VERSION = '1.0.1';
+
 // Set max execution time to 1 day (86400 seconds)
 @set_time_limit(86400);
 
@@ -27,9 +30,9 @@ $DEFAULT_FILENAME = 'solofm.php';
 // Auth (recommended). Set to false to rely on unique filename only (not recommended).
 $ENABLE_AUTH = true;
 
-// Set a password hash (generate via password_hash('yourPass', PASSWORD_DEFAULT)).
-// Default password is: admin (CHANGE IT)
-// password_hash('admin', PASSWORD_DEFAULT)
+// Password hash for login. Prefer changing via the in-app "Change password" UI after setup.
+// Default password is: admin (you will be asked to change it). Manual fallback:
+//   password_hash('your-strong-password', PASSWORD_DEFAULT) → paste into $PASSWORD_HASH below.
 $PASSWORD_HASH = '$2y$10$gfAs1ZRrZH6GElppZp3UV.Zt8N7R.KnGFJ0X02Ow6ZhMNtGihJvlK';
 
 // Folder tree depth (avoid excessive recursion).
@@ -39,7 +42,7 @@ $MAX_TREE_DEPTH = 12;
 $EXCLUDE_NAMES = [
     '.', '..',
     'solofm.php',
-    'README.md', 'SECURITY.md', 'CONTRIBUTING.md', '.gitignore', 'LICENSE',
+    'README.md', 'SECURITY.md', '.gitignore', 'LICENSE',
 ];
 
 /**
@@ -50,6 +53,7 @@ $EXCLUDE_NAMES = [
  * - 'os': OS only when exec() is available; no PHP fallback. If exec() is disabled, these actions error.
  *
  * Aliases for 'os': 'shell'
+ * Can also be changed from Configuration in the UI (password) when the script file is writable.
  */
 $FM_FILE_OPS_MODE = 'auto';
 
@@ -63,13 +67,16 @@ $FM_VERBOSE_PROGRESS_MIN_ITEMS = 800;
 /** Hidden trash folder under root (mirror layout: ROOT/rel -> ROOT/.trash/rel). */
 $FM_TRASH_BASENAME = '.trash';
 
-/** Developer feature: run a small allowlist of shell commands in a folder. HIGH RISK; disable on untrusted hosts. */
+/**
+ * Terminal-here (standard): allowlisted shell commands in a folder.
+ * Toggle from Terminal settings in the UI (password) when the script file is writable; trusted hosts only.
+ */
 $FM_ENABLE_TERMINAL_HERE = false;
-/** Allow typed commands through a strict safe parser (still restricted to vetted commands only). */
+/** Manual mode: typed commands through a strict safe parser. Also settable from Terminal settings. */
 $FM_ENABLE_TERMINAL_MANUAL = false;
 /**
- * Advanced terminal mode: allow raw user commands.
- * DANGEROUS: enable only on trusted/private environments.
+ * Advanced terminal mode: raw user commands.
+ * Also settable from Terminal settings — use only on trusted/private environments.
  */
 $FM_ENABLE_TERMINAL_ADVANCED = false;
 
@@ -663,6 +670,361 @@ function isAuthed(bool $enableAuth): bool {
 }
 
 /**
+ * True when the configured hash still matches the shipped default password "admin".
+ */
+function fmPasswordIsDefault(string $passwordHash): bool {
+    return $passwordHash !== '' && password_verify('admin', $passwordHash);
+}
+
+/**
+ * Atomically replace this script's file contents.
+ *
+ * @return array{ok:bool, reason?:string}
+ */
+function fmWriteScriptContents(string $newSrc): array {
+    $path = __FILE__;
+    if (!is_writable($path)) {
+        return ['ok' => false, 'reason' => 'not_writable'];
+    }
+    $dir = dirname($path);
+    $tmp = $dir . DIRECTORY_SEPARATOR . '.solofm-write-' . bin2hex(random_bytes(8)) . '.tmp';
+    if (@file_put_contents($tmp, $newSrc, LOCK_EX) === false) {
+        return ['ok' => false, 'reason' => 'write_failed'];
+    }
+    $replaced = @rename($tmp, $path);
+    if (!$replaced) {
+        // Windows often cannot rename over an existing file.
+        if (@copy($tmp, $path)) {
+            @unlink($tmp);
+            return ['ok' => true];
+        }
+        @unlink($tmp);
+        return ['ok' => false, 'reason' => 'replace_failed'];
+    }
+    return ['ok' => true];
+}
+
+/**
+ * Read this script and apply a single preg_replace_callback edit, then write back.
+ *
+ * @param callable(array):string $replacer
+ * @return array{ok:bool, reason?:string}
+ */
+function fmEditScriptWithCallback(string $pattern, callable $replacer): array {
+    $path = __FILE__;
+    if (!is_readable($path)) {
+        return ['ok' => false, 'reason' => 'read_failed'];
+    }
+    if (!is_writable($path)) {
+        return ['ok' => false, 'reason' => 'not_writable'];
+    }
+    $src = @file_get_contents($path);
+    if ($src === false || $src === '') {
+        return ['ok' => false, 'reason' => 'read_failed'];
+    }
+    $count = 0;
+    $newSrc = preg_replace_callback($pattern, $replacer, $src, 1, $count);
+    if ($newSrc === null || $count !== 1) {
+        return ['ok' => false, 'reason' => 'pattern_failed'];
+    }
+    if ($newSrc === $src) {
+        return ['ok' => false, 'reason' => 'unchanged'];
+    }
+    return fmWriteScriptContents($newSrc);
+}
+
+/**
+ * Replace $PASSWORD_HASH = '...' in this script file.
+ *
+ * @return array{ok:bool, reason?:string}
+ */
+function fmWritePasswordHashToScript(string $newHash): array {
+    if ($newHash === '' || !preg_match('/^\$2[ayb]\$\d{2}\$[A-Za-z0-9\.\/]{53}$/', $newHash)) {
+        return ['ok' => false, 'reason' => 'invalid_hash'];
+    }
+    // Use a callback so bcrypt `$2y$10$...` is not treated as preg_replace backreferences.
+    return fmEditScriptWithCallback(
+        '/(\$PASSWORD_HASH\s*=\s*)([\'"])([^\'"]*)\2(\s*;)/',
+        static function (array $m) use ($newHash): string {
+            $escaped = str_replace(['\\', '\''], ['\\\\', '\\\''], $newHash);
+            return $m[1] . '\'' . $escaped . '\'' . $m[4];
+        }
+    );
+}
+
+/**
+ * Normalize terminal feature flags (Standard is master).
+ *
+ * @return array{here:bool,manual:bool,advanced:bool}
+ */
+function fmNormalizeTerminalFlags(bool $here, bool $manual, bool $advanced): array {
+    if ($manual || $advanced) {
+        $here = true;
+    }
+    if (!$here) {
+        $manual = false;
+        $advanced = false;
+    }
+    return ['here' => $here, 'manual' => $manual, 'advanced' => $advanced];
+}
+
+/**
+ * Set $FM_ENABLE_TERMINAL_HERE / MANUAL / ADVANCED in this script file.
+ *
+ * @return array{ok:bool, reason?:string}
+ */
+function fmWriteTerminalFlagsToScript(bool $here, bool $manual, bool $advanced): array {
+    $flags = fmNormalizeTerminalFlags($here, $manual, $advanced);
+    $path = __FILE__;
+    if (!is_readable($path)) {
+        return ['ok' => false, 'reason' => 'read_failed'];
+    }
+    if (!is_writable($path)) {
+        return ['ok' => false, 'reason' => 'not_writable'];
+    }
+    $src = @file_get_contents($path);
+    if ($src === false || $src === '') {
+        return ['ok' => false, 'reason' => 'read_failed'];
+    }
+    $map = [
+        'FM_ENABLE_TERMINAL_HERE'     => $flags['here'],
+        'FM_ENABLE_TERMINAL_MANUAL'   => $flags['manual'],
+        'FM_ENABLE_TERMINAL_ADVANCED' => $flags['advanced'],
+    ];
+    foreach ($map as $name => $val) {
+        $literal = $val ? 'true' : 'false';
+        $count = 0;
+        $src = preg_replace_callback(
+            '/(\$' . $name . '\s*=\s*)(true|false)(\s*;)/i',
+            static function (array $m) use ($literal): string {
+                return $m[1] . $literal . $m[3];
+            },
+            $src,
+            1,
+            $count
+        );
+        if ($src === null || $count !== 1) {
+            return ['ok' => false, 'reason' => 'pattern_failed'];
+        }
+    }
+    return fmWriteScriptContents($src);
+}
+
+/**
+ * Save terminal feature flags after password confirmation.
+ *
+ * @return array{status:string,msg?:string,saved?:bool,here?:bool,manual?:bool,advanced?:bool,lines?:string,file?:string}
+ */
+function fmSetTerminalSettings(
+    string $password,
+    bool $here,
+    bool $manual,
+    bool $advanced,
+    string $passwordHash,
+    bool $authEnabled,
+    bool $curHere,
+    bool $curManual,
+    bool $curAdvanced
+): array {
+    if ($authEnabled) {
+        if ($password === '' || !password_verify($password, $passwordHash)) {
+            usleep(200000);
+            return ['status' => 'error', 'msg' => 'Password is incorrect'];
+        }
+    }
+    $flags = fmNormalizeTerminalFlags($here, $manual, $advanced);
+    if (
+        $curHere === $flags['here']
+        && $curManual === $flags['manual']
+        && $curAdvanced === $flags['advanced']
+    ) {
+        return [
+            'status'   => 'success',
+            'saved'    => true,
+            'here'     => $flags['here'],
+            'manual'   => $flags['manual'],
+            'advanced' => $flags['advanced'],
+            'msg'      => 'Terminal settings are unchanged.',
+        ];
+    }
+    $write = fmWriteTerminalFlagsToScript($flags['here'], $flags['manual'], $flags['advanced']);
+    $lines =
+        '$FM_ENABLE_TERMINAL_HERE = ' . ($flags['here'] ? 'true' : 'false') . ";\n" .
+        '$FM_ENABLE_TERMINAL_MANUAL = ' . ($flags['manual'] ? 'true' : 'false') . ";\n" .
+        '$FM_ENABLE_TERMINAL_ADVANCED = ' . ($flags['advanced'] ? 'true' : 'false') . ';';
+    if (!empty($write['ok'])) {
+        return [
+            'status'   => 'success',
+            'saved'    => true,
+            'here'     => $flags['here'],
+            'manual'   => $flags['manual'],
+            'advanced' => $flags['advanced'],
+            'msg'      => 'Terminal settings saved in this PHP file. Reloading…',
+        ];
+    }
+    $reason = (string)($write['reason'] ?? 'write_failed');
+    $hint = 'Could not update this PHP file automatically';
+    if ($reason === 'not_writable' || $reason === 'replace_failed' || $reason === 'write_failed') {
+        $hint .= ' (check write permissions on the script file)';
+    } elseif ($reason === 'pattern_failed') {
+        $hint .= ' (could not find terminal settings in the script)';
+    }
+    return [
+        'status'   => 'success',
+        'saved'    => false,
+        'here'     => $flags['here'],
+        'manual'   => $flags['manual'],
+        'advanced' => $flags['advanced'],
+        'lines'    => $lines,
+        'file'     => pathinfo(__FILE__, PATHINFO_BASENAME),
+        'msg'      => $hint . '. Set these lines near the top of the script, save, then reload:',
+    ];
+}
+
+/**
+ * Normalize $FM_FILE_OPS_MODE to auto|php|os.
+ */
+function fmNormalizeFileOpsModeString(string $mode): string {
+    $m = strtolower(trim($mode));
+    if ($m === 'shell') {
+        $m = 'os';
+    }
+    return in_array($m, ['auto', 'php', 'os'], true) ? $m : 'auto';
+}
+
+/**
+ * Set $FM_FILE_OPS_MODE = '...' in this script file.
+ *
+ * @return array{ok:bool, reason?:string}
+ */
+function fmWriteFileOpsModeToScript(string $mode): array {
+    $mode = fmNormalizeFileOpsModeString($mode);
+    return fmEditScriptWithCallback(
+        '/(\$FM_FILE_OPS_MODE\s*=\s*)([\'"])([^\'"]*)\2(\s*;)/',
+        static function (array $m) use ($mode): string {
+            return $m[1] . '\'' . $mode . '\'' . $m[4];
+        }
+    );
+}
+
+/**
+ * Save file-ops mode after password confirmation.
+ *
+ * @return array{status:string,msg?:string,saved?:bool,mode?:string,line?:string,file?:string}
+ */
+function fmSetFileOpsMode(
+    string $password,
+    string $mode,
+    string $passwordHash,
+    bool $authEnabled,
+    string $currentMode,
+    bool $execAvailable
+): array {
+    if ($authEnabled) {
+        if ($password === '' || !password_verify($password, $passwordHash)) {
+            usleep(200000);
+            return ['status' => 'error', 'msg' => 'Password is incorrect'];
+        }
+    }
+    $mode = fmNormalizeFileOpsModeString($mode);
+    if ($mode === 'os' && !$execAvailable) {
+        return [
+            'status' => 'error',
+            'msg'    => 'OS-only mode needs exec(). Choose Auto or PHP only, or enable exec() on the server.',
+        ];
+    }
+    $current = fmNormalizeFileOpsModeString($currentMode);
+    if ($current === $mode) {
+        return [
+            'status' => 'success',
+            'saved'  => true,
+            'mode'   => $mode,
+            'msg'    => 'File ops mode is unchanged.',
+        ];
+    }
+    $write = fmWriteFileOpsModeToScript($mode);
+    $line = '$FM_FILE_OPS_MODE = \'' . $mode . '\';';
+    if (!empty($write['ok'])) {
+        return [
+            'status' => 'success',
+            'saved'  => true,
+            'mode'   => $mode,
+            'msg'    => 'File ops mode saved in this PHP file. Reloading…',
+        ];
+    }
+    $reason = (string)($write['reason'] ?? 'write_failed');
+    $hint = 'Could not update this PHP file automatically';
+    if ($reason === 'not_writable' || $reason === 'replace_failed' || $reason === 'write_failed') {
+        $hint .= ' (check write permissions on the script file)';
+    } elseif ($reason === 'pattern_failed') {
+        $hint .= ' (could not find $FM_FILE_OPS_MODE in the script)';
+    }
+    return [
+        'status' => 'success',
+        'saved'  => false,
+        'mode'   => $mode,
+        'line'   => $line,
+        'file'   => pathinfo(__FILE__, PATHINFO_BASENAME),
+        'msg'    => $hint . '. Set this line near the top of the script, save, then reload:',
+    ];
+}
+
+/**
+ * Validate and apply a password change (in-file write, with hash fallback payload).
+ *
+ * @return array{status:string,msg?:string,saved?:bool,hash?:string,file?:string}
+ */
+function fmChangePassword(string $currentPass, string $newPass, string $confirmPass, string $passwordHash): array {
+    // First-time setup: default password is public ("admin"), so do not require retyping it.
+    // Later changes (non-default hash) still require the current password.
+    $isDefault = fmPasswordIsDefault($passwordHash);
+    if (!$isDefault) {
+        if ($currentPass === '' || !password_verify($currentPass, $passwordHash)) {
+            usleep(200000);
+            return ['status' => 'error', 'msg' => 'Current password is incorrect'];
+        }
+    }
+    if (strlen($newPass) < 8) {
+        return ['status' => 'error', 'msg' => 'New password must be at least 8 characters'];
+    }
+    if ($newPass !== $confirmPass) {
+        return ['status' => 'error', 'msg' => 'New password and confirmation do not match'];
+    }
+    if ($newPass === 'admin') {
+        return ['status' => 'error', 'msg' => 'Choose a password other than the default "admin"'];
+    }
+    if (!$isDefault && password_verify($newPass, $passwordHash)) {
+        return ['status' => 'error', 'msg' => 'New password must be different from the current password'];
+    }
+    $newHash = password_hash($newPass, PASSWORD_DEFAULT);
+    if ($newHash === false || $newHash === '') {
+        return ['status' => 'error', 'msg' => 'Could not hash the new password'];
+    }
+    $write = fmWritePasswordHashToScript($newHash);
+    if (!empty($write['ok'])) {
+        return [
+            'status' => 'success',
+            'saved'  => true,
+            'msg'    => 'Password updated in this PHP file. Reloading…',
+        ];
+    }
+    $reason = (string)($write['reason'] ?? 'write_failed');
+    $hint = 'Could not update this PHP file automatically';
+    if ($reason === 'not_writable' || $reason === 'replace_failed' || $reason === 'write_failed') {
+        $hint .= ' (check write permissions on the script file)';
+    } elseif ($reason === 'pattern_failed') {
+        $hint .= ' (could not find $PASSWORD_HASH in the script)';
+    }
+    return [
+        'status' => 'success',
+        'saved'  => false,
+        'hash'   => $newHash,
+        'file'   => pathinfo(__FILE__, PATHINFO_BASENAME),
+        'msg'    => $hint . '. Copy the hash below into $PASSWORD_HASH near the top of the script, save, then reload.',
+    ];
+}
+
+/**
  * Require authentication or exit
  * 
  * @param bool $enableAuth
@@ -907,7 +1269,7 @@ function fmRunTerminalCommand(
     bool $advancedEnabled = false
 ): array {
     if (!$terminalEnabled) {
-        return ['status' => 'error', 'msg' => 'Terminal action is disabled by configuration.'];
+        return ['status' => 'error', 'msg' => 'Terminal is disabled. Open Terminal settings from the terminal icon, or set $FM_ENABLE_TERMINAL_HERE = true in this PHP file (trusted hosts only).'];
     }
     if (empty($caps['exec_available'])) {
         return ['status' => 'error', 'msg' => 'exec() is disabled on this server.'];
@@ -997,7 +1359,7 @@ function fmRunTerminalCommand(
  */
 function fmTerminalComplete(string $dir, string $rootDir, bool $terminalEnabled, string $partial, int $limit = 30): array {
     if (!$terminalEnabled) {
-        return ['status' => 'error', 'msg' => 'Terminal action is disabled by configuration.'];
+        return ['status' => 'error', 'msg' => 'Terminal is disabled. Open Terminal settings from the terminal icon, or set $FM_ENABLE_TERMINAL_HERE = true in this PHP file (trusted hosts only).'];
     }
     $realRaw = realpath($dir);
     if ($realRaw === false) {
@@ -2133,6 +2495,8 @@ $thisFileName = pathinfo(__FILE__, PATHINFO_BASENAME);
 $needsRename = ($thisFileName === $DEFAULT_FILENAME);
 // If auth is enabled, determine current auth state (used for initial HTML rendering).
 $isAuthed = (!$needsRename) ? isAuthed($ENABLE_AUTH) : false;
+$passwordIsDefault = $ENABLE_AUTH && fmPasswordIsDefault($PASSWORD_HASH);
+$needsPasswordChange = (!$needsRename) && $ENABLE_AUTH && $isAuthed && $passwordIsDefault;
 
 // Handle rename POST (allowed even if not authed, because it happens before auth).
 if (isset($_POST['action']) && $_POST['action'] === 'do-rename') {
@@ -2140,8 +2504,10 @@ if (isset($_POST['action']) && $_POST['action'] === 'do-rename') {
         jsonOut(['status' => 'error', 'msg' => 'Already renamed']);
     }
     $new = isset($_POST['new_name']) ? trim((string)$_POST['new_name']) : '';
-    if (!preg_match('/^[A-Za-z0-9]{30,40}\\.php$/', $new)) {
-        jsonOut(['status' => 'error', 'msg' => 'Invalid name. Use 30–40 chars [A-Za-z0-9] + .php']);
+    $validRandom = (bool)preg_match('/^[A-Za-z0-9]{30,40}\\.php$/', $new);
+    $validPrefixed = (bool)preg_match('/^solofm_[A-Za-z0-9]{24,32}\\.php$/', $new);
+    if (!$validRandom && !$validPrefixed) {
+        jsonOut(['status' => 'error', 'msg' => 'Invalid name. Use 30–40 chars [A-Za-z0-9].php, or solofm_ + 24–32 chars + .php']);
     }
     $dest = safeRealpath(__DIR__ . '/' . $new);
     if (!pathInsideRoot($dest, $ROOT_DIR)) {
@@ -2174,6 +2540,44 @@ if (isset($_POST['action']) && $_POST['action'] === 'logout') {
     $_SESSION['fm_auth'] = false;
     jsonOut(['status' => 'success']);
 }
+if (isset($_POST['action']) && $_POST['action'] === 'change-password') {
+    requireAuthOrExit($ENABLE_AUTH);
+    jsonOut(fmChangePassword(
+        (string)($_POST['current_password'] ?? ''),
+        (string)($_POST['new_password'] ?? ''),
+        (string)($_POST['confirm_password'] ?? ''),
+        $PASSWORD_HASH
+    ));
+}
+if (isset($_POST['action']) && $_POST['action'] === 'set-terminal-settings') {
+    requireAuthOrExit($ENABLE_AUTH);
+    $asBool = static function ($v): bool {
+        $raw = strtolower(trim((string)$v));
+        return in_array($raw, ['1', 'true', 'yes', 'on'], true);
+    };
+    jsonOut(fmSetTerminalSettings(
+        (string)($_POST['password'] ?? ''),
+        $asBool($_POST['here'] ?? ''),
+        $asBool($_POST['manual'] ?? ''),
+        $asBool($_POST['advanced'] ?? ''),
+        $PASSWORD_HASH,
+        $ENABLE_AUTH,
+        (bool)$FM_ENABLE_TERMINAL_HERE,
+        (bool)$FM_ENABLE_TERMINAL_MANUAL,
+        (bool)$FM_ENABLE_TERMINAL_ADVANCED
+    ));
+}
+if (isset($_POST['action']) && $_POST['action'] === 'set-file-ops-mode') {
+    requireAuthOrExit($ENABLE_AUTH);
+    jsonOut(fmSetFileOpsMode(
+        (string)($_POST['password'] ?? ''),
+        (string)($_POST['mode'] ?? ''),
+        $PASSWORD_HASH,
+        $ENABLE_AUTH,
+        fmFileOpsMode(),
+        !empty($serverCapabilities['exec_available'])
+    ));
+}
 
 // =========================
 // API actions
@@ -2186,6 +2590,15 @@ if (!$needsRename) {
         $allowUnauthed = in_array($a, ['do-rename', 'login', 'logout'], true);
         if (!$allowUnauthed) {
             requireAuthOrExit($ENABLE_AUTH);
+        }
+        // Block file-manager APIs until the shipped default password is changed.
+        if (
+            $ENABLE_AUTH
+            && !$allowUnauthed
+            && $a !== 'change-password'
+            && fmPasswordIsDefault($PASSWORD_HASH)
+        ) {
+            jsonOut(['status' => 'error', 'msg' => 'Change the default password before continuing.']);
         }
     }
 }
@@ -2391,6 +2804,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'get-server-info') {
     $rootTotal = @disk_total_space($ROOT_DIR);
     jsonOut([
         'status'               => 'success',
+        'solofm_version'       => SOLOFM_VERSION,
         'php_version'          => PHP_VERSION,
         'php_sapi'             => PHP_SAPI,
         'server_software'      => (string)($_SERVER['SERVER_SOFTWARE'] ?? ''),
@@ -4189,6 +4603,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'delete-stream' && isset($_P
 
 $cmsId = detectCms($ROOT_DIR);
 $suggested = randomName(30, 40) . '.php';
+$suggestedPrefixed = 'solofm_' . randomName(24, 32) . '.php';
 global $serverCapabilities;
 $FM_EXEC_AVAILABLE = $serverCapabilities['exec_available'];
 $FM_TERMINAL_HERE_ENABLED = $FM_ENABLE_TERMINAL_HERE;
@@ -4208,7 +4623,7 @@ $FM_TERMINAL_ADVANCED_ENABLED = $FM_ENABLE_TERMINAL_ADVANCED;
     <link href="https://cdnjs.cloudflare.com/ajax/libs/normalize/8.0.1/normalize.min.css" rel="stylesheet" crossorigin="anonymous" referrerpolicy="no-referrer">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.13.1/font/bootstrap-icons.css" rel="stylesheet">
     <style>
-/* fm_new_1.css — parallel dev bundle. Section comments: layout, popup, table, tree, … (future single-PHP inline). */
+/* SoloFM inline styles — layout, popup, table, tree, setup/login. */
 :root {
     --main-color: #da615b;
     --main-color-alpha-40: #da615b40;
@@ -4738,7 +5153,7 @@ html:has(.fm-table-wrapper) body {
     overflow: hidden;
 }
 
-/* --- Ported core UI styles from fm_table.css (table + popup) --- */
+/* --- Core UI styles (table + popup) --- */
 /* FmPopup styles */
 .fm-popup {
     position: fixed;
@@ -6482,6 +6897,36 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     font-size: 11px;
 }
 
+.fm-popup-content .fm-cfg-fileops-option {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin: 8px 0 0;
+    font-size: 13px;
+    cursor: pointer;
+    line-height: 1.35;
+}
+.fm-popup-content .fm-cfg-fileops-option input {
+    margin-top: 2px;
+    flex-shrink: 0;
+}
+.fm-popup-content .fm-cfg-fileops-option.fm-cfg-fileops-disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+}
+.fm-popup-content .fm-cfg-fileops-pass {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 12px;
+    font-size: 12px;
+    color: #444;
+}
+.fm-popup-content .fm-cfg-fileops-pass .fm-input {
+    width: 100%;
+    min-width: 0;
+}
+
 .fm-info-loading {
     padding: 1.5rem 0;
     color: var(--muted-text, #6c757d);
@@ -6551,6 +6996,55 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
 .fm-table-action-btn.disabled {
     opacity: .4;
     cursor: default;
+}
+
+/* Terminal settings popup: checkbox + label on one line */
+.fm-term-settings-options {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin: 12px 0;
+}
+.fm-term-settings-options label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: #333;
+    cursor: pointer;
+    line-height: 1.3;
+}
+.fm-term-settings-options input[type="checkbox"] {
+    margin: 0;
+    flex-shrink: 0;
+}
+
+/* Gear in terminal popup header (vertically centered, left of close) */
+.fm-popup-header .fm-terminal-settings-btn {
+    position: absolute;
+    top: 50%;
+    right: 40px;
+    transform: translateY(-50%);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: #fff;
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+}
+.fm-popup-header .fm-terminal-settings-btn i {
+    display: block;
+    line-height: 1;
+}
+.fm-popup-header .fm-terminal-settings-btn:hover {
+    background: rgba(255, 255, 255, .18);
 }
 
 .fm-table-action-btn i {
@@ -7526,6 +8020,101 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     color: #b00020;
     font-size: 12px;
 }
+
+.fm-rename-options {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin: 12px 0;
+}
+
+.fm-rename-option {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid rgba(0, 0, 0, .18);
+    border-radius: 10px;
+    background: #f7f7f7;
+    cursor: pointer;
+    text-align: left;
+    font: inherit;
+    color: inherit;
+    transition: border-color 120ms, background-color 120ms;
+}
+
+.fm-rename-option:hover,
+.fm-rename-option.is-selected {
+    border-color: var(--main-color);
+    background: #fff;
+}
+
+.fm-rename-option-label {
+    font-weight: 700;
+    font-size: 12px;
+}
+
+.fm-rename-option-name {
+    font-family: "Roboto Mono", monospace;
+    font-size: 12px;
+    word-break: break-all;
+    color: #333;
+}
+
+.fm-rename-option-hint {
+    font-size: 11px;
+    color: #666;
+}
+
+.fm-pwd-fields {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin: 12px 0;
+}
+
+.fm-pwd-fields label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 12px;
+    color: #444;
+}
+
+.fm-pwd-fields .fm-input {
+    width: 100%;
+    min-width: 0;
+}
+
+.fm-pwd-hash-box {
+    margin-top: 10px;
+    padding: 10px;
+    border: 1px dashed rgba(0, 0, 0, .25);
+    border-radius: 10px;
+    background: #fafafa;
+}
+
+.fm-pwd-hash-box textarea {
+    width: 100%;
+    min-height: 64px;
+    font-family: "Roboto Mono", monospace;
+    font-size: 11px;
+    resize: vertical;
+}
+
+.fm-pwd-hash-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+    flex-wrap: wrap;
+}
+
+.fm-version-tag {
+    font-weight: 500;
+    opacity: .9;
+}
 </style>
     <script>
         const root_dir = <?php echo json_encode($ROOT_DIR); ?>;
@@ -7534,7 +8123,10 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
         const cms_id = <?php echo json_encode($cmsId); ?>;
         const needs_rename = <?php echo $needsRename ? 'true' : 'false'; ?>;
         const enable_auth = <?php echo $ENABLE_AUTH ? 'true' : 'false'; ?>;
+        const solofm_version = <?php echo json_encode(SOLOFM_VERSION); ?>;
+        const password_is_default = <?php echo $passwordIsDefault ? 'true' : 'false'; ?>;
         const suggested_name = <?php echo json_encode($suggested); ?>;
+        const suggested_name_prefixed = <?php echo json_encode($suggestedPrefixed); ?>;
         const fm_exec_available = <?php echo $FM_EXEC_AVAILABLE ? 'true' : 'false'; ?>;
         const fm_terminal_here_enabled = <?php echo $FM_TERMINAL_HERE_ENABLED ? 'true' : 'false'; ?>;
         const fm_terminal_manual_enabled = <?php echo $FM_TERMINAL_MANUAL_ENABLED ? 'true' : 'false'; ?>;
@@ -7556,7 +8148,19 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     <div class="fm-card">
         <h1>Setup required</h1>
         <p>This file should be renamed to a unique, hard-to-guess name before use.</p>
-        <p class="fm-hint">Suggestion: 30–40 characters, only <code>[A-Za-z0-9]</code>.</p>
+        <p class="fm-hint">Choose a suggestion, or edit the name. Allowed: 30–40 chars <code>[A-Za-z0-9].php</code>, or <code>solofm_</code> + 24–32 chars + <code>.php</code>.</p>
+        <div class="fm-rename-options" id="fm-rename-options">
+            <button type="button" class="fm-rename-option is-selected" data-name="<?php echo htmlspecialchars($suggested, ENT_QUOTES); ?>">
+                <span class="fm-rename-option-label">Random (harder to find)</span>
+                <span class="fm-rename-option-name"><?php echo htmlspecialchars($suggested, ENT_QUOTES); ?></span>
+                <span class="fm-rename-option-hint">Pure random filename — slightly better obscurity</span>
+            </button>
+            <button type="button" class="fm-rename-option" data-name="<?php echo htmlspecialchars($suggestedPrefixed, ENT_QUOTES); ?>">
+                <span class="fm-rename-option-label">With SoloFM prefix (easier to find)</span>
+                <span class="fm-rename-option-name"><?php echo htmlspecialchars($suggestedPrefixed, ENT_QUOTES); ?></span>
+                <span class="fm-rename-option-hint">Starts with <code>solofm_</code> — easier for you to spot in the folder</span>
+            </button>
+        </div>
         <div class="fm-row">
             <input class="fm-input" id="fm-rename-input" value="<?php echo htmlspecialchars($suggested, ENT_QUOTES); ?>" autocomplete="off" spellcheck="false">
             <button class="fm-btn" id="fm-rename-btn">Rename</button>
@@ -7569,7 +8173,15 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
             const btn = document.getElementById('fm-rename-btn');
             const input = document.getElementById('fm-rename-input');
             const err = document.getElementById('fm-rename-error');
+            const options = document.querySelectorAll('.fm-rename-option');
             function showErr(msg){ err.textContent = msg; err.style.display = 'block'; }
+            function selectOption(el) {
+                options.forEach(function (o) { o.classList.toggle('is-selected', o === el); });
+                input.value = el.getAttribute('data-name') || '';
+            }
+            options.forEach(function (el) {
+                el.addEventListener('click', function () { selectOption(el); });
+            });
             btn.addEventListener('click', function () {
                 const newName = (input.value || '').trim();
                 err.style.display = 'none';
@@ -7593,12 +8205,13 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
 <?php if ($ENABLE_AUTH && !$isAuthed): ?>
     <div class="fm-card">
         <h1>Login</h1>
-        <p class="fm-hint">Enter the password to continue.</p>
+        <p class="fm-hint">Enter the password to continue.<?php if ($passwordIsDefault): ?> Default password is <code>admin</code> — you will be asked to change it after login.<?php endif; ?></p>
         <div class="fm-row">
             <input class="fm-input" id="fm-login-input" type="password" placeholder="Password" autocomplete="current-password">
             <button class="fm-btn" id="fm-login-btn">Login</button>
         </div>
         <p class="fm-error" id="fm-login-error" style="display:none"></p>
+        <p class="fm-hint">SoloFM <?php echo htmlspecialchars(SOLOFM_VERSION, ENT_QUOTES); ?></p>
     </div>
     <script>
         (function () {
@@ -7628,15 +8241,99 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
             input.focus();
         })();
     </script>
+<?php elseif ($needsPasswordChange): ?>
+    <div class="fm-card">
+        <h1>Set a password</h1>
+        <p class="fm-hint">Choose a new password before using SoloFM (the default <code>admin</code> login is only for first setup).</p>
+        <p class="fm-hint">SoloFM will try to update <code>$PASSWORD_HASH</code> in <code><?php echo htmlspecialchars($thisFileName, ENT_QUOTES); ?></code>. If the file is not writable, you will get a hash to paste manually.</p>
+        <div class="fm-pwd-fields">
+            <label><span>New password (min 8 characters)</span><input class="fm-input" id="fm-pwd-new" type="password" autocomplete="new-password"></label>
+            <label><span>Confirm new password</span><input class="fm-input" id="fm-pwd-confirm" type="password" autocomplete="new-password"></label>
+        </div>
+        <div class="fm-row">
+            <button class="fm-btn" id="fm-pwd-save-btn" type="button">Save password</button>
+        </div>
+        <p class="fm-error" id="fm-pwd-error" style="display:none"></p>
+        <div class="fm-pwd-hash-box" id="fm-pwd-hash-box" style="display:none">
+            <p class="fm-hint" id="fm-pwd-hash-msg"></p>
+            <textarea id="fm-pwd-hash-value" readonly></textarea>
+            <div class="fm-pwd-hash-actions">
+                <button type="button" class="fm-btn secondary" id="fm-pwd-copy-btn">Copy hash</button>
+                <button type="button" class="fm-btn" id="fm-pwd-reload-btn">I updated the file — reload</button>
+            </div>
+        </div>
+    </div>
+    <script>
+        (function () {
+            const newEl = document.getElementById('fm-pwd-new');
+            const confirmEl = document.getElementById('fm-pwd-confirm');
+            const btn = document.getElementById('fm-pwd-save-btn');
+            const err = document.getElementById('fm-pwd-error');
+            const hashBox = document.getElementById('fm-pwd-hash-box');
+            const hashMsg = document.getElementById('fm-pwd-hash-msg');
+            const hashVal = document.getElementById('fm-pwd-hash-value');
+            const copyBtn = document.getElementById('fm-pwd-copy-btn');
+            const reloadBtn = document.getElementById('fm-pwd-reload-btn');
+            function showErr(msg){ err.textContent = msg; err.style.display = 'block'; }
+            function clearErr(){ err.style.display = 'none'; err.textContent = ''; }
+            function submitChange() {
+                clearErr();
+                hashBox.style.display = 'none';
+                const form = new FormData();
+                form.append('action', 'change-password');
+                form.append('current_password', '');
+                form.append('new_password', newEl.value || '');
+                form.append('confirm_password', confirmEl.value || '');
+                fetch(ajax_url, { method: 'POST', body: form })
+                    .then(r => r.json())
+                    .then(data => {
+                        if (data.status !== 'success') {
+                            showErr(data.msg || 'Password change failed');
+                            return;
+                        }
+                        if (data.saved) {
+                            location.reload();
+                            return;
+                        }
+                        hashMsg.textContent = data.msg || 'Paste this hash into $PASSWORD_HASH in the PHP file, save, then reload.';
+                        hashVal.value = data.hash || '';
+                        hashBox.style.display = 'block';
+                    })
+                    .catch(() => showErr('Password change failed'));
+            }
+            btn.addEventListener('click', submitChange);
+            [newEl, confirmEl].forEach(function (el) {
+                el.addEventListener('keydown', function (e) {
+                    if (e.key === 'Enter') { e.preventDefault(); submitChange(); }
+                });
+            });
+            copyBtn.addEventListener('click', function () {
+                hashVal.select();
+                try {
+                    if (navigator.clipboard && navigator.clipboard.writeText) {
+                        navigator.clipboard.writeText(hashVal.value);
+                    } else {
+                        document.execCommand('copy');
+                    }
+                } catch (e) { /* ignore */ }
+            });
+            reloadBtn.addEventListener('click', function () { location.reload(); });
+            newEl.focus();
+        })();
+    </script>
 <?php else: ?>
     <div class="fm-table-wrapper">
         <div class="fm-table-header">
             <div class="fm-table-title">
                 <span>SoloFM</span>
+                <span class="fm-version-tag" style="color:rgba(255,255,255,.85);font-size:12px">v<?php echo htmlspecialchars(SOLOFM_VERSION, ENT_QUOTES); ?></span>
                 <span class="fm-hint" style="color:rgba(255,255,255,.85);font-size:12px"><?php echo htmlspecialchars($thisFileName); ?></span>
             </div>
             <div class="fm-table-header-right">
+                <?php if ($ENABLE_AUTH): ?>
+                <button type="button" id="fm-change-password-btn" class="fm-header-btn" title="Change password" aria-label="Change password"><i class="bi bi-key"></i></button>
                 <button type="button" id="fm-auth-btn" class="fm-header-btn" title="Logout" aria-label="Logout"><i class="bi bi-box-arrow-right"></i></button>
+                <?php endif; ?>
                 <button type="button" id="fm-keyboard-shortcuts-btn" class="fm-table-config-btn" title="Keyboard shortcuts" aria-label="Keyboard shortcuts"><i class="bi bi-keyboard"></i></button>
                 <button type="button" id="fm-server-info-btn" class="fm-table-config-btn" title="Server info" aria-label="Server info"><i class="bi bi-hdd-network"></i></button>
                 <button type="button" id="fm-table-config-btn" class="fm-table-config-btn" title="Configuration" aria-label="Configuration"><i class="bi bi-gear"></i></button>
@@ -7676,9 +8373,9 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     </div>
 
 <script>
-/* ===== fm_functions_1.js ===== */
+/* ===== Shared utilities ===== */
 /**
- * @fileoverview Shared utilities for fm_new_1 (paths, hash, auth fetch, verbose-progress helpers).
+ * @fileoverview Shared utilities (paths, hash, auth fetch, verbose-progress helpers).
  */
 
 /**
@@ -7869,15 +8566,15 @@ function requireAuthFetch(url, opts) {
     });
 }
 
-/* ===== fm_popup_1.js ===== */
+/* ===== Popup layer ===== */
 /**
- * @fileoverview Modal / popup layer for fm_new_1 (parallel bundle).
+ * @fileoverview Modal / popup layer for SoloFM.
  * Base: {@link FmPopup}. Domain subclasses include {@link FmDeletePopup}, {@link FmCompressPopup},
  * {@link FmDownloadArchivePopup}, {@link FmExtractPopup}, {@link FmCopyMovePopup}, {@link FmUploadPopup}, {@link FmChmodPopup}, {@link FmBulkRenamePopup}, {@link FmServerInfoPopup},
  * {@link FmNoticePopup}, {@link FmIndeterminateProgressPopup}, {@link FmImageViewerPopup}, and smaller dialogs (rename, new folder, …).
  *
  * FmPopup – JS-driven popup class.
- * Builds modal DOM from config; works with .fm-popup / .fm-popup-container styles (fm.css).
+ * Builds modal DOM from config; works with .fm-popup / .fm-popup-container styles.
  *
  * @example
  *   const p = new FmPopup({
@@ -8450,6 +9147,165 @@ function fmUserNotice(opts) {
     } else {
         alert((opts && opts.message) || '');
     }
+}
+
+/**
+ * Password-confirmed Terminal settings: Standard / Manual / Advanced flags in the PHP file.
+ * @param {{ ajaxUrl?: string, onSaved?: () => void, here?: boolean, manual?: boolean, advanced?: boolean }} opts
+ */
+function fmShowTerminalSettingsPopup(opts) {
+    if (typeof FmPopup === 'undefined') return;
+    const ajaxUrl = (opts && opts.ajaxUrl) || (typeof ajax_url !== 'undefined' ? ajax_url : '');
+    const authOn = typeof enable_auth === 'undefined' ? true : !!enable_auth;
+    const curHere = typeof (opts && opts.here) === 'boolean'
+        ? opts.here
+        : (typeof window !== 'undefined' && window.fm_terminal_here_enabled === true);
+    const curManual = typeof (opts && opts.manual) === 'boolean'
+        ? opts.manual
+        : (typeof window !== 'undefined' && window.fm_terminal_manual_enabled === true);
+    const curAdvanced = typeof (opts && opts.advanced) === 'boolean'
+        ? opts.advanced
+        : (typeof window !== 'undefined' && window.fm_terminal_advanced_enabled === true);
+    const content =
+        '<p class="fm-hint">Runs commands on this server — use on trusted hosts. Settings are saved in this PHP file.</p>' +
+        '<div class="fm-term-settings-options">' +
+        '<label><input type="checkbox" name="term-here"' + (curHere ? ' checked' : '') + '> <span>Standard — allowlisted commands in the current folder</span></label>' +
+        '<label><input type="checkbox" name="term-manual"' + (curManual ? ' checked' : '') + '> <span>Manual — typed commands (safe subset)</span></label>' +
+        '<label><input type="checkbox" name="term-advanced"' + (curAdvanced ? ' checked' : '') + '> <span>Advanced — raw commands (powerful; trusted hosts)</span></label>' +
+        '</div>' +
+        '<div class="fm-pwd-fields">' +
+        (authOn
+            ? '<label><span>Password</span><input class="fm-input fm-input-focus-on-open" name="term-password" type="password" autocomplete="current-password"></label>'
+            : '<p class="fm-hint">Authentication is off — password is not required.</p>') +
+        '</div>' +
+        '<p class="fm-error" data-term-error style="display:none"></p>' +
+        '<div class="fm-pwd-hash-box" data-term-manual style="display:none">' +
+        '<p class="fm-hint" data-term-manual-msg></p>' +
+        '<textarea data-term-manual-line readonly></textarea>' +
+        '<div class="fm-pwd-hash-actions">' +
+        '<button type="button" class="fm-btn secondary" data-term-copy>Copy lines</button>' +
+        '<button type="button" class="fm-btn" data-term-reload>I updated the file — reload</button>' +
+        '</div></div>';
+    const p = new FmPopup({
+        title: 'Terminal settings',
+        maxWidth: '520px',
+        submitOnEnter: true,
+        content: content,
+        buttons: [
+            { label: 'Cancel', close: true },
+            {
+                label: 'Save',
+                primary: true,
+                close: false,
+                onClick: () => {
+                    const root = p.el;
+                    const err = root.querySelector('[data-term-error]');
+                    const fallback = root.querySelector('[data-term-manual]');
+                    const fallbackMsg = root.querySelector('[data-term-manual-msg]');
+                    const fallbackLine = root.querySelector('[data-term-manual-line]');
+                    const hereEl = root.querySelector('[name="term-here"]');
+                    const manualEl = root.querySelector('[name="term-manual"]');
+                    const advancedEl = root.querySelector('[name="term-advanced"]');
+                    const passEl = root.querySelector('[name="term-password"]');
+                    if (err) { err.style.display = 'none'; err.textContent = ''; }
+                    if (fallback) fallback.style.display = 'none';
+                    if (authOn && (!passEl || !(passEl.value || '').length)) {
+                        if (err) {
+                            err.textContent = 'Password is required.';
+                            err.style.display = 'block';
+                        }
+                        return;
+                    }
+                    let here = !!(hereEl && hereEl.checked);
+                    let manual = !!(manualEl && manualEl.checked);
+                    let advanced = !!(advancedEl && advancedEl.checked);
+                    if (manual || advanced) here = true;
+                    if (!here) { manual = false; advanced = false; }
+                    const form = new FormData();
+                    form.append('action', 'set-terminal-settings');
+                    form.append('here', here ? '1' : '0');
+                    form.append('manual', manual ? '1' : '0');
+                    form.append('advanced', advanced ? '1' : '0');
+                    form.append('password', passEl ? (passEl.value || '') : '');
+                    return fetch(ajaxUrl, { method: 'POST', body: form })
+                        .then(r => r.json())
+                        .then(data => {
+                            if (data.status !== 'success') {
+                                if (err) {
+                                    err.textContent = data.msg || 'Could not update terminal settings';
+                                    err.style.display = 'block';
+                                }
+                                return;
+                            }
+                            if (data.saved) {
+                                p.hide();
+                                if (typeof opts.onSaved === 'function') {
+                                    opts.onSaved(data);
+                                } else {
+                                    location.reload();
+                                }
+                                return;
+                            }
+                            if (fallback && fallbackMsg && fallbackLine) {
+                                fallbackMsg.textContent = data.msg || 'Edit the script manually:';
+                                fallbackLine.value = data.lines || '';
+                                fallback.style.display = 'block';
+                            }
+                        })
+                        .catch(() => {
+                            if (err) {
+                                err.textContent = 'Could not update terminal settings';
+                                err.style.display = 'block';
+                            }
+                        });
+                }
+            }
+        ],
+        onAfterShow: () => {
+            const root = p.el;
+            const hereEl = root.querySelector('[name="term-here"]');
+            const manualEl = root.querySelector('[name="term-manual"]');
+            const advancedEl = root.querySelector('[name="term-advanced"]');
+            const syncMaster = () => {
+                if (!hereEl) return;
+                if (hereEl.checked) return;
+                if (manualEl) manualEl.checked = false;
+                if (advancedEl) advancedEl.checked = false;
+            };
+            const ensureHere = () => {
+                if ((manualEl && manualEl.checked) || (advancedEl && advancedEl.checked)) {
+                    if (hereEl) hereEl.checked = true;
+                }
+            };
+            if (hereEl) hereEl.addEventListener('change', syncMaster);
+            if (manualEl) manualEl.addEventListener('change', ensureHere);
+            if (advancedEl) advancedEl.addEventListener('change', ensureHere);
+            const copyBtn = root.querySelector('[data-term-copy]');
+            const reloadBtn = root.querySelector('[data-term-reload]');
+            const lineEl = root.querySelector('[data-term-manual-line]');
+            if (copyBtn && lineEl) {
+                copyBtn.addEventListener('click', () => {
+                    lineEl.select();
+                    try {
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                            navigator.clipboard.writeText(lineEl.value);
+                        } else {
+                            document.execCommand('copy');
+                        }
+                    } catch (e) { /* ignore */ }
+                });
+            }
+            if (reloadBtn) {
+                reloadBtn.addEventListener('click', () => location.reload());
+            }
+        }
+    });
+    p.show();
+}
+
+/** @deprecated Use fmShowTerminalSettingsPopup */
+function fmShowTerminalHereTogglePopup(opts) {
+    fmShowTerminalSettingsPopup(opts || {});
 }
 
 /**
@@ -9181,7 +10037,7 @@ class FmDeletePopup extends FmPopup {
  *   new FmCompressPopup({
  *     currentPath: '/uploads/docs',
  *     rootDir:     '/uploads',
- *     ajaxUrl:     '/fm_new.php',
+ *     ajaxUrl:     '/solofm.php',
  *     names:       ['a.txt', 'b'],
  *     defaultArchiveName: 'archive.zip',
  *     onSuccess:   (archiveNames) => { table.load(...); } // string[] basenames of created archives
@@ -10096,7 +10952,7 @@ class FmGetInfoPopup extends FmPopup {
  * FmServerInfoPopup – shows PHP / OS / disk / limits from `get-server-info`.
  *
  * @example
- *   new FmServerInfoPopup({ ajaxUrl: '/fm_new.php' }).show();
+ *   new FmServerInfoPopup({ ajaxUrl: '/solofm.php' }).show();
  */
 class FmServerInfoPopup extends FmPopup {
     /**
@@ -10145,6 +11001,7 @@ class FmServerInfoPopup extends FmPopup {
             ? FmPopup.escapeHtml(String(data.verbose_progress_min_items))
             : esc(null);
         const rows = [
+            ['SoloFM version',        esc(data.solofm_version)],
             ['PHP version',           esc(data.php_version)],
             ['PHP exec()',            execLine],
             ['File ops mode',         fileOpsLine],
@@ -10179,7 +11036,7 @@ class FmServerInfoPopup extends FmPopup {
     }
 
     /**
-     * Human-readable label for fm_new.php $FM_FILE_OPS_MODE (get-server-info: file_ops_mode).
+     * Human-readable label for solofm.php $FM_FILE_OPS_MODE (get-server-info: file_ops_mode).
      * @param {string|null|undefined} mode
      * @returns {string} HTML (escaped)
      */
@@ -10268,6 +11125,7 @@ class FmTerminalHerePopup extends FmPopup {
             ],
             onAfterShow() {
                 this._renderPath();
+                this._ensureSettingsButton();
             },
             ...rest,
         });
@@ -10283,6 +11141,33 @@ class FmTerminalHerePopup extends FmPopup {
             'git status --short --branch', 'git pull --rebase', 'git log --oneline -n 10',
             'php -v', 'php -m', 'php --ini', 'whoami', 'pwd', 'ls -la'
         ];
+    }
+
+    _ensureSettingsButton() {
+        if (!this.el) return;
+        const header = this.el.querySelector('.fm-popup-header');
+        if (!header || header.querySelector('.fm-terminal-settings-btn')) return;
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'fm-terminal-settings-btn';
+        btn.title = 'Terminal settings';
+        btn.setAttribute('aria-label', 'Terminal settings');
+        btn.innerHTML = '<i class="bi bi-gear" aria-hidden="true"></i>';
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (typeof fmShowTerminalSettingsPopup !== 'function') return;
+            fmShowTerminalSettingsPopup({
+                ajaxUrl: this._ajaxUrl,
+                onSaved: () => location.reload(),
+            });
+        });
+        const closeBtn = header.querySelector('.fm-popup-close');
+        if (closeBtn) {
+            header.insertBefore(btn, closeBtn);
+        } else {
+            header.appendChild(btn);
+        }
     }
 
     _run() {
@@ -13719,9 +14604,9 @@ if (typeof window !== 'undefined') {
 }
 
 
-/* ===== fm_tree_1.js ===== */
+/* ===== Folder tree ===== */
 /**
- * @fileoverview Folder tree for fm_new_1. Base: {@link FmTree}. Sidebar + AJAX: {@link FmSidebarTree} extends FmTree.
+ * @fileoverview Folder tree for SoloFM. Base: {@link FmTree}. Sidebar + AJAX: {@link FmSidebarTree} extends FmTree.
  */
 
 /**
@@ -14466,9 +15351,9 @@ if (typeof window !== 'undefined') {
 }
 
 
-/* ===== fm_table_1.js ===== */
+/* ===== Table UI ===== */
 /**
- * @fileoverview Table UI for fm_new_1. Base: {@link FmTable} (toolbar + sortable rows). File manager: {@link FmFileManagerTable}.
+ * @fileoverview Table UI for SoloFM. Base: {@link FmTable} (toolbar + sortable rows). File manager: {@link FmFileManagerTable}.
  */
 
 /**
@@ -15179,7 +16064,7 @@ class FmFileManagerTable extends FmTable {
     };
 
     /**
-     * Extensions allowed for inline list preview (`action=file-view`). Keep aligned with `fmImageViewMimeForExtension` in fm_new_1.php.
+     * Extensions allowed for inline list preview (`action=file-view`). Keep aligned with `fmImageViewMimeForExtension` in solofm.php.
      * @type {Set<string>}
      */
     static IMAGE_PREVIEW_EXT = new Set([
@@ -15877,9 +16762,22 @@ class FmFileManagerTable extends FmTable {
         if (terminalBtn) {
             const enabled = typeof window !== 'undefined' && window.fm_terminal_here_enabled === true;
             const execOk = typeof window !== 'undefined' && window.fm_exec_available === true;
-            const canTerminal = enabled && execOk && (selected.length === 0 || (selected.length === 1 && selected[0] && selected[0].type === 'folder'));
-            terminalBtn.disabled = !canTerminal;
-            terminalBtn.classList.toggle('disabled', !canTerminal);
+            terminalBtn.classList.remove('fm-terminal-needs-enable');
+            if (!execOk) {
+                terminalBtn.disabled = true;
+                terminalBtn.classList.add('disabled');
+                terminalBtn.title = 'Terminal unavailable (exec() is disabled on this server)';
+            } else if (!enabled) {
+                // Fully active — first click opens Terminal settings.
+                terminalBtn.disabled = false;
+                terminalBtn.classList.remove('disabled');
+                terminalBtn.title = 'Terminal settings';
+            } else {
+                const canTerminal = selected.length === 0 || (selected.length === 1 && selected[0] && selected[0].type === 'folder');
+                terminalBtn.disabled = !canTerminal;
+                terminalBtn.classList.toggle('disabled', !canTerminal);
+                terminalBtn.title = 'Open terminal here';
+            }
         }
         const hasArchive = selected.some(r => r.type === 'file' && FmFileManagerTable.isArchiveFile(r.name));
         this.options.actions.forEach(a => {
@@ -17232,17 +18130,25 @@ class FmFileManagerTable extends FmTable {
     }
 
     _handleTerminalHere({ selectedRows, selectedRow } = {}) {
-        const enabled = typeof window !== 'undefined' && window.fm_terminal_here_enabled === true;
-        if (!enabled) {
-            if (typeof fmUserNotice === 'function') {
-                fmUserNotice({ title: 'Terminal', message: 'Terminal action is disabled by configuration.' });
-            }
-            return;
-        }
         const execOk = typeof window !== 'undefined' && window.fm_exec_available === true;
         if (!execOk) {
             if (typeof fmUserNotice === 'function') {
                 fmUserNotice({ title: 'Terminal', message: 'exec() is disabled on this server.' });
+            }
+            return;
+        }
+        const enabled = typeof window !== 'undefined' && window.fm_terminal_here_enabled === true;
+        if (!enabled) {
+            if (typeof fmShowTerminalSettingsPopup === 'function') {
+                fmShowTerminalSettingsPopup({
+                    ajaxUrl: this._ajaxUrl,
+                    onSaved: () => location.reload(),
+                });
+            } else if (typeof fmUserNotice === 'function') {
+                fmUserNotice({
+                    title: 'Terminal',
+                    message: 'Terminal is disabled. Open Terminal settings or set $FM_ENABLE_TERMINAL_HERE = true in this PHP file.',
+                });
             }
             return;
         }
@@ -17916,9 +18822,11 @@ class FmFileManagerTable extends FmTable {
             return !p || !this._bookmarkIsSaved(p);
         }
         if (actionId === 'terminal-here') {
-            const enabled = typeof window !== 'undefined' && window.fm_terminal_here_enabled === true;
             const execOk = typeof window !== 'undefined' && window.fm_exec_available === true;
-            if (!enabled || !execOk) return true;
+            if (!execOk) return true;
+            const enabled = typeof window !== 'undefined' && window.fm_terminal_here_enabled === true;
+            // Config off: keep clickable so the enable popup can open.
+            if (!enabled) return false;
             const row = payload.selectedRow;
             if (!row) return false;
             return row.type !== 'folder';
@@ -18576,10 +19484,9 @@ if (typeof window !== 'undefined') {
 }
 
 
-/* ===== fm_new_1.js ===== */
+/* ===== App bootstrap ===== */
 /**
- * @fileoverview Bootstraps fm_new_1: main table, sidebar tree, config / shortcuts / server-info wiring.
- * Uses scripts: fm_functions_1 → fm_popup_1 → fm_tree_1 → fm_table_1 → fm_new_1.
+ * @fileoverview Bootstraps SoloFM: main table, sidebar tree, config / shortcuts / server-info wiring.
  */
 const mainTableContainer = document.getElementById('fm-table-container');
 let mainTable   = null;
@@ -18651,13 +19558,19 @@ function describeFileOpsModeForUi() {
     if (raw === 'os' || raw === 'shell') {
         return {
             title: 'OS / shell only',
-            desc:  'Uses OS commands when exec() is available; no PHP fallback. Set in fm_new_1.php: $FM_FILE_OPS_MODE.',
+            desc:  'Uses OS commands when exec() is available; no PHP fallback.',
         };
     }
     return {
         title: 'Auto (OS first, PHP fallback)',
-        desc:  'Tries OS commands first when exec() is available, then PHP on failure. Set in fm_new_1.php: $FM_FILE_OPS_MODE.',
+        desc:  'Tries OS commands first when exec() is available, then PHP on failure.',
     };
+}
+
+function normalizeFileOpsModeUi(mode) {
+    const raw = mode != null ? String(mode).toLowerCase().trim() : 'auto';
+    if (raw === 'shell') return 'os';
+    return (raw === 'php' || raw === 'os') ? raw : 'auto';
 }
 function saveConfig() {
     try { localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(config)); } catch (e) {}
@@ -18967,16 +19880,29 @@ if (serverInfoBtn) {
 
 // config popup
 document.getElementById('fm-table-config-btn').addEventListener('click', () => {
-    const fileOpsUi = describeFileOpsModeForUi();
+    const curOps = normalizeFileOpsModeUi(typeof fm_file_ops_mode !== 'undefined' ? fm_file_ops_mode : 'auto');
+    const authOn = typeof enable_auth === 'undefined' ? true : !!enable_auth;
+    const execOk = typeof window !== 'undefined' && window.fm_exec_available === true;
     const fileOpsHtml =
         '<fieldset class="fm-cfg-server-fieldset">' +
-        '<legend>Server <span class="fm-cfg-server-legend-hint">(read-only)</span></legend>' +
-        '<p class="fm-cfg-server-line"><span class="fm-cfg-server-label">Heavy file operations</span> ' +
-        '<strong class="fm-cfg-server-value">' + FmPopup.escapeHtml(fileOpsUi.title) + '</strong></p>' +
-        '<p class="fm-cfg-server-desc">' + FmPopup.escapeHtml(fileOpsUi.desc) + '</p>' +
-        '<p class="fm-cfg-server-edit-hint">Change on the server in <code>fm_new_1.php</code> (<code>$FM_FILE_OPS_MODE</code>).</p>' +
+        '<legend>Heavy file operations</legend>' +
+        '<p class="fm-cfg-server-desc">How SoloFM runs compress, extract, copy/move, and delete-stream. Saved in this PHP file when changed.</p>' +
+        '<label class="fm-cfg-fileops-option"><input type="radio" name="cfg-fileops" value="auto" class="cfg-fileops" ' + (curOps === 'auto' ? 'checked' : '') + '> Auto <span class="fm-cfg-perm-example">OS first when exec() is available, then PHP</span></label>' +
+        '<label class="fm-cfg-fileops-option"><input type="radio" name="cfg-fileops" value="php" class="cfg-fileops" ' + (curOps === 'php' ? 'checked' : '') + '> PHP only <span class="fm-cfg-perm-example">no OS shell for these actions</span></label>' +
+        '<label class="fm-cfg-fileops-option' + (execOk ? '' : ' fm-cfg-fileops-disabled') + '"><input type="radio" name="cfg-fileops" value="os" class="cfg-fileops" ' + (curOps === 'os' ? 'checked' : '') + (execOk ? '' : ' disabled') + '> OS / shell only <span class="fm-cfg-perm-example">' + (execOk ? 'no PHP fallback' : 'unavailable — exec() disabled') + '</span></label>' +
+        (authOn
+            ? '<label class="fm-cfg-fileops-pass"><span>Password <span class="fm-cfg-hint">(required only if you change the mode above)</span></span><input class="fm-input" name="cfg-fileops-password" type="password" autocomplete="current-password"></label>'
+            : '') +
+        '<p class="fm-error" data-cfg-fileops-error style="display:none"></p>' +
+        '<div class="fm-pwd-hash-box" data-cfg-fileops-fallback style="display:none">' +
+        '<p class="fm-hint" data-cfg-fileops-fallback-msg></p>' +
+        '<textarea data-cfg-fileops-fallback-line readonly></textarea>' +
+        '<div class="fm-pwd-hash-actions">' +
+        '<button type="button" class="fm-btn secondary" data-cfg-fileops-copy>Copy line</button>' +
+        '<button type="button" class="fm-btn" data-cfg-fileops-reload>I updated the file — reload</button>' +
+        '</div></div>' +
         '</fieldset>';
-    const p =         new FmPopup({
+    const p = new FmPopup({
             title:'Configuration',
             maxWidth: '620px',
             submitOnEnter: true,
@@ -19003,6 +19929,14 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
                 const cbImg = p.querySelector('.cfg-imgprev');
                 const stepInp = p.querySelector('.cfg-pagestep');
                 const permRadio = p.querySelector('.cfg-perm-display:checked');
+                const opsRadio = p.querySelector('.cfg-fileops:checked');
+                const opsPass = p.querySelector('[name="cfg-fileops-password"]');
+                const opsErr = p.querySelector('[data-cfg-fileops-error]');
+                const opsFallback = p.querySelector('[data-cfg-fileops-fallback]');
+                const opsFallbackMsg = p.querySelector('[data-cfg-fileops-fallback-msg]');
+                const opsFallbackLine = p.querySelector('[data-cfg-fileops-fallback-line]');
+                if (opsErr) { opsErr.style.display = 'none'; opsErr.textContent = ''; }
+                if (opsFallback) opsFallback.style.display = 'none';
                 if (cbA) config.showActionsColumn = cbA.checked;
                 if (cbM) config.showLastModifiedColumn = cbM.checked;
                 if (cbS) config.automaticGetFoldersSize = cbS.checked;
@@ -19015,10 +19949,79 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
                     mainTable.options.showImagePreviews = config.showImagePreviews === true;
                 }
                 saveConfig();
-                p.hide();
-                fetchAndShowFolder(currentPath);
+
+                const nextOps = normalizeFileOpsModeUi(opsRadio ? opsRadio.value : curOps);
+                if (nextOps === curOps) {
+                    p.hide();
+                    fetchAndShowFolder(currentPath);
+                    return;
+                }
+                if (nextOps === 'os' && !execOk) {
+                    if (opsErr) {
+                        opsErr.textContent = 'OS-only mode needs exec(). Choose Auto or PHP only.';
+                        opsErr.style.display = 'block';
+                    }
+                    return;
+                }
+                if (authOn && (!opsPass || !(opsPass.value || '').length)) {
+                    if (opsErr) {
+                        opsErr.textContent = 'Password is required to change file ops mode.';
+                        opsErr.style.display = 'block';
+                    }
+                    return;
+                }
+                const form = new FormData();
+                form.append('action', 'set-file-ops-mode');
+                form.append('mode', nextOps);
+                form.append('password', opsPass ? (opsPass.value || '') : '');
+                return fetch(ajax_url, { method: 'POST', body: form })
+                    .then(r => r.json())
+                    .then(data => {
+                        if (data.status !== 'success') {
+                            if (opsErr) {
+                                opsErr.textContent = data.msg || 'Could not update file ops mode';
+                                opsErr.style.display = 'block';
+                            }
+                            return;
+                        }
+                        if (data.saved) {
+                            location.reload();
+                            return;
+                        }
+                        if (opsFallback && opsFallbackMsg && opsFallbackLine) {
+                            opsFallbackMsg.textContent = data.msg || 'Edit the script manually:';
+                            opsFallbackLine.value = data.line || ('$FM_FILE_OPS_MODE = \'' + nextOps + '\';');
+                            opsFallback.style.display = 'block';
+                        }
+                    })
+                    .catch(() => {
+                        if (opsErr) {
+                            opsErr.textContent = 'Could not update file ops mode';
+                            opsErr.style.display = 'block';
+                        }
+                    });
             }}
-        ]
+        ],
+        onAfterShow() {
+            const copyBtn = p.querySelector('[data-cfg-fileops-copy]');
+            const reloadBtn = p.querySelector('[data-cfg-fileops-reload]');
+            const lineEl = p.querySelector('[data-cfg-fileops-fallback-line]');
+            if (copyBtn && lineEl) {
+                copyBtn.addEventListener('click', () => {
+                    lineEl.select();
+                    try {
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                            navigator.clipboard.writeText(lineEl.value);
+                        } else {
+                            document.execCommand('copy');
+                        }
+                    } catch (e) { /* ignore */ }
+                });
+            }
+            if (reloadBtn) {
+                reloadBtn.addEventListener('click', () => location.reload());
+            }
+        }
     });
     p.show();
 });
@@ -19030,6 +20033,107 @@ if (authBtn) {
         const form = new FormData();
         form.append('action','logout');
         fetch(ajax_url, { method:'POST', body: form }).then(() => location.reload());
+    });
+}
+
+// Change password (header)
+const changePasswordBtn = document.getElementById('fm-change-password-btn');
+if (changePasswordBtn && typeof FmPopup !== 'undefined') {
+    changePasswordBtn.addEventListener('click', () => {
+        const content =
+            '<p class="fm-hint">SoloFM will try to update <code>$PASSWORD_HASH</code> in this PHP file. If that fails, a hash is shown for manual paste.</p>' +
+            '<div class="fm-pwd-fields">' +
+            '<label><span>Current password</span><input class="fm-input" name="pwd-current" type="password" autocomplete="current-password"></label>' +
+            '<label><span>New password (min 8 characters)</span><input class="fm-input" name="pwd-new" type="password" autocomplete="new-password"></label>' +
+            '<label><span>Confirm new password</span><input class="fm-input" name="pwd-confirm" type="password" autocomplete="new-password"></label>' +
+            '</div>' +
+            '<p class="fm-error" data-pwd-error style="display:none"></p>' +
+            '<div class="fm-pwd-hash-box" data-pwd-hash-box style="display:none">' +
+            '<p class="fm-hint" data-pwd-hash-msg></p>' +
+            '<textarea data-pwd-hash-value readonly></textarea>' +
+            '<div class="fm-pwd-hash-actions">' +
+            '<button type="button" class="fm-btn secondary" data-pwd-copy>Copy hash</button>' +
+            '</div></div>';
+        const p = new FmPopup({
+            title: 'Change password',
+            maxWidth: '520px',
+            submitOnEnter: true,
+            content: content,
+            buttons: [
+                { label: 'Cancel', close: true },
+                {
+                    label: 'Save password',
+                    primary: true,
+                    close: false,
+                    onClick: () => {
+                        const root = p.el;
+                        const err = root.querySelector('[data-pwd-error]');
+                        const hashBox = root.querySelector('[data-pwd-hash-box]');
+                        const hashMsg = root.querySelector('[data-pwd-hash-msg]');
+                        const hashVal = root.querySelector('[data-pwd-hash-value]');
+                        const current = root.querySelector('[name="pwd-current"]');
+                        const next = root.querySelector('[name="pwd-new"]');
+                        const confirm = root.querySelector('[name="pwd-confirm"]');
+                        if (err) { err.style.display = 'none'; err.textContent = ''; }
+                        if (hashBox) hashBox.style.display = 'none';
+                        const form = new FormData();
+                        form.append('action', 'change-password');
+                        form.append('current_password', current ? current.value : '');
+                        form.append('new_password', next ? next.value : '');
+                        form.append('confirm_password', confirm ? confirm.value : '');
+                        return fetch(ajax_url, { method: 'POST', body: form })
+                            .then(r => r.json())
+                            .then(data => {
+                                if (data.status !== 'success') {
+                                    if (err) {
+                                        err.textContent = data.msg || 'Password change failed';
+                                        err.style.display = 'block';
+                                    }
+                                    return;
+                                }
+                                if (data.saved) {
+                                    p.hide();
+                                    if (typeof fmUserNotice === 'function') {
+                                        fmUserNotice({ title: 'Password', message: data.msg || 'Password updated.' });
+                                    }
+                                    return;
+                                }
+                                if (hashBox && hashMsg && hashVal) {
+                                    hashMsg.textContent = data.msg || 'Paste this hash into $PASSWORD_HASH, save the file, then reload.';
+                                    hashVal.value = data.hash || '';
+                                    hashBox.style.display = 'block';
+                                }
+                            })
+                            .catch(() => {
+                                if (err) {
+                                    err.textContent = 'Password change failed';
+                                    err.style.display = 'block';
+                                }
+                            });
+                    }
+                }
+            ],
+            onAfterShow: () => {
+                const root = p.el;
+                const copyBtn = root.querySelector('[data-pwd-copy]');
+                const hashVal = root.querySelector('[data-pwd-hash-value]');
+                if (copyBtn && hashVal) {
+                    copyBtn.addEventListener('click', () => {
+                        hashVal.select();
+                        try {
+                            if (navigator.clipboard && navigator.clipboard.writeText) {
+                                navigator.clipboard.writeText(hashVal.value);
+                            } else {
+                                document.execCommand('copy');
+                            }
+                        } catch (e) { /* ignore */ }
+                    });
+                }
+                const first = root.querySelector('[name="pwd-current"]');
+                if (first) first.focus();
+            }
+        });
+        p.show();
     });
 }
 
