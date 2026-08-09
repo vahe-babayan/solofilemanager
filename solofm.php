@@ -46,7 +46,7 @@ $EXCLUDE_NAMES = [
 ];
 
 /**
- * Heavy file ops (compress, extract, copy, move, delete-stream): OS shell vs PHP.
+ * Heavy file ops (compress, extract, copy, move, delete-stream, folder-size): OS shell vs PHP.
  *
  * - 'auto' (default): try OS commands when exec() is available, fall back to PHP on failure.
  * - 'php': PHP only (no exec-based shell for these actions).
@@ -447,7 +447,7 @@ function fmIsExecAvailable(): bool {
 }
 
 /**
- * Normalized mode for compress / extract / copy-move / delete-stream: 'auto' | 'php' | 'os'.
+ * Normalized mode for compress / extract / copy-move / delete-stream / folder-size: 'auto' | 'php' | 'os'.
  *
  * @return string
  */
@@ -1915,26 +1915,123 @@ function countPathFiles(string $path, string $rootDir): array {
 }
 
 /**
- * Get folder size
- * 
+ * Folder size via recursive PHP walk (no exec).
+ *
  * @param string $path
  * @param string $rootDir
  * @return int
- * 
- * @throws RuntimeException If $path does not exist, is not readable, or an error occurs while checking its contents.
  */
-function getFolderSize(string $path, string $rootDir): int {
-    if (!pathInsideRoot($path, $rootDir) || !is_dir($path)) return 0;
+function getFolderSizePhp(string $path, string $rootDir): int {
+    if (!pathInsideRoot($path, $rootDir) || !is_dir($path)) {
+        return 0;
+    }
     $size = 0;
     $list = @scandir($path);
-    if ($list === false) return 0;
+    if ($list === false) {
+        return 0;
+    }
     foreach ($list as $f) {
-        if ($f === '.' || $f === '..') continue;
+        if ($f === '.' || $f === '..') {
+            continue;
+        }
         $full = $path . '/' . $f;
-        if (is_file($full)) $size += (int) (@filesize($full) ?: 0);
-        elseif (is_dir($full)) $size += getFolderSize($full, $rootDir);
+        if (is_file($full)) {
+            $size += (int) (@filesize($full) ?: 0);
+        } elseif (is_dir($full)) {
+            $size += getFolderSizePhp($full, $rootDir);
+        }
     }
     return $size;
+}
+
+/**
+ * Folder size via OS tools when exec() is allowed. Returns null if unavailable or failed.
+ * Unix: du -sb (GNU) or du -sk (BSD/macOS, KiB × 1024).
+ * Windows: robocopy /L byte summary, then PowerShell Measure-Object.
+ *
+ * @param string $path
+ * @param string $rootDir
+ * @return int|null
+ */
+function getFolderSizeOs(string $path, string $rootDir): ?int {
+    global $isWindows;
+    if (!pathInsideRoot($path, $rootDir) || !is_dir($path)) {
+        return null;
+    }
+    if (!fmFileOpsTryShell()) {
+        return null;
+    }
+
+    if ($isWindows) {
+        $pathWin = str_replace('/', '\\', rtrim($path, '/\\'));
+        $src = escapeshellarg($pathWin);
+        // /L = list only (no copy). Exit codes 0–7 are normal for robocopy.
+        $cmd = 'robocopy ' . $src . ' ' . $src . ' /L /S /NJH /NFL /NDL /NC /NS /NP /BYTES /XJ /R:0 /W:0 2>&1';
+        $out = [];
+        $rc = 1;
+        @exec($cmd, $out, $rc);
+        if ($rc < 8) {
+            $text = implode("\n", $out);
+            if (preg_match('/^\s*Bytes\s*:\s*([\d]+)/mi', $text, $m)) {
+                return (int)$m[1];
+            }
+        }
+
+        $pathPs = str_replace("'", "''", $pathWin);
+        $ps = '$sum = (Get-ChildItem -LiteralPath \'' . $pathPs . '\' -Recurse -Force -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum; if ($null -eq $sum) { 0 } else { [int64]$sum }';
+        $cmdPs = 'powershell -NoProfile -NonInteractive -Command ' . escapeshellarg($ps) . ' 2>&1';
+        $outPs = [];
+        $rcPs = 1;
+        @exec($cmdPs, $outPs, $rcPs);
+        if ($rcPs === 0 && isset($outPs[0])) {
+            $line = trim((string)$outPs[0]);
+            if (preg_match('/^-?\d+$/', $line)) {
+                $n = (int)$line;
+                return $n >= 0 ? $n : null;
+            }
+        }
+        return null;
+    }
+
+    $esc = escapeshellarg($path);
+    $out = [];
+    $rc = 1;
+    @exec('du -sb ' . $esc . ' 2>/dev/null', $out, $rc);
+    if ($rc === 0 && isset($out[0]) && preg_match('/^(\d+)/', (string)$out[0], $m)) {
+        return (int)$m[1];
+    }
+    $out = [];
+    $rc = 1;
+    @exec('du -sk ' . $esc . ' 2>/dev/null', $out, $rc);
+    if ($rc === 0 && isset($out[0]) && preg_match('/^(\d+)/', (string)$out[0], $m)) {
+        return (int)$m[1] * 1024;
+    }
+    return null;
+}
+
+/**
+ * Get folder size using $FM_FILE_OPS_MODE (OS first in auto/os when exec works, else PHP).
+ *
+ * @param string $path
+ * @param string $rootDir
+ * @return int
+ */
+function getFolderSize(string $path, string $rootDir): int {
+    if (!pathInsideRoot($path, $rootDir) || !is_dir($path)) {
+        return 0;
+    }
+    if (fmFileOpsTryShell()) {
+        $osSize = getFolderSizeOs($path, $rootDir);
+        if ($osSize !== null) {
+            return $osSize;
+        }
+        if (!fmFileOpsAllowPhpFallback()) {
+            return 0;
+        }
+    } elseif (!fmFileOpsAllowPhpFallback()) {
+        return 0;
+    }
+    return getFolderSizePhp($path, $rootDir);
 }
 
 /**
@@ -2767,8 +2864,26 @@ if (isset($_GET['action']) && $_GET['action'] === 'folder-tree-branch' && isset(
 
 if (isset($_GET['action']) && $_GET['action'] === 'get-folder-size' && isset($_GET['folder'])) {
     $folder = safeRealpath(rawurldecode((string)$_GET['folder']));
-    if (!pathInsideRoot($folder, $ROOT_DIR)) jsonOut(['status' => 'error', 'size' => 0]);
-    jsonOut(['status' => 'success', 'size' => getFolderSize($folder, $ROOT_DIR)]);
+    if (!pathInsideRoot($folder, $ROOT_DIR) || !is_dir($folder)) {
+        jsonOut(['status' => 'error', 'msg' => 'Invalid folder', 'size' => 0]);
+    }
+    if (fmFileOpsMode() === 'os' && !fmFileOpsTryShell()) {
+        jsonOut([
+            'status' => 'error',
+            'msg'    => 'File ops mode is OS-only but exec() is disabled. Set $FM_FILE_OPS_MODE to "auto" or "php".',
+            'size'   => 0,
+        ]);
+    }
+    if (fmFileOpsTryShell()) {
+        $osSize = getFolderSizeOs($folder, $ROOT_DIR);
+        if ($osSize !== null) {
+            jsonOut(['status' => 'success', 'size' => $osSize, 'via' => 'os']);
+        }
+        if (!fmFileOpsAllowPhpFallback()) {
+            jsonOut(['status' => 'error', 'msg' => 'Could not get folder size via OS tools (OS-only mode).', 'size' => 0]);
+        }
+    }
+    jsonOut(['status' => 'success', 'size' => getFolderSizePhp($folder, $ROOT_DIR), 'via' => 'php']);
 }
 
 if (isset($_GET['action']) && $_GET['action'] === 'get-info' && isset($_GET['path'])) {
@@ -3111,9 +3226,18 @@ if (isset($_POST['action']) && $_POST['action'] === 'compress' && isset($_POST['
     }
     if (count($names) === 0) $sendError('No valid items to archive');
 
-    // Overwrite behavior: frontend confirms, so we delete first if present.
+    // Overwrite only when the UI confirmed (checkbox + "Are you sure").
+    $overwrite = isset($_POST['overwrite']) && ((string)$_POST['overwrite'] === '1' || (string)$_POST['overwrite'] === 'true');
     if (file_exists($destPath)) {
-        if (!@unlink($destPath)) $sendError('Could not overwrite existing archive');
+        if (!$overwrite) {
+            $sendError('Archive already exists. Enable overwrite to replace it.');
+        }
+        if (is_dir($destPath)) {
+            $sendError('A folder with that name already exists');
+        }
+        if (!@unlink($destPath)) {
+            $sendError('Could not overwrite existing archive');
+        }
     }
 
     // To keep Windows fast, we avoid re-scanning the whole tree here.
@@ -4443,6 +4567,48 @@ if (isset($_POST['action']) && $_POST['action'] === 'trash-restore' && isset($_P
     ]);
 }
 
+if (isset($_POST['action']) && $_POST['action'] === 'trash-empty') {
+    $trashRoot = fmTrashRootPath($ROOT_DIR);
+    $trashNorm = rtrim(normPath($trashRoot), '/');
+    $rootNorm  = rtrim(normPath(safeRealpath($ROOT_DIR)), '/');
+    if ($trashNorm === '' || $trashNorm === $rootNorm || strpos($trashNorm, $rootNorm . '/') !== 0) {
+        jsonOut(['status' => 'error', 'msg' => 'Invalid trash path']);
+    }
+    if (!is_dir($trashRoot)) {
+        jsonOut(['status' => 'success', 'msg' => 'Trash is already empty', 'ok' => [], 'errors' => []]);
+    }
+    $resolved = safeRealpath($trashRoot);
+    if ($resolved === '' || !fmIsUnderTrashTree($resolved, $ROOT_DIR)) {
+        jsonOut(['status' => 'error', 'msg' => 'Invalid trash path']);
+    }
+    $ok     = [];
+    $errors = [];
+    $items  = @scandir($trashRoot);
+    if ($items === false) {
+        jsonOut(['status' => 'error', 'msg' => 'Could not read Trash folder']);
+    }
+    foreach ($items as $item) {
+        if ($item === '.' || $item === '..') {
+            continue;
+        }
+        $full = $trashRoot . '/' . $item;
+        if (!pathInsideRoot($full, $ROOT_DIR) || !fmIsUnderTrashTree($full, $ROOT_DIR)) {
+            $errors[] = $item . ': skipped';
+            continue;
+        }
+        if (!deletePath($full, $ROOT_DIR)) {
+            $errors[] = $item . ': delete failed';
+            continue;
+        }
+        $ok[] = $item;
+    }
+    jsonOut([
+        'status' => count($errors) === 0 ? 'success' : (count($ok) > 0 ? 'partial' : 'error'),
+        'ok'     => $ok,
+        'errors' => $errors,
+    ]);
+}
+
 if (isset($_POST['action']) && $_POST['action'] === 'trash-delete-forever' && isset($_POST['in']) && isset($_POST['names']) && is_array($_POST['names'])) {
     $dirIn = (string)$_POST['in'];
     $dir   = $dirIn !== '' ? $ROOT_DIR . '/' . trim($dirIn, '/') : $ROOT_DIR;
@@ -4827,6 +4993,35 @@ html:has(.fm-table-wrapper) body {
 
 #sidebar-tree::-webkit-scrollbar-thumb:hover {
     background: rgba(218, 97, 91, 0.65);
+}
+
+/* Pointer devices: hide scrollbar until hover / focus-within; touch keeps always-visible above. */
+@media (hover: hover) and (pointer: fine) {
+    #sidebar-tree {
+        scrollbar-color: transparent transparent;
+    }
+    #sidebar-tree::-webkit-scrollbar-track {
+        background: transparent;
+    }
+    #sidebar-tree::-webkit-scrollbar-thumb {
+        background: transparent;
+    }
+    #sidebar-tree:hover,
+    #sidebar-tree:focus-within {
+        scrollbar-color: rgba(80, 80, 80, 0.55) #ebebeb;
+    }
+    #sidebar-tree:hover::-webkit-scrollbar-track,
+    #sidebar-tree:focus-within::-webkit-scrollbar-track {
+        background: #ebebeb;
+    }
+    #sidebar-tree:hover::-webkit-scrollbar-thumb,
+    #sidebar-tree:focus-within::-webkit-scrollbar-thumb {
+        background: rgba(100, 100, 100, 0.45);
+    }
+    #sidebar-tree:hover::-webkit-scrollbar-thumb:hover,
+    #sidebar-tree:focus-within::-webkit-scrollbar-thumb:hover {
+        background: rgba(218, 97, 91, 0.65);
+    }
 }
 
 #fm-sidebar-toolbar {
@@ -7082,8 +7277,10 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
 .fm-breadcrumb-nav {
     display: flex;
     align-items: center;
-    gap: 4px;
+    flex-wrap: wrap;
+    gap: 6px 8px;
     flex-shrink: 0;
+    min-width: 0;
 }
 
 .fm-breadcrumb-count {
@@ -7334,6 +7531,13 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     font-size: 1.1em;
 }
 
+.fm-sidebar-trash-hint {
+    margin: 6px 2px 0;
+    font-size: 11px;
+    line-height: 1.35;
+    color: #666;
+}
+
 .fm-table {
     table-layout: fixed;
     width: 100%;
@@ -7381,6 +7585,72 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
 
 .fm-table tbody::-webkit-scrollbar-thumb:hover {
     background: rgba(218, 97, 91, 0.65);
+}
+
+@media (hover: hover) and (pointer: fine) {
+    .fm-table tbody {
+        scrollbar-color: transparent transparent;
+    }
+    .fm-table tbody::-webkit-scrollbar-track {
+        background: transparent;
+    }
+    .fm-table tbody::-webkit-scrollbar-thumb {
+        background: transparent;
+    }
+    .fm-table tbody:hover,
+    .fm-table tbody:focus-within {
+        scrollbar-color: rgba(80, 80, 80, 0.55) #ebebeb;
+    }
+    .fm-table tbody:hover::-webkit-scrollbar-track,
+    .fm-table tbody:focus-within::-webkit-scrollbar-track {
+        background: #ebebeb;
+    }
+    .fm-table tbody:hover::-webkit-scrollbar-thumb,
+    .fm-table tbody:focus-within::-webkit-scrollbar-thumb {
+        background: rgba(100, 100, 100, 0.45);
+    }
+    .fm-table tbody:hover::-webkit-scrollbar-thumb:hover,
+    .fm-table tbody:focus-within::-webkit-scrollbar-thumb:hover {
+        background: rgba(218, 97, 91, 0.65);
+    }
+}
+
+/* Filter sits on the right of the breadcrumb nav row (folder context, not actions). */
+.fm-breadcrumb-bar .fm-table-filter-wrap {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    min-width: 140px;
+    width: min(240px, 100%);
+    flex: 0 1 220px;
+}
+
+.fm-table-filter {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 5px 10px;
+    border: 1px solid #bbb;
+    border-radius: 4px;
+    background: #fff;
+    color: #222;
+    font: inherit;
+    font-size: 13px;
+    line-height: 1.3;
+}
+
+.fm-table-filter:focus {
+    outline: none;
+    border-color: var(--main-color, #0d6efd);
+    box-shadow: 0 0 0 2px rgba(13, 110, 253, 0.2);
+}
+
+@media (max-width: 720px) {
+    .fm-breadcrumb-bar .fm-table-filter-wrap {
+        margin-left: 0;
+        flex: 1 1 100%;
+        width: 100%;
+        max-width: none;
+    }
 }
 
 /* Drag-and-drop: move/copy onto folder row, breadcrumb, or sidebar tree */
@@ -7840,6 +8110,19 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
 /* Trash folder empty: message only (no New folder / file / upload). */
 .fm-table-empty-text--trash {
     margin-bottom: 0;
+}
+
+.fm-table-empty-text--trash-hint,
+.fm-trash-cleanup-hint {
+    margin: 8px 0 0;
+    font-size: 12px;
+    line-height: 1.4;
+    color: #666;
+}
+
+.fm-breadcrumb-bar .fm-trash-cleanup-hint {
+    margin: 0;
+    padding: 0 2px;
 }
 
 .fm-table-empty-actions {
@@ -8361,6 +8644,7 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
                         </div>
                         <div class="fm-sidebar-footer">
                             <button type="button" id="fm-sidebar-trash-btn" class="fm-sidebar-trash-btn" title="Trash (recycle bin)" aria-label="Trash" aria-pressed="false"><i class="bi bi-trash3" aria-hidden="true"></i> Trash</button>
+                            <p class="fm-sidebar-trash-hint">Open Trash and use Empty Trash (toolbar), or delete the <code><?php echo htmlspecialchars(fmTrashBasename(), ENT_QUOTES); ?></code> folder when you finish with SoloFM.</p>
                         </div>
                     </div>
                 </div>
@@ -9652,6 +9936,7 @@ class FmDeletePopup extends FmPopup {
      * @param {string[]} options.names
      * @param {{ name: string, isTrashed?: boolean }[]} [options.trashTargets] - Per-row flags (merged trashed rows)
      * @param {boolean} [options.inTrashTree] - Current folder is under hidden Trash: only permanent delete
+     * @param {boolean} [options.foreverOnly] - Permanent-delete confirm only (e.g. dimmed "Show trashed" rows); no recycle checkbox
      * @param {boolean} [options.defaultDeleteForever] - e.g. Shift+Delete pre-checks "Delete forever"
      * @param {(names: string[]) => void} [options.onSuccess]
      * @param {boolean} [options.execAvailable]
@@ -9664,6 +9949,7 @@ class FmDeletePopup extends FmPopup {
             names,
             trashTargets,
             inTrashTree,
+            foreverOnly,
             defaultDeleteForever,
             onSuccess,
             execAvailable,
@@ -9679,6 +9965,7 @@ class FmDeletePopup extends FmPopup {
         const count = list.length;
         const label = count === 1 ? '1 item' : (count + ' items');
         const inT = !!inTrashTree;
+        const foreverUi = inT || !!foreverOnly;
         const foreverDefault = !!defaultDeleteForever;
 
         const hintTrash =
@@ -9691,20 +9978,27 @@ class FmDeletePopup extends FmPopup {
                 : 'PHP <code>exec()</code> is disabled; deletion runs in PHP with per-item progress.') +
             '</p>';
 
-        const foreverRow = inT
+        const foreverRow = foreverUi
             ? ''
             : '<p class="fm-delete-forever-row"><label><input type="checkbox" id="fm-delete-forever-cb"> Delete forever (skip Trash)</label></p>';
 
-        const body = inT
-            ? (`<p>Permanently delete ${label} from Trash?</p><p>This cannot be undone.</p>` + hintForever)
-            : (`<p>Remove selected ${label}?</p>` + foreverRow + hintTrash + hintForever);
+        let body;
+        if (inT) {
+            body = `<p>Permanently delete ${label} from Trash?</p><p>This cannot be undone.</p>` + hintForever;
+        } else if (foreverUi) {
+            body = `<p>Permanently delete ${label}?</p>` +
+                '<p>These items are already in Trash. This removes them forever and cannot be undone.</p>' +
+                hintForever;
+        } else {
+            body = `<p>Remove selected ${label}?</p>` + foreverRow + hintTrash + hintForever;
+        }
 
         super({
-            title:   inT ? 'Delete permanently' : 'Delete',
+            title:   foreverUi ? 'Delete permanently' : 'Delete',
             content: body,
             buttons: [
                 { label: 'Cancel', close: true },
-                { label: inT ? 'Delete' : 'OK', primary: true, close: false, onClick: () => this._handleDelete() }
+                { label: foreverUi ? 'Delete forever' : 'OK', primary: true, close: false, onClick: () => this._handleDelete() }
             ],
             ...rest
         });
@@ -9715,11 +10009,12 @@ class FmDeletePopup extends FmPopup {
         this._names = list;
         this._trashTargets = Array.isArray(trashTargets) ? trashTargets : null;
         this._inTrashTree = inT;
+        this._foreverOnly = !!foreverOnly;
         this._defaultDeleteForever = foreverDefault;
         this._onSuccess = onSuccess || null;
         this._execAvailable = execOk;
 
-        if (!inT && this.el) {
+        if (!foreverUi && this.el) {
             const cb = this.el.querySelector('#fm-delete-forever-cb');
             if (cb && foreverDefault) {
                 cb.checked = true;
@@ -9754,10 +10049,17 @@ class FmDeletePopup extends FmPopup {
         const allNames = targets.map((t) => t.name);
 
         const cb = typeof document !== 'undefined' ? document.getElementById('fm-delete-forever-cb') : null;
-        const deleteForever = this._inTrashTree || !!(cb && cb.checked) || this._defaultDeleteForever;
+        const deleteForever = this._inTrashTree || this._foreverOnly || !!(cb && cb.checked) || this._defaultDeleteForever;
 
         if (this._inTrashTree) {
             this._runPermanentDeleteChain(liveNames.length ? liveNames : this._names.filter((n) => n), [], () => {
+                if (this._onSuccess) this._onSuccess(allNames);
+            });
+            return;
+        }
+
+        if (this._foreverOnly) {
+            this._runPermanentDeleteChain(liveNames, trashedNames, () => {
                 if (this._onSuccess) this._onSuccess(allNames);
             });
             return;
@@ -10092,8 +10394,8 @@ class FmCompressPopup extends FmPopup {
             content:
                 '<p><label><span class="fm-compress-name-label">Archive name</span><input type="text" name="archive-name" class="fm-compress-name fm-input-focus-on-open" autocomplete="off" value="' +
                 FmPopup.escapeAttr(defaultNameWithExt) + '" placeholder="archive.zip"></label></p>' +
-                '<p class="fm-compress-exists-notice fm-hidden"></p>' +
-                '<p class="fm-compress-override-row fm-hidden"><label class="fm-option-label"><input type="checkbox" name="compress-override" class="fm-compress-override"> Overwrite existing file</label></p>' +
+                '<p class="fm-compress-exists-notice fm-hidden" role="status"></p>' +
+                '<p class="fm-compress-override-row fm-hidden"><label class="fm-option-label"><input type="checkbox" name="compress-override" class="fm-compress-override"> Overwrite existing archive</label></p>' +
                 separateRowHtml +
                 '<p class="fm-compress-type-row"><span class="fm-compress-type-label">Archive type:</span> ' +
                 '<label class="fm-option-label"><input type="radio" name="fm-compress-type" class="fm-compress-type" value="zip" checked> ZIP</label> ' +
@@ -10119,7 +10421,9 @@ class FmCompressPopup extends FmPopup {
         this._onSuccess     = onSuccess || null;
         this._extByType     = { zip: '.zip', tar: '.tar', gzip: '.tar.gz' };
         this._archiveExists = false;
+        this._existingArchiveNames = [];
         this._archiveNameCheckReqId = 0;
+        this._pendingOverwriteOk = false;
     }
 
     _pathIn() {
@@ -10155,16 +10459,24 @@ class FmCompressPopup extends FmPopup {
             btn.classList.toggle('fm-popup-btn-disabled', disabled);
         };
 
+        const hideExistsUi = () => {
+            this._archiveExists = false;
+            this._existingArchiveNames = [];
+            if (noticeEl) {
+                noticeEl.classList.add('fm-hidden');
+                noticeEl.textContent = '';
+            }
+            if (overrideRow) overrideRow.classList.add('fm-hidden');
+            if (overrideEl) overrideEl.checked = false;
+            updateCreateButtonState();
+        };
+
         const checkArchiveNameExists = () => {
             if (!input) return;
             const n = (input.value || '').trim();
             const sep = !!(separateEl && separateEl.checked);
             if ((!n && !sep) || /[\\/:*?"<>|]/.test(n)) {
-                this._archiveExists = false;
-                if (noticeEl)    { noticeEl.style.display = 'none'; noticeEl.textContent = ''; }
-                if (overrideRow) overrideRow.style.display = 'none';
-                if (overrideEl)  overrideEl.checked = false;
-                updateCreateButtonState();
+                hideExistsUi();
                 return;
             }
             const typeRadio = this.querySelector('.fm-compress-type:checked');
@@ -10175,19 +10487,27 @@ class FmCompressPopup extends FmPopup {
                 ? (this._names.length > 1
                     ? this._names.map(an => (prefix ? prefix + '-' + an : an) + ext)
                     : [(prefix || this._names[0] || '') + ext])
-                : [n];
+                : [n.endsWith(ext) ? n : (n.replace(/\.(zip|tar|tar\.gz)$/i, '') + ext)];
 
             this._archiveNameCheckReqId += 1;
             const reqId = this._archiveNameCheckReqId;
-            let anyExists = false;
+            const existing = [];
 
-            const setState = (exists) => {
+            const setState = (existsList) => {
+                const exists = existsList.length > 0;
                 this._archiveExists = exists;
+                this._existingArchiveNames = existsList.slice();
                 if (noticeEl) {
-                    noticeEl.style.display = exists ? 'block' : 'none';
-                    noticeEl.textContent   = exists ? 'Archive name already exists.' : '';
+                    noticeEl.classList.toggle('fm-hidden', !exists);
+                    if (!exists) {
+                        noticeEl.textContent = '';
+                    } else if (existsList.length === 1) {
+                        noticeEl.textContent = 'An archive named "' + existsList[0] + '" already exists in this folder.';
+                    } else {
+                        noticeEl.textContent = 'These archive names already exist in this folder: ' + existsList.join(', ') + '.';
+                    }
                 }
-                if (overrideRow) overrideRow.style.display = exists ? 'block' : 'none';
+                if (overrideRow) overrideRow.classList.toggle('fm-hidden', !exists);
                 if (!exists && overrideEl) overrideEl.checked = false;
                 updateCreateButtonState();
             };
@@ -10199,12 +10519,12 @@ class FmCompressPopup extends FmPopup {
                     const fullPath = this._currentPath.replace(/\/$/, '') + '/' + an;
                     return requireAuthFetch(this._ajaxUrl + '?' + new URLSearchParams({ action: 'get-info', path: fullPath }))
                         .then(r => r.json())
-                        .then(data => { if (data.status === 'success') anyExists = true; });
+                        .then(data => { if (data.status === 'success') existing.push(an); });
                 });
             });
             chain
-                .then(() => { if (reqId === this._archiveNameCheckReqId) setState(anyExists); })
-                .catch(() => { if (reqId === this._archiveNameCheckReqId) setState(false); });
+                .then(() => { if (reqId === this._archiveNameCheckReqId) setState(existing); })
+                .catch(() => { if (reqId === this._archiveNameCheckReqId) setState([]); });
         };
 
         const scheduleArchiveCheck = () => {
@@ -10322,10 +10642,38 @@ class FmCompressPopup extends FmPopup {
             return;
         }
 
-        if (this._archiveExists) {
-            const ov = this.querySelector('.fm-compress-override');
-            if (!ov || !ov.checked) return;
+        const allowOverwrite = !!(this._archiveExists && this.querySelector('.fm-compress-override') && this.querySelector('.fm-compress-override').checked);
+        if (this._archiveExists && !allowOverwrite) return;
+
+        if (allowOverwrite && !this._pendingOverwriteOk) {
+            const existing = (this._existingArchiveNames && this._existingArchiveNames.length)
+                ? this._existingArchiveNames
+                : [name];
+            const labelHtml = existing.length === 1
+                ? '<strong>' + FmPopup.escapeHtml(existing[0]) + '</strong>'
+                : 'these archives (<strong>' + FmPopup.escapeHtml(existing.join(', ')) + '</strong>)';
+            const confirm = new FmPopup({
+                title: 'Overwrite archive?',
+                maxWidth: '460px',
+                content: '<p class="mt-0 mb-0">Are you sure you want to replace ' + labelHtml + '? This cannot be undone.</p>',
+                buttons: [
+                    { label: 'Cancel', close: true },
+                    {
+                        label: 'Overwrite',
+                        primary: true,
+                        close: false,
+                        onClick: () => {
+                            confirm.hideAndDestroy();
+                            this._pendingOverwriteOk = true;
+                            this._handleCreate();
+                        },
+                    },
+                ],
+            });
+            confirm.show();
+            return;
         }
+        this._pendingOverwriteOk = false;
 
         if (separate && names.length > 1) {
             const ext    = extByType[type] || '.zip';
@@ -10351,6 +10699,7 @@ class FmCompressPopup extends FmPopup {
                     form.append('archive_name', jobArchiveName);
                     form.append('archive_type', type);
                     form.append('total',        String(totalForUi || 0));
+                    form.append('overwrite',    allowOverwrite ? '1' : '0');
                     jobNames.forEach(n => form.append('names[]', n));
 
                     fetch(this._ajaxUrl, { method: 'POST', body: form })
@@ -10457,6 +10806,7 @@ class FmCompressPopup extends FmPopup {
             form.append('archive_name', archiveNameForRequest);
             form.append('archive_type', type);
             form.append('total',        String(total));
+            form.append('overwrite',    allowOverwrite ? '1' : '0');
             names.forEach(n => form.append('names[]', n));
 
             fetch(this._ajaxUrl, { method: 'POST', body: form })
@@ -11046,7 +11396,7 @@ class FmServerInfoPopup extends FmPopup {
             : 'auto';
         let text;
         if (raw === 'php') {
-            text = 'PHP only (compress, extract, copy/move, delete-stream)';
+            text = 'PHP only (compress, extract, copy/move, delete-stream, folder-size)';
         } else if (raw === 'os' || raw === 'shell') {
             text = 'OS / shell only (no PHP fallback)';
         } else {
@@ -14801,6 +15151,16 @@ class FmTree {
     }
 
     /**
+     * Remove all direct children under parentPath (keeps the parent node).
+     * @param {string} parentPath
+     * @returns {boolean} true if the parent was found
+     */
+    clearChildren(parentPath) {
+        if (!this._data) return false;
+        return this._clearChildrenRecursive(this._data, parentPath);
+    }
+
+    /**
      * Rename a folder under parentPath in the tree data (no network).
      * Files are not in the folder tree; returns false for those.
      * Updates paths for the node and all descendants, then re-sorts siblings.
@@ -14972,6 +15332,19 @@ class FmTree {
                 self._removePathsRecursive(c, parentPath, namesToRemove);
             });
         }
+    }
+
+    _clearChildrenRecursive(node, parentPath) {
+        if (norm(node.path) === norm(parentPath)) {
+            node.children = [];
+            return true;
+        }
+        if (node.children && node.children.length) {
+            for (let i = 0; i < node.children.length; i++) {
+                if (this._clearChildrenRecursive(node.children[i], parentPath)) return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -15919,10 +16292,7 @@ class FmFileManagerTable extends FmTable {
         'create-new-folder': 'Ctrl + Alt + D',
         'create-new-file':   'Ctrl + Alt + F',
         'delete':            'Delete / Shift + Delete',
-        'restore-trashed':   'Restore from Trash',
-        'delete-forever-trash': 'Delete forever',
-        'goto-live-folder':  'Original location (merged)',
-        'goto-trash-item':   'Open in Trash',
+        'restore-trashed':   'Ctrl + Alt + R',
         'copy':              'Ctrl + Alt + C',
         'move':              'Ctrl + Alt + M / Ctrl + Alt + X',
         'duplicate':         'Ctrl + Alt + U',
@@ -15939,6 +16309,7 @@ class FmFileManagerTable extends FmTable {
         'compress':          'Ctrl + Alt + A',
         'extract':           'Ctrl + Alt + E',
         'open':              'Enter',
+        'refresh':           'F5',
     };
 
     /**
@@ -15969,6 +16340,7 @@ class FmFileManagerTable extends FmTable {
             rows: [
                 ['Shift + F10', 'Open context menu for focused row'],
                 ['F2', 'Rename selected item'],
+                ['F5', 'Refresh the current folder'],
                 ['Alt + Enter', 'Get info for selected item'],
             ],
         },
@@ -15992,9 +16364,10 @@ class FmFileManagerTable extends FmTable {
                 ['Ctrl + Alt + N', 'Create a new subfolder and move selected items into it'],
                 ['Ctrl + Alt + L', 'Copy full server path(s) for selected item(s) to clipboard'],
                 ['Ctrl + Alt + Shift + L', 'Copy path(s) relative to root to clipboard'],
+                ['Ctrl + Alt + Enter', 'Open selected folder or file in a new tab'],
                 ['Ctrl + Alt + B', 'Bookmark the current folder'],
                 ['Ctrl + Alt + T', 'Open terminal in current folder'],
-                ['Ctrl + Alt + R', 'Restore selected items (only while browsing inside Trash)'],
+                ['Ctrl + Alt + R', 'Restore selected trashed items (in Trash, or dimmed rows when Show trashed is on; Restore toolbar button appears outside Trash only with Show trashed)'],
             ],
         },
     ];
@@ -16246,6 +16619,15 @@ class FmFileManagerTable extends FmTable {
         try {
             this._showTrashed = localStorage.getItem('fm_show_trashed_1') === '1';
         } catch (e) { /* ignore */ }
+
+        /** Client-side name filter for the current folder listing. */
+        this._nameFilter = '';
+        /** Unfiltered rows for the current folder (filter applies a subset to `this.rows`). */
+        this._allRows = [];
+        /** Preserve filter input caret across re-renders. */
+        this._filterKeepFocus = false;
+        this._filterSelStart = null;
+        this._filterSelEnd = null;
 
         /** @type {{ path: string, mtv: boolean }[]} History for Alt+Left (newest at end). */
         this._navBackStack = [];
@@ -16682,17 +17064,17 @@ class FmFileManagerTable extends FmTable {
         };
         if (this._pathIsInTrash(this._currentPath)) {
             const byId = Object.fromEntries(FmFileManagerTable.ACTIONS.map((x) => [x.id, x]));
-            const order = ["restore-trashed", "delete", "rename", "copy-path", "copy-relative-path", "download", "open-in-new-tab", "terminal-here"];
+            const order = ["restore-trashed", "delete", "empty-trash", "rename", "copy-path", "copy-relative-path", "download", "open-in-new-tab", "terminal-here"];
             return order.map((id, i) => {
-                const base = byId[id];
+                let base = byId[id];
+                if (!base && id === 'empty-trash') {
+                    base = { id: 'empty-trash', icon: 'bi-trash3', title: 'Empty Trash', needSelection: false };
+                }
                 if (!base) return null;
                 const merged = {
                     ...base,
-                    separatorBefore: i === 0,
+                    separatorBefore: i === 0 || id === 'empty-trash',
                 };
-                if (id === "restore-trashed") {
-                    return { ...merged, shortcut: "Ctrl + Alt + R" };
-                }
                 return withShortcut(merged);
             }).filter(Boolean);
         }
@@ -16701,6 +17083,10 @@ class FmFileManagerTable extends FmTable {
             "copy-path", "copy-relative-path",
             "get-info", "bulk-rename", "change-permissions", "compress", "extract", "refresh", "download", "open-in-new-tab", "terminal-here", "upload",
         ]);
+        // Outside Trash: Restore only when Show trashed is on (dimmed rows can appear).
+        if (!this._showTrashed) {
+            allowed.delete('restore-trashed');
+        }
         return FmFileManagerTable.ACTIONS.filter((a) => allowed.has(a.id)).map(withShortcut);
     }
 
@@ -16776,7 +17162,8 @@ class FmFileManagerTable extends FmTable {
                 const canTerminal = selected.length === 0 || (selected.length === 1 && selected[0] && selected[0].type === 'folder');
                 terminalBtn.disabled = !canTerminal;
                 terminalBtn.classList.toggle('disabled', !canTerminal);
-                terminalBtn.title = 'Open terminal here';
+                const termSc = FmFileManagerTable.ACTION_TOOLTIP_SHORTCUT['terminal-here'];
+                terminalBtn.title = termSc ? `Open terminal here (${termSc})` : 'Open terminal here';
             }
         }
         const hasArchive = selected.some(r => r.type === 'file' && FmFileManagerTable.isArchiveFile(r.name));
@@ -16786,12 +17173,16 @@ class FmFileManagerTable extends FmTable {
             if (!btn) return;
             if (selected.length > 0 && !hasArchive) btn.classList.add('disabled');
         });
-        // Outside Trash: Restore only applies to merged trashed rows (Show trashed).
-        if (!this._pathIsInTrash(this._currentPath) && selected.length > 0) {
+        // Outside Trash: Restore applies only to dimmed trashed rows (requires Show trashed).
+        if (!this._pathIsInTrash(this._currentPath)) {
             const restoreBtn = toolbar.querySelector('[data-action="restore-trashed"]');
             if (restoreBtn) {
-                const hasTrashedSel = selected.some((r) => r && r.isTrashed);
+                const hasTrashedSel = selected.length > 0 && selected.some((r) => r && r.isTrashed);
                 restoreBtn.classList.toggle('disabled', !hasTrashedSel);
+                const scR = FmFileManagerTable.ACTION_TOOLTIP_SHORTCUT['restore-trashed'];
+                restoreBtn.title = hasTrashedSel
+                    ? (scR ? `Restore from Trash (${scR})` : 'Restore from Trash')
+                    : 'Restore from Trash — select a dimmed trashed row (Show trashed)';
             }
         }
         // Inside Trash: Restore only for real trashed rows (not mirror-only parents). Delete also removes shadow-only folders under Trash.
@@ -16801,11 +17192,21 @@ class FmFileManagerTable extends FmTable {
             const restoreBtnIn = toolbar.querySelector('[data-action="restore-trashed"]');
             if (restoreBtnIn) {
                 restoreBtnIn.classList.toggle('disabled', !canRestoreTrash);
+                const scR = FmFileManagerTable.ACTION_TOOLTIP_SHORTCUT['restore-trashed'];
+                restoreBtnIn.title = canRestoreTrash
+                    ? (scR ? `Restore (${scR})` : 'Restore')
+                    : 'Restore — select an item that is not a live-folder placeholder';
             }
             const canDeleteTrash = selected.length > 0 && selected.some((r) => r && r.name);
             const delBtnTrash = toolbar.querySelector('[data-action="delete"]');
             if (delBtnTrash) {
                 delBtnTrash.classList.toggle('disabled', !canDeleteTrash);
+            }
+            const emptyBtn = toolbar.querySelector('[data-action="empty-trash"]');
+            if (emptyBtn) {
+                emptyBtn.disabled = false;
+                emptyBtn.classList.remove('disabled');
+                emptyBtn.title = 'Empty Trash — permanently delete everything in Trash';
             }
         }
     }
@@ -17056,11 +17457,37 @@ class FmFileManagerTable extends FmTable {
             `<button type="button" class="fm-breadcrumb-nav-btn" data-bc="up" title="Up to parent folder (Backspace / Alt + \u2191)" aria-label="Up to parent folder"${canUp ? '' : ' disabled'}><i class="bi bi-arrow-up"></i></button>` +
             showTrashedToggle +
             this._buildBreadcrumbCountHtml() +
+            this._buildNameFilterHtml() +
             '</div>';
 
         const crumbsHtml = this._buildBreadcrumbPathHtml(crumbs);
+        let trashHint = '';
+        if (this._pathIsInTrash(this._currentPath)) {
+            const tb = this._trashBasename();
+            trashHint =
+                '<p class="fm-trash-cleanup-hint">' +
+                this.escapeHtml('Tip: use Empty Trash in the toolbar, or delete the ') +
+                '<code>' + this.escapeHtml(tb) + '</code>' +
+                this.escapeHtml(' folder when you finish with SoloFM.') +
+                '</p>';
+        }
 
-        return nav + '<div class="fm-breadcrumb-path">' + crumbsHtml + '</div>';
+        return nav + '<div class="fm-breadcrumb-path">' + crumbsHtml + '</div>' + trashHint;
+    }
+
+    /**
+     * Name filter field HTML for the breadcrumb nav row (right-aligned via CSS).
+     * @returns {string}
+     */
+    _buildNameFilterHtml() {
+        return (
+            '<div class="fm-table-filter-wrap">' +
+            '<input type="search" class="fm-table-filter" placeholder="Filter by name…" ' +
+            'aria-label="Filter items in this folder by name" autocomplete="off" value="' +
+            this.escapeAttr(this._nameFilter || '') +
+            '">' +
+            '</div>'
+        );
     }
 
     /**
@@ -17070,6 +17497,11 @@ class FmFileManagerTable extends FmTable {
     _buildBreadcrumbCountHtml() {
         if (this._invalidFolderMessage) return '';
         const rows = Array.isArray(this.rows) ? this.rows : [];
+        const all = Array.isArray(this._allRows) && this._allRows.length ? this._allRows : rows;
+        const filterOn = String(this._nameFilter || '').trim() !== '';
+        if (filterOn && all.length > 0) {
+            return '<span class="fm-breadcrumb-count">Showing ' + rows.length + ' of ' + all.length + '</span>';
+        }
         const folders = rows.filter(r => r.type === 'folder').length;
         const files = rows.filter(r => r.type === 'file').length;
         if (folders === 0 && files === 0) {
@@ -17147,6 +17579,37 @@ class FmFileManagerTable extends FmTable {
                 this.load(this._currentPath);
             });
         }
+        this._bindNameFilterInput(bar.querySelector('.fm-table-filter'));
+    }
+
+    /**
+     * Wire the breadcrumb name filter input.
+     * @param {HTMLInputElement|null} input
+     */
+    _bindNameFilterInput(input) {
+        if (!input) return;
+        input.addEventListener('input', () => {
+            this._nameFilter = input.value || '';
+            this._filterKeepFocus = true;
+            this._filterSelStart = input.selectionStart;
+            this._filterSelEnd = input.selectionEnd;
+            this._allRows = Array.isArray(this._allRows) && this._allRows.length
+                ? this._allRows
+                : (this._data ? this.buildRows(this._data) : this.rows.slice());
+            this.rows = this._filteredRows(this._allRows);
+            this.selectedRows = this.selectedRows.filter((r) => this.rows.includes(r));
+            this._focusedIndex = -1;
+            this._selectionAnchor = null;
+            this.render();
+        });
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && (input.value || '')) {
+                e.preventDefault();
+                e.stopPropagation();
+                input.value = '';
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+        });
     }
 
     // -------------------------------------------------------------------------
@@ -17170,10 +17633,25 @@ class FmFileManagerTable extends FmTable {
             return;
         }
         el.classList.remove('fm-table-empty--invalid-folder');
+        const filterQ = String(this._nameFilter || '').trim();
+        if (filterQ && Array.isArray(this._allRows) && this._allRows.length > 0) {
+            el.innerHTML =
+                '<p class="fm-table-empty-text">No items match <strong>' +
+                this.escapeHtml(filterQ) +
+                '</strong>.</p>' +
+                '<p class="fm-table-empty-text fm-hint">Clear the filter to see all items in this folder.</p>';
+            return;
+        }
         if (this._pathIsInTrash(this._currentPath)) {
+            const tb = this._trashBasename();
             el.innerHTML =
                 '<p class="fm-table-empty-text fm-table-empty-text--trash">' +
                 this.escapeHtml('No removed items here.') +
+                '</p>' +
+                '<p class="fm-table-empty-text fm-table-empty-text--trash-hint">' +
+                this.escapeHtml('Use Empty Trash in the toolbar, or delete the ') +
+                '<code>' + this.escapeHtml(tb) + '</code>' +
+                this.escapeHtml(' folder when you finish with SoloFM.') +
                 '</p>';
             return;
         }
@@ -17200,10 +17678,28 @@ class FmFileManagerTable extends FmTable {
             showActionsColumn: this.options.showActionsColumn,
             showLastModifiedColumn: this.options.showLastModifiedColumn
         });
+        if (Array.isArray(this._allRows) && this._allRows.length) {
+            this.rows = this._filteredRows(this._allRows);
+        }
         super.render();
         if (this.tableEl) {
             this.tableEl.classList.toggle('fm-table--image-previews', !!this.options.showImagePreviews);
         }
+        if (this._filterKeepFocus) {
+            const bar = this.container && this.container.querySelector('.fm-breadcrumb-bar');
+            const inp = bar && bar.querySelector('.fm-table-filter');
+            if (inp) {
+                inp.focus();
+                const a = this._filterSelStart;
+                const b = this._filterSelEnd;
+                if (typeof a === 'number' && typeof b === 'number') {
+                    try { inp.setSelectionRange(a, b); } catch (e) { /* ignore */ }
+                }
+            }
+        }
+        this._filterKeepFocus = false;
+        this._filterSelStart = null;
+        this._filterSelEnd = null;
     }
 
     /**
@@ -17213,15 +17709,14 @@ class FmFileManagerTable extends FmTable {
      * @returns {string} HTML or empty string
      */
     _nameSymlinkActionHtml(row, index) {
-        const sc = FmFileManagerTable.ACTION_TOOLTIP_SHORTCUT;
         if (this._pathIsInTrash(this._currentPath)) {
-            const tip = sc['goto-live-folder'] || 'Original location (merged)';
+            const tip = 'Original location (merged)';
             return `<button type="button" class="fm-table-row-action" data-action="goto-live-folder" data-row-index="${index}" ` +
                 `title="${this.escapeAttr(tip)}" aria-label="${this.escapeAttr(tip)}">` +
                 '<i class="bi bi-folder-symlink" aria-hidden="true"></i></button>';
         }
         if (row.isTrashed) {
-            const tip = sc['goto-trash-item'] || 'Open in Trash';
+            const tip = 'Open in Trash';
             return `<button type="button" class="fm-table-row-action" data-action="goto-trash-item" data-row-index="${index}" ` +
                 `title="${this.escapeAttr(tip)}" aria-label="${this.escapeAttr(tip)}">` +
                 '<i class="bi bi-folder-symlink" aria-hidden="true"></i></button>';
@@ -17353,7 +17848,19 @@ class FmFileManagerTable extends FmTable {
      */
     setData(data) {
         this._data = data || { folders: {}, files: {} };
-        super.setData(this.buildRows(this._data));
+        this._allRows = this.buildRows(this._data);
+        super.setData(this._filteredRows(this._allRows));
+    }
+
+    /**
+     * @param {Object[]} rows
+     * @returns {Object[]}
+     */
+    _filteredRows(rows) {
+        const q = String(this._nameFilter || '').trim().toLowerCase();
+        const list = Array.isArray(rows) ? rows : [];
+        if (!q) return list.slice();
+        return list.filter((r) => r && String(r.name || '').toLowerCase().includes(q));
     }
 
     // -------------------------------------------------------------------------
@@ -17398,6 +17905,7 @@ class FmFileManagerTable extends FmTable {
             case 'delete':            return this._handleDelete({ selectedRows, defaultDeleteForever: !!(payload && payload.defaultDeleteForever) });
             case 'restore-trashed':   return this._handleRestoreTrashed({ selectedRows });
             case 'delete-forever-trash': return this._handleDeleteForeverTrashed({ selectedRows });
+            case 'empty-trash':       return this._handleEmptyTrash();
             case 'goto-live-folder':  return this._handleGotoLiveFolder({ selectedRow });
             case 'goto-trash-item':   return this._handleGotoTrashItem({ selectedRow });
             case 'copy':              return this._handleCopyMove('copy', { selectedRows });
@@ -17527,6 +18035,11 @@ class FmFileManagerTable extends FmTable {
         if (rows.length === 0) {
             return;
         }
+        // Outside Trash: selection of only dimmed trashed rows → dedicated forever confirm (#25).
+        if (!this._pathIsInTrash(this._currentPath) && rows.every((r) => r && r.isTrashed)) {
+            this._handleDeleteForeverTrashed({ selectedRows: rows });
+            return;
+        }
         const names = rows.map(r => r.name);
         if (names.length === 0) return;
         const trashTargets = rows
@@ -17572,11 +18085,18 @@ class FmFileManagerTable extends FmTable {
         }
         const names = rows.map((r) => r.name);
         const pathIn = this._currentPath === this._rootDir ? '' : this._currentPath.slice(this._rootDir.length + 1);
+        const inTrashTree = this._pathIsInTrash(this._currentPath);
+        const trashParentPath = inTrashTree
+            ? this._currentPath
+            : this._shadowDirForMergedTrashed();
+        const liveParentPath = inTrashTree
+            ? this._livePathForTrashMirrorItem(this._currentPath)
+            : this._currentPath;
         const form = new FormData();
         form.append('action', 'trash-restore');
         form.append('in', pathIn);
         names.forEach((n) => form.append('names[]', n));
-        const heartbeatAfterRestore = !this._pathIsInTrash(this._currentPath);
+        const heartbeatAfterRestore = !inTrashTree;
         fetch(this._ajaxUrl, { method: 'POST', body: form })
             .then((r) => r.json())
             .then((data) => {
@@ -17586,11 +18106,21 @@ class FmFileManagerTable extends FmTable {
                 }
                 if (data.status === 'error' && !(data.ok && data.ok.length)) return;
                 const restoredOk = Array.isArray(data.ok) ? data.ok : [];
+                const restoredSet = new Set(restoredOk);
+                const folderNames = rows
+                    .filter((r) => r && r.type === 'folder' && restoredSet.has(r.name))
+                    .map((r) => r.name);
                 this.load(this._currentPath, () => {
                     if (heartbeatAfterRestore && restoredOk.length) {
                         restoredOk.forEach((name) => this.highlightRowByName(name));
                     }
-                    this._callHook('after', 'refresh', { currentPath: this._currentPath });
+                    this._callHook('after', 'restore-trashed', {
+                        currentPath: this._currentPath,
+                        trashParentPath,
+                        liveParentPath,
+                        names: restoredOk,
+                        folderNames,
+                    });
                 });
             })
             .catch(() => {
@@ -17632,6 +18162,63 @@ class FmFileManagerTable extends FmTable {
     }
 
     /**
+     * Empty the entire Trash tree (confirm, then trash-empty API).
+     */
+    _handleEmptyTrash() {
+        if (!this._pathIsInTrash(this._currentPath)) return;
+        const tb = this._trashBasename();
+        const confirm = new FmPopup({
+            title: 'Empty Trash?',
+            maxWidth: '460px',
+            content:
+                '<p class="mt-0">Permanently delete <strong>everything</strong> in <code>' +
+                FmPopup.escapeHtml(tb) +
+                '</code>?</p>' +
+                '<p class="mb-0">This cannot be undone.</p>',
+            buttons: [
+                { label: 'Cancel', close: true },
+                {
+                    label: 'Empty Trash',
+                    primary: true,
+                    close: false,
+                    onClick: () => {
+                        confirm.hideAndDestroy();
+                        const form = new FormData();
+                        form.append('action', 'trash-empty');
+                        fetch(this._ajaxUrl, { method: 'POST', body: form })
+                            .then((r) => r.json())
+                            .then((data) => {
+                                const errs = data.errors || [];
+                                if (errs.length && typeof fmUserNotice === 'function') {
+                                    fmUserNotice({ title: 'Empty Trash', message: errs.join('; ') });
+                                }
+                                if (data.status === 'error' && !(data.ok && data.ok.length)) {
+                                    if (typeof fmUserNotice === 'function') {
+                                        fmUserNotice({ title: 'Empty Trash', message: data.msg || 'Could not empty Trash.' });
+                                    }
+                                    return;
+                                }
+                                const trashRoot = norm(this._rootDir).replace(/\/$/, '') + '/' + tb;
+                                this.load(trashRoot, () => {
+                                    this._callHook('after', 'empty-trash', {
+                                        currentPath: trashRoot,
+                                        trashRootPath: trashRoot,
+                                    });
+                                });
+                            })
+                            .catch(() => {
+                                if (typeof fmUserNotice === 'function') {
+                                    fmUserNotice({ title: 'Empty Trash', message: 'Could not empty Trash.' });
+                                }
+                            });
+                    },
+                },
+            ],
+        });
+        confirm.show();
+    }
+
+    /**
      * Permanent delete for merged trashed rows only (shadow tree).
      */
     _handleDeleteForeverTrashed({ selectedRows } = {}) {
@@ -17645,7 +18232,7 @@ class FmFileManagerTable extends FmTable {
             execAvailable: this._execAvailable,
             names,
             trashTargets: names.map((name) => ({ name, isTrashed: true })),
-            defaultDeleteForever: true,
+            foreverOnly: true,
             onSuccess: () => {
                 this._captureKeyboardAnchorFromRemovedNames(names);
                 this.load(this._currentPath, () => {
@@ -18431,15 +19018,26 @@ class FmFileManagerTable extends FmTable {
 
             const inTrashTree = this._pathIsInTrash(this._currentPath);
 
+            if (e.key === 'F5' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                e.preventDefault();
+                this.handleAction('refresh', { selectedRows: selAll, selectedRow: sel });
+                return;
+            }
+
             if (e.key === 'Delete' && sel) {
                 e.preventDefault();
                 this.handleAction('delete', { selectedRows: selAll, selectedRow: sel, defaultDeleteForever: e.shiftKey });
             } else if (e.key === 'F2' && sel) {
                 e.preventDefault();
                 this.handleAction('rename', { selectedRows: selAll, selectedRow: sel });
-            } else if (inTrashTree && e.ctrlKey && e.altKey && !e.shiftKey && e.key.toLowerCase() === 'r' && sel) {
-                e.preventDefault();
-                this.handleAction('restore-trashed', { selectedRows: selAll, selectedRow: sel });
+            } else if (e.ctrlKey && e.altKey && !e.shiftKey && e.key.toLowerCase() === 'r' && sel) {
+                const canRestore = inTrashTree
+                    ? selAll.some((r) => r && r.name && !this._rowIsTrashShadowOnly(r))
+                    : selAll.some((r) => r && r.isTrashed);
+                if (canRestore) {
+                    e.preventDefault();
+                    this.handleAction('restore-trashed', { selectedRows: selAll, selectedRow: sel });
+                }
             } else if (!inTrashTree && e.ctrlKey && e.altKey && !e.shiftKey && e.key.toLowerCase() === 'f') {
                 e.preventDefault();
                 this.handleAction('create-new-file', { selectedRows: [], selectedRow: null });
@@ -18554,13 +19152,13 @@ class FmFileManagerTable extends FmTable {
             { id: 'create-new-folder', title: 'Create new folder', icon: 'bi-folder-plus', shortcut: sc['create-new-folder'] },
             { id: 'create-new-file', title: 'Create new file', icon: 'bi-file-earmark-plus', shortcut: sc['create-new-file'] },
             { id: 'bookmark-pin-current', title: 'Bookmark current folder', icon: 'bi-bookmark-plus', shortcut: sc['bookmark-pin-current'] },
-            { id: 'bookmark-remove-current', title: 'Remove current bookmark', icon: 'bi-bookmark-x', shortcut: null },
+            { id: 'bookmark-remove-current', title: 'Remove current bookmark', icon: 'bi-bookmark-x', shortcut: sc['bookmark-remove-current'] },
             { id: 'terminal-here', title: 'Open terminal here', icon: 'bi-terminal', shortcut: sc['terminal-here'] },
             { type: 'separator' },
-            { id: 'refresh', title: 'Refresh', icon: 'bi-arrow-clockwise', shortcut: null },
+            { id: 'refresh', title: 'Refresh', icon: 'bi-arrow-clockwise', shortcut: sc['refresh'] },
             { id: 'get-info', title: 'Get info', icon: 'bi-info-circle', shortcut: sc['get-info'] },
             { type: 'separator' },
-            { id: 'upload', title: 'Upload', icon: 'bi-upload', shortcut: null },
+            { id: 'upload', title: 'Upload', icon: 'bi-upload', shortcut: sc['upload'] },
             { id: 'download', title: FM_CONTEXT_MENU_DOWNLOAD_LABEL, icon: 'bi-download', shortcut: sc['download'] },
         ];
         if (this.rows.length > 0) {
@@ -18627,7 +19225,7 @@ class FmFileManagerTable extends FmTable {
         if (row.isTrashed && !this._pathIsInTrash(this._currentPath)) {
             rowPart.push(
                 { id: 'restore-trashed', title: 'Restore from Trash', icon: 'bi-arrow-counterclockwise', shortcut: sc['restore-trashed'] },
-                { id: 'delete-forever-trash', title: 'Delete forever', icon: 'bi-trash', shortcut: null }
+                { id: 'delete-forever-trash', title: 'Delete forever', icon: 'bi-trash', shortcut: sc['delete-forever-trash'] }
             );
             pushDownloadOnly();
             rowPart.push({ id: 'goto-trash-item', title: 'Open in Trash', icon: 'bi-folder-symlink', shortcut: sc['goto-trash-item'] });
@@ -18636,7 +19234,7 @@ class FmFileManagerTable extends FmTable {
                 rowPart.push({ id: 'goto-live-folder', title: 'Original location (merged)', icon: 'bi-folder-symlink', shortcut: sc['goto-live-folder'] });
             }
             if (!this._rowIsTrashShadowOnly(row)) {
-                rowPart.push({ id: 'restore-trashed', title: 'Restore', icon: 'bi-arrow-counterclockwise', shortcut: 'Ctrl + Alt + R' });
+                rowPart.push({ id: 'restore-trashed', title: 'Restore', icon: 'bi-arrow-counterclockwise', shortcut: sc['restore-trashed'] });
             }
             rowPart.push(
                 { id: 'rename', title: 'Rename', icon: 'bi-input-cursor-text', shortcut: sc['rename'] },
@@ -18646,8 +19244,8 @@ class FmFileManagerTable extends FmTable {
         } else {
             if (row.type === 'folder') {
                 rowPart.push({ id: 'open', title: 'Open', icon: 'bi-folder2-open', shortcut: sc['open'] });
-                rowPart.push({ id: 'bookmark-pin-row-folder', title: 'Bookmark this folder', icon: 'bi-bookmark-plus', shortcut: null });
-                rowPart.push({ id: 'bookmark-remove-row-folder', title: 'Remove folder bookmark', icon: 'bi-bookmark-x', shortcut: null });
+                rowPart.push({ id: 'bookmark-pin-row-folder', title: 'Bookmark this folder', icon: 'bi-bookmark-plus', shortcut: sc['bookmark-pin-row-folder'] });
+                rowPart.push({ id: 'bookmark-remove-row-folder', title: 'Remove folder bookmark', icon: 'bi-bookmark-x', shortcut: sc['bookmark-remove-row-folder'] });
                 rowPart.push({ id: 'terminal-here', title: 'Open terminal here', icon: 'bi-terminal', shortcut: sc['terminal-here'] });
             }
             rowPart.push(
@@ -18982,6 +19580,7 @@ class FmFileManagerTable extends FmTable {
         if (norm(path) !== norm(this._currentPath)) {
             this._breadcrumbMidExpanded = false;
             this._pendingKeyboardAnchor = null;
+            this._nameFilter = '';
         }
         const openParams = { action: 'open', folder: path };
         const mtv = this._showTrashed && typeof getMergedTrashViewFromHash === 'function' && getMergedTrashViewFromHash();
@@ -19886,7 +20485,7 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
     const fileOpsHtml =
         '<fieldset class="fm-cfg-server-fieldset">' +
         '<legend>Heavy file operations</legend>' +
-        '<p class="fm-cfg-server-desc">How SoloFM runs compress, extract, copy/move, and delete-stream. Saved in this PHP file when changed.</p>' +
+        '<p class="fm-cfg-server-desc">How SoloFM runs compress, extract, copy/move, delete-stream, and folder-size. Saved in this PHP file when changed.</p>' +
         '<label class="fm-cfg-fileops-option"><input type="radio" name="cfg-fileops" value="auto" class="cfg-fileops" ' + (curOps === 'auto' ? 'checked' : '') + '> Auto <span class="fm-cfg-perm-example">OS first when exec() is available, then PHP</span></label>' +
         '<label class="fm-cfg-fileops-option"><input type="radio" name="cfg-fileops" value="php" class="cfg-fileops" ' + (curOps === 'php' ? 'checked' : '') + '> PHP only <span class="fm-cfg-perm-example">no OS shell for these actions</span></label>' +
         '<label class="fm-cfg-fileops-option' + (execOk ? '' : ' fm-cfg-fileops-disabled') + '"><input type="radio" name="cfg-fileops" value="os" class="cfg-fileops" ' + (curOps === 'os' ? 'checked' : '') + (execOk ? '' : ' disabled') + '> OS / shell only <span class="fm-cfg-perm-example">' + (execOk ? 'no PHP fallback' : 'unavailable — exec() disabled') + '</span></label>' +
@@ -20187,6 +20786,48 @@ window.addEventListener('hashchange', () => {
     mainTable.afterUpload = ({ currentPath: path }) => {
         if (sidebarTree) {
             sidebarTree.reloadFolderTree(path);
+        }
+    };
+    mainTable.afterExtract = ({ currentPath: path }) => {
+        if (sidebarTree) {
+            sidebarTree.reloadFolderTree(path);
+        }
+    };
+    /**
+     * Restore: surgically sync LS (remove under Trash, re-add folders under live parent).
+     * Avoids full reloadFolderTree which blocked the next folder open on single-threaded PHP.
+     */
+    mainTable.afterRestoreTrashed = ({
+        currentPath: path,
+        trashParentPath,
+        liveParentPath,
+        names,
+        folderNames,
+    }) => {
+        if (!sidebarTree) return;
+        let needFullReload = false;
+        if (trashParentPath && names && names.length) {
+            sidebarTree.removePaths(trashParentPath, new Set(names));
+        }
+        if (liveParentPath && folderNames && folderNames.length) {
+            folderNames.forEach((name) => {
+                if (!sidebarTree.addFolder(liveParentPath, name, root_dir)) {
+                    needFullReload = true;
+                }
+            });
+        }
+        if (needFullReload) {
+            sidebarTree.reloadFolderTree(path || liveParentPath || trashParentPath);
+        } else {
+            sidebarTree.render(path || liveParentPath || trashParentPath);
+        }
+    };
+    mainTable.afterEmptyTrash = ({ currentPath: path, trashRootPath }) => {
+        if (!sidebarTree || !trashRootPath) return;
+        if (!sidebarTree.clearChildren(trashRootPath)) {
+            sidebarTree.reloadFolderTree(path || trashRootPath);
+        } else {
+            sidebarTree.render(path || trashRootPath);
         }
     };
     mainTable.afterCreateNewFolder = ({ name, currentPath: path }) => {

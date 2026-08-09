@@ -19,13 +19,14 @@ Current version: **1.0.2**
 - Extensions: **`json`**, **`session`** (required for the UI/API and login)
 - **`mbstring`** recommended (better text encoding handling; SoloFM degrades without it)
 - Archives (compress / extract / multi-download ZIP): **`zip`** (`ZipArchive`) and/or **`phar`** (`Phar` / `PharData`)
-- **`exec()`** optional — when available and not in `disable_functions`, SoloFM can use OS tools for faster copy/move/delete/compress/extract (`$FM_FILE_OPS_MODE = 'auto'`). Without `exec()`, use `'php'` mode (or leave `'auto'` and rely on PHP fallbacks)
+- **`exec()`** optional — when available and not in `disable_functions`, SoloFM can use OS tools for faster copy/move/delete/compress/extract/folder-size (`$FM_FILE_OPS_MODE = 'auto'`). Without `exec()`, use `'php'` mode (or leave `'auto'` and rely on PHP fallbacks)
 
 **Filesystem**
 
 - The web server user must be able to **read** `$ROOT_DIR` and **write** where you create/upload/rename/delete files
 - First-run self-rename needs write permission on the directory that contains `solofm.php`
 - Trash uses a hidden folder under root (default `.trash`); that path must be creatable/writable
+- When you finish with SoloFM, **empty Trash** or delete the trash folder (default `.trash`) so removed files are not left on the server
 
 **Browser & network**
 
@@ -43,7 +44,8 @@ Current version: **1.0.2**
 - File/folder listing with sortable columns
 - Create folder/file, rename, bulk rename, duplicate
 - Copy / move with progress; drag and drop
-- Delete to trash (recycle) or delete forever; restore
+- Delete to trash (recycle) or delete forever; restore; Empty Trash (with confirm); cleanup reminders in the Trash UI
+- Filter the current folder listing by name (search field in the breadcrumb bar)
 - Compress / extract archives
 - Change permissions (chmod) for folders and files, including recursive 0755 / 0644 style fixes
 - Upload, download, get info, copy paths
