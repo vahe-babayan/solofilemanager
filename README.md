@@ -2,14 +2,14 @@
 
 **SoloFM** is a single-file PHP file manager for small self-hosted setups (XAMPP, shared hosting, VPS, etc.). Drop one PHP file into a directory and manage files from the browser.
 
-Current version: **1.0.1**
+Current version: **1.0.2**
 
 ## Quick start
 
 1. Copy `solofm.php` into the directory you want to manage (or into a web-accessible folder pointing at your target root).
 2. Open it in the browser, e.g. `http://localhost/solofm.php`
 3. On first run, SoloFM asks you to **rename** the file. You can pick a pure random name (harder to find) or a `solofm_`-prefixed name (easier to spot in the folder).
-4. Log in with the default password **`admin`**. SoloFM then asks you to **set a new password** (new + confirm only — no need to retype `admin`). It tries to update `$PASSWORD_HASH` in the same PHP file; if the file is not writable, it shows a hash to paste manually.
+4. Log in with the default password **`admin`**. SoloFM then asks you to **set a new password** (new + confirm only — no need to retype `admin`). It tries to update `$PASSWORD_HASH` in the same PHP file; if the file is not writable, it shows a hash to paste manually. You can change the password later from the key icon in the header.
 
 ### Requirements
 
@@ -47,9 +47,10 @@ Current version: **1.0.1**
 - Compress / extract archives
 - Change permissions (chmod) for folders and files, including recursive 0755 / 0644 style fixes
 - Upload, download, get info, copy paths
-- Configuration popup (columns, permissions display, folder-size behavior)
+- Configuration popup (columns, permissions display, folder-size behavior, heavy file-ops mode)
+- Change password from the UI (updates `$PASSWORD_HASH` in the same PHP file when writable)
 - Keyboard shortcuts, server info
-- Optional terminal-here (disabled by default — open the terminal icon for Terminal settings: Standard / Manual / Advanced, password to save; or edit the `$FM_ENABLE_TERMINAL_*` flags; trusted hosts only)
+- Optional terminal-here (disabled by default — open the terminal icon for Terminal settings: Standard / Manual / Advanced, password to save; gear inside the terminal popup; or edit the `$FM_ENABLE_TERMINAL_*` flags; trusted hosts only)
 
 ## Configuration
 
@@ -83,6 +84,19 @@ SoloFM can create, rename, and delete files. Treat it as **high risk** if expose
 
 See [SECURITY.md](SECURITY.md) for more.
 
+## Changelog
+
+### 1.0.2
+
+- Fix: after changing password from the header, the page reloads as promised
+- Docs: clarify setup, Configuration (file-ops mode), and terminal settings UX
+
+### 1.0.1
+
+- Dual first-run rename suggestions (random / `solofm_` prefix)
+- In-app password change and Terminal settings (Standard / Manual / Advanced)
+- Configuration can set `$FM_FILE_OPS_MODE` with password confirmation
+
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). Others may use, modify, and redistribute SoloFM (including commercially), as long as they keep the copyright and license notice. The software is provided **as is**, without warranty.

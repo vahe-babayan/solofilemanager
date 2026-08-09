@@ -10,3 +10,6 @@ Thumbs.db
 # PHP
 /.phpunit.result.cache
 /vendor/
+
+# Todo
+todo.md

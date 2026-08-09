@@ -8,7 +8,7 @@ declare(strict_types=1);
  */
 
 /** Product version (semver). Shown in UI / server info. */
-const SOLOFM_VERSION = '1.0.1';
+const SOLOFM_VERSION = '1.0.2';
 
 // Set max execution time to 1 day (86400 seconds)
 @set_time_limit(86400);
@@ -20092,10 +20092,7 @@ if (changePasswordBtn && typeof FmPopup !== 'undefined') {
                                     return;
                                 }
                                 if (data.saved) {
-                                    p.hide();
-                                    if (typeof fmUserNotice === 'function') {
-                                        fmUserNotice({ title: 'Password', message: data.msg || 'Password updated.' });
-                                    }
+                                    location.reload();
                                     return;
                                 }
                                 if (hashBox && hashMsg && hashVal) {
