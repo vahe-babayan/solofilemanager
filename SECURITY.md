@@ -6,10 +6,10 @@ SoloFileManager is a file manager with destructive operations (delete, rename, u
 
 ## Minimum recommendations
 
-- Keep authentication enabled in `solofm.php`:
+- Keep authentication enabled in `solofilemanager.php`:
   - `$ENABLE_AUTH = true`
   - change the default `admin` password via the in-app **Change password** flow (updates `$PASSWORD_HASH` in the same file when writable; otherwise paste the shown hash manually)
-- Complete the first-run **self-rename** away from `solofm.php` (pure random or `solofm_` + random — both are accepted)
+- Complete the first-run **self-rename** away from `solofilemanager.php` (pure random or `solofilemanager_` + random — both are accepted)
 - Leave `$FM_ENABLE_TERMINAL_HERE`, `$FM_ENABLE_TERMINAL_MANUAL`, and `$FM_ENABLE_TERMINAL_ADVANCED` at **`false`** unless you fully trust the host and operators. All three can be set from **Terminal settings** in the UI (terminal icon / gear → password → writes the flags in the same PHP file) or by editing the file manually.
 - When you finish using SoloFileManager, **empty Trash** or delete the trash folder (default `$FM_TRASH_BASENAME` / `.trash`) so deleted files are not left on disk
 - Do not deploy it publicly without additional controls

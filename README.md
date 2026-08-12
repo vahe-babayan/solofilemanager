@@ -6,9 +6,9 @@ Current version: **1.1.0**
 
 ## Quick start
 
-1. Copy `solofm.php` into the directory you want to manage (or into a web-accessible folder pointing at your target root).
-2. Open it in the browser, e.g. `http://localhost/solofm.php`
-3. On first run, SoloFileManager asks you to **rename** the file. You can pick a pure random name (harder to find) or a `solofm_`-prefixed name (easier to spot in the folder).
+1. Copy `solofilemanager.php` into the directory you want to manage (or into a web-accessible folder pointing at your target root).
+2. Open it in the browser, e.g. `http://localhost/solofilemanager.php`
+3. On first run, SoloFileManager asks you to **rename** the file. You can pick a pure random name (harder to find) or a `solofilemanager_`-prefixed name (easier to spot in the folder).
 4. Log in with the default password **`admin`**. SoloFileManager then asks you to **set a new password** (new + confirm only — no need to retype `admin`). It tries to update `$PASSWORD_HASH` in the same PHP file; if the file is not writable, it shows a hash to paste manually. You can change the password later from the key icon in the header.
 
 ### Requirements
@@ -24,7 +24,7 @@ Current version: **1.1.0**
 **Filesystem**
 
 - The web server user must be able to **read** `$ROOT_DIR` and **write** where you create/upload/rename/delete files
-- First-run self-rename needs write permission on the directory that contains `solofm.php`
+- First-run self-rename needs write permission on the directory that contains `solofilemanager.php`
 - Trash uses a hidden folder under root (default `.trash`); that path must be creatable/writable
 - When you finish with SoloFileManager, **empty Trash** or delete the trash folder (default `.trash`) so removed files are not left on the server
 
@@ -56,7 +56,7 @@ Current version: **1.1.0**
 
 ## Configuration
 
-Edit the config block at the top of `solofm.php`:
+Edit the config block at the top of `solofilemanager.php`:
 
 | Setting | Purpose |
 |---------|---------|
@@ -105,7 +105,7 @@ See [SECURITY.md](SECURITY.md) for more.
 
 ### 1.0.1
 
-- Dual first-run rename suggestions (random / `solofm_` prefix)
+- Dual first-run rename suggestions (random / `solofilemanager_` prefix)
 - In-app password change and Terminal settings (Standard / Manual / Advanced)
 - Configuration can set `$FM_FILE_OPS_MODE` with password confirmation
 

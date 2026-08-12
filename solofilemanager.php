@@ -8,7 +8,7 @@ declare(strict_types=1);
  */
 
 /** Product version (semver). Shown in UI / server info. */
-const SOLOFM_VERSION = '1.1.0';
+const SOLOFILEMANAGER_VERSION = '1.1.0';
 
 // Set max execution time to 1 day (86400 seconds)
 @set_time_limit(86400);
@@ -25,7 +25,7 @@ error_reporting(E_ALL);
 $ROOT_DIR = str_replace('\\', '/', realpath(__DIR__) ?: __DIR__);
 
 // Rename gate: require renaming away from this filename on first run.
-$DEFAULT_FILENAME = 'solofm.php';
+$DEFAULT_FILENAME = 'solofilemanager.php';
 
 // Auth (recommended). Set to false to rely on unique filename only (not recommended).
 $ENABLE_AUTH = true;
@@ -41,7 +41,7 @@ $MAX_TREE_DEPTH = 12;
 // Items to exclude from listings (hide this script and common repo docs if present).
 $EXCLUDE_NAMES = [
     '.', '..',
-    'solofm.php',
+    'solofilemanager.php',
     'README.md', 'SECURITY.md', '.gitignore', 'LICENSE',
 ];
 
@@ -687,7 +687,7 @@ function fmWriteScriptContents(string $newSrc): array {
         return ['ok' => false, 'reason' => 'not_writable'];
     }
     $dir = dirname($path);
-    $tmp = $dir . DIRECTORY_SEPARATOR . '.solofm-write-' . bin2hex(random_bytes(8)) . '.tmp';
+    $tmp = $dir . DIRECTORY_SEPARATOR . '.solofilemanager-write-' . bin2hex(random_bytes(8)) . '.tmp';
     if (@file_put_contents($tmp, $newSrc, LOCK_EX) === false) {
         return ['ok' => false, 'reason' => 'write_failed'];
     }
@@ -2602,9 +2602,9 @@ if (isset($_POST['action']) && $_POST['action'] === 'do-rename') {
     }
     $new = isset($_POST['new_name']) ? trim((string)$_POST['new_name']) : '';
     $validRandom = (bool)preg_match('/^[A-Za-z0-9]{30,40}\\.php$/', $new);
-    $validPrefixed = (bool)preg_match('/^solofm_[A-Za-z0-9]{24,32}\\.php$/', $new);
+    $validPrefixed = (bool)preg_match('/^solofilemanager_[A-Za-z0-9]{24,32}\\.php$/', $new);
     if (!$validRandom && !$validPrefixed) {
-        jsonOut(['status' => 'error', 'msg' => 'Invalid name. Use 30–40 chars [A-Za-z0-9].php, or solofm_ + 24–32 chars + .php']);
+        jsonOut(['status' => 'error', 'msg' => 'Invalid name. Use 30–40 chars [A-Za-z0-9].php, or solofilemanager_ + 24–32 chars + .php']);
     }
     $dest = safeRealpath(__DIR__ . '/' . $new);
     if (!pathInsideRoot($dest, $ROOT_DIR)) {
@@ -2919,7 +2919,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'get-server-info') {
     $rootTotal = @disk_total_space($ROOT_DIR);
     jsonOut([
         'status'               => 'success',
-        'solofm_version'       => SOLOFM_VERSION,
+        'solofilemanager_version' => SOLOFILEMANAGER_VERSION,
         'php_version'          => PHP_VERSION,
         'php_sapi'             => PHP_SAPI,
         'server_software'      => (string)($_SERVER['SERVER_SOFTWARE'] ?? ''),
@@ -4769,7 +4769,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'delete-stream' && isset($_P
 
 $cmsId = detectCms($ROOT_DIR);
 $suggested = randomName(30, 40) . '.php';
-$suggestedPrefixed = 'solofm_' . randomName(24, 32) . '.php';
+$suggestedPrefixed = 'solofilemanager_' . randomName(24, 32) . '.php';
 global $serverCapabilities;
 $FM_EXEC_AVAILABLE = $serverCapabilities['exec_available'];
 $FM_TERMINAL_HERE_ENABLED = $FM_ENABLE_TERMINAL_HERE;
@@ -8406,7 +8406,7 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
         const cms_id = <?php echo json_encode($cmsId); ?>;
         const needs_rename = <?php echo $needsRename ? 'true' : 'false'; ?>;
         const enable_auth = <?php echo $ENABLE_AUTH ? 'true' : 'false'; ?>;
-        const solofm_version = <?php echo json_encode(SOLOFM_VERSION); ?>;
+        const solofilemanager_version = <?php echo json_encode(SOLOFILEMANAGER_VERSION); ?>;
         const password_is_default = <?php echo $passwordIsDefault ? 'true' : 'false'; ?>;
         const suggested_name = <?php echo json_encode($suggested); ?>;
         const suggested_name_prefixed = <?php echo json_encode($suggestedPrefixed); ?>;
@@ -8431,7 +8431,7 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     <div class="fm-card">
         <h1>Setup required</h1>
         <p>This file should be renamed to a unique, hard-to-guess name before use.</p>
-        <p class="fm-hint">Choose a suggestion, or edit the name. Allowed: 30–40 chars <code>[A-Za-z0-9].php</code>, or <code>solofm_</code> + 24–32 chars + <code>.php</code>.</p>
+        <p class="fm-hint">Choose a suggestion, or edit the name. Allowed: 30–40 chars <code>[A-Za-z0-9].php</code>, or <code>solofilemanager_</code> + 24–32 chars + <code>.php</code>.</p>
         <div class="fm-rename-options" id="fm-rename-options">
             <button type="button" class="fm-rename-option is-selected" data-name="<?php echo htmlspecialchars($suggested, ENT_QUOTES); ?>">
                 <span class="fm-rename-option-label">Random (harder to find)</span>
@@ -8441,7 +8441,7 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
             <button type="button" class="fm-rename-option" data-name="<?php echo htmlspecialchars($suggestedPrefixed, ENT_QUOTES); ?>">
                 <span class="fm-rename-option-label">With SoloFileManager prefix (easier to find)</span>
                 <span class="fm-rename-option-name"><?php echo htmlspecialchars($suggestedPrefixed, ENT_QUOTES); ?></span>
-                <span class="fm-rename-option-hint">Starts with <code>solofm_</code> — easier for you to spot in the folder</span>
+                <span class="fm-rename-option-hint">Starts with <code>solofilemanager_</code> — easier for you to spot in the folder</span>
             </button>
         </div>
         <div class="fm-row">
@@ -8494,7 +8494,7 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
             <button class="fm-btn" id="fm-login-btn">Login</button>
         </div>
         <p class="fm-error" id="fm-login-error" style="display:none"></p>
-        <p class="fm-hint">SoloFileManager <?php echo htmlspecialchars(SOLOFM_VERSION, ENT_QUOTES); ?></p>
+        <p class="fm-hint">SoloFileManager <?php echo htmlspecialchars(SOLOFILEMANAGER_VERSION, ENT_QUOTES); ?></p>
     </div>
     <script>
         (function () {
@@ -8609,7 +8609,7 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
         <div class="fm-table-header">
             <div class="fm-table-title">
                 <span>SoloFileManager</span>
-                <span class="fm-version-tag" style="color:rgba(255,255,255,.85);font-size:12px">v<?php echo htmlspecialchars(SOLOFM_VERSION, ENT_QUOTES); ?></span>
+                <span class="fm-version-tag" style="color:rgba(255,255,255,.85);font-size:12px">v<?php echo htmlspecialchars(SOLOFILEMANAGER_VERSION, ENT_QUOTES); ?></span>
                 <span class="fm-hint" style="color:rgba(255,255,255,.85);font-size:12px"><?php echo htmlspecialchars($thisFileName); ?></span>
             </div>
             <div class="fm-table-header-right">
@@ -10339,7 +10339,7 @@ class FmDeletePopup extends FmPopup {
  *   new FmCompressPopup({
  *     currentPath: '/uploads/docs',
  *     rootDir:     '/uploads',
- *     ajaxUrl:     '/solofm.php',
+ *     ajaxUrl:     '/solofilemanager.php',
  *     names:       ['a.txt', 'b'],
  *     defaultArchiveName: 'archive.zip',
  *     onSuccess:   (archiveNames) => { table.load(...); } // string[] basenames of created archives
@@ -11302,7 +11302,7 @@ class FmGetInfoPopup extends FmPopup {
  * FmServerInfoPopup – shows PHP / OS / disk / limits from `get-server-info`.
  *
  * @example
- *   new FmServerInfoPopup({ ajaxUrl: '/solofm.php' }).show();
+ *   new FmServerInfoPopup({ ajaxUrl: '/solofilemanager.php' }).show();
  */
 class FmServerInfoPopup extends FmPopup {
     /**
@@ -11351,7 +11351,7 @@ class FmServerInfoPopup extends FmPopup {
             ? FmPopup.escapeHtml(String(data.verbose_progress_min_items))
             : esc(null);
         const rows = [
-            ['SoloFileManager version',        esc(data.solofm_version)],
+            ['SoloFileManager version',        esc(data.solofilemanager_version)],
             ['PHP version',           esc(data.php_version)],
             ['PHP exec()',            execLine],
             ['File ops mode',         fileOpsLine],
@@ -11386,7 +11386,7 @@ class FmServerInfoPopup extends FmPopup {
     }
 
     /**
-     * Human-readable label for solofm.php $FM_FILE_OPS_MODE (get-server-info: file_ops_mode).
+     * Human-readable label for solofilemanager.php $FM_FILE_OPS_MODE (get-server-info: file_ops_mode).
      * @param {string|null|undefined} mode
      * @returns {string} HTML (escaped)
      */
@@ -16437,7 +16437,7 @@ class FmFileManagerTable extends FmTable {
     };
 
     /**
-     * Extensions allowed for inline list preview (`action=file-view`). Keep aligned with `fmImageViewMimeForExtension` in solofm.php.
+     * Extensions allowed for inline list preview (`action=file-view`). Keep aligned with `fmImageViewMimeForExtension` in solofilemanager.php.
      * @type {Set<string>}
      */
     static IMAGE_PREVIEW_EXT = new Set([
