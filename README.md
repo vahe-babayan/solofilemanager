@@ -1,15 +1,15 @@
-# SoloFM
+# SoloFileManager
 
-**SoloFM** is a single-file PHP file manager for small self-hosted setups (XAMPP, shared hosting, VPS, etc.). Drop one PHP file into a directory and manage files from the browser.
+**SoloFileManager** is a single-file PHP file manager for small self-hosted setups (XAMPP, shared hosting, VPS, etc.). Drop one PHP file into a directory and manage files from the browser.
 
-Current version: **1.0.2**
+Current version: **1.1.0**
 
 ## Quick start
 
 1. Copy `solofm.php` into the directory you want to manage (or into a web-accessible folder pointing at your target root).
 2. Open it in the browser, e.g. `http://localhost/solofm.php`
-3. On first run, SoloFM asks you to **rename** the file. You can pick a pure random name (harder to find) or a `solofm_`-prefixed name (easier to spot in the folder).
-4. Log in with the default password **`admin`**. SoloFM then asks you to **set a new password** (new + confirm only — no need to retype `admin`). It tries to update `$PASSWORD_HASH` in the same PHP file; if the file is not writable, it shows a hash to paste manually. You can change the password later from the key icon in the header.
+3. On first run, SoloFileManager asks you to **rename** the file. You can pick a pure random name (harder to find) or a `solofm_`-prefixed name (easier to spot in the folder).
+4. Log in with the default password **`admin`**. SoloFileManager then asks you to **set a new password** (new + confirm only — no need to retype `admin`). It tries to update `$PASSWORD_HASH` in the same PHP file; if the file is not writable, it shows a hash to paste manually. You can change the password later from the key icon in the header.
 
 ### Requirements
 
@@ -17,16 +17,16 @@ Current version: **1.0.2**
 
 - PHP **7.4+** (`declare(strict_types=1)`)
 - Extensions: **`json`**, **`session`** (required for the UI/API and login)
-- **`mbstring`** recommended (better text encoding handling; SoloFM degrades without it)
+- **`mbstring`** recommended (better text encoding handling; SoloFileManager degrades without it)
 - Archives (compress / extract / multi-download ZIP): **`zip`** (`ZipArchive`) and/or **`phar`** (`Phar` / `PharData`)
-- **`exec()`** optional — when available and not in `disable_functions`, SoloFM can use OS tools for faster copy/move/delete/compress/extract/folder-size (`$FM_FILE_OPS_MODE = 'auto'`). Without `exec()`, use `'php'` mode (or leave `'auto'` and rely on PHP fallbacks)
+- **`exec()`** optional — when available and not in `disable_functions`, SoloFileManager can use OS tools for faster copy/move/delete/compress/extract/folder-size (`$FM_FILE_OPS_MODE = 'auto'`). Without `exec()`, use `'php'` mode (or leave `'auto'` and rely on PHP fallbacks)
 
 **Filesystem**
 
 - The web server user must be able to **read** `$ROOT_DIR` and **write** where you create/upload/rename/delete files
 - First-run self-rename needs write permission on the directory that contains `solofm.php`
 - Trash uses a hidden folder under root (default `.trash`); that path must be creatable/writable
-- When you finish with SoloFM, **empty Trash** or delete the trash folder (default `.trash`) so removed files are not left on the server
+- When you finish with SoloFileManager, **empty Trash** or delete the trash folder (default `.trash`) so removed files are not left on the server
 
 **Browser & network**
 
@@ -78,7 +78,7 @@ Paste the result into `$PASSWORD_HASH` near the top of the script.
 
 ## Security
 
-SoloFM can create, rename, and delete files. Treat it as **high risk** if exposed on the public internet.
+SoloFileManager can create, rename, and delete files. Treat it as **high risk** if exposed on the public internet.
 
 - Keep `$ENABLE_AUTH = true` and change the default `admin` password on first login
 - Do not rely on the random filename alone
@@ -87,6 +87,16 @@ SoloFM can create, rename, and delete files. Treat it as **high risk** if expose
 See [SECURITY.md](SECURITY.md) for more.
 
 ## Changelog
+
+### 1.1.0
+
+- Filter current folder by name (search field in the breadcrumb bar)
+- Empty Trash (toolbar confirm + API); clearer Restore visibility with Show trashed
+- Delete forever confirm for dimmed trashed rows; archive overwrite confirm
+- Faster folder size via OS tools when `exec()` / file-ops mode allows
+- Keyboard shortcut labels on actions; F5 refresh; extract syncs sidebar tree
+- Scrollbars: show on hover (fine pointer); always visible on touch
+- Fix: restore / empty trash update the sidebar without a full tree reload (avoids lag)
 
 ### 1.0.2
 
@@ -101,4 +111,4 @@ See [SECURITY.md](SECURITY.md) for more.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Others may use, modify, and redistribute SoloFM (including commercially), as long as they keep the copyright and license notice. The software is provided **as is**, without warranty.
+MIT — see [LICENSE](LICENSE). Others may use, modify, and redistribute SoloFileManager (including commercially), as long as they keep the copyright and license notice. The software is provided **as is**, without warranty.

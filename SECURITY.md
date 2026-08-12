@@ -2,7 +2,7 @@
 
 ## Important
 
-SoloFM is a file manager with destructive operations (delete, rename, upload, chmod, optional shell). Treat it as **high risk** if exposed publicly.
+SoloFileManager is a file manager with destructive operations (delete, rename, upload, chmod, optional shell). Treat it as **high risk** if exposed publicly.
 
 ## Minimum recommendations
 
@@ -11,7 +11,7 @@ SoloFM is a file manager with destructive operations (delete, rename, upload, ch
   - change the default `admin` password via the in-app **Change password** flow (updates `$PASSWORD_HASH` in the same file when writable; otherwise paste the shown hash manually)
 - Complete the first-run **self-rename** away from `solofm.php` (pure random or `solofm_` + random — both are accepted)
 - Leave `$FM_ENABLE_TERMINAL_HERE`, `$FM_ENABLE_TERMINAL_MANUAL`, and `$FM_ENABLE_TERMINAL_ADVANCED` at **`false`** unless you fully trust the host and operators. All three can be set from **Terminal settings** in the UI (terminal icon / gear → password → writes the flags in the same PHP file) or by editing the file manually.
-- When you finish using SoloFM, **empty Trash** or delete the trash folder (default `$FM_TRASH_BASENAME` / `.trash`) so deleted files are not left on disk
+- When you finish using SoloFileManager, **empty Trash** or delete the trash folder (default `$FM_TRASH_BASENAME` / `.trash`) so deleted files are not left on disk
 - Do not deploy it publicly without additional controls
 
 ## Strong recommendations (production)
@@ -21,7 +21,7 @@ SoloFM is a file manager with destructive operations (delete, rename, upload, ch
 - Serve over **HTTPS** only
 - Disable directory listing in the web server
 - Place the script **outside the public web root** if possible, or behind a private admin route
-- Ensure PHP errors are not displayed publicly (`display_errors=Off` — SoloFM ships with this off)
+- Ensure PHP errors are not displayed publicly (`display_errors=Off` — SoloFileManager ships with this off)
 
 ## Threat model notes
 

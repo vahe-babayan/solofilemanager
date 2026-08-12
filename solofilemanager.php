@@ -2,13 +2,13 @@
 declare(strict_types=1);
 
 /*
- * SoloFM — single-file PHP file manager (release build).
+ * SoloFileManager — single-file PHP file manager (release build).
  * Layout: config → helpers → actions → HTML + inlined CSS/JS.
- * Built from the SoloFM development sources; do not edit by hand unless necessary.
+ * Built from the SoloFileManager development sources; do not edit by hand unless necessary.
  */
 
 /** Product version (semver). Shown in UI / server info. */
-const SOLOFM_VERSION = '1.0.2';
+const SOLOFM_VERSION = '1.1.0';
 
 // Set max execution time to 1 day (86400 seconds)
 @set_time_limit(86400);
@@ -4781,7 +4781,7 @@ $FM_TERMINAL_ADVANCED_ENABLED = $FM_ENABLE_TERMINAL_ADVANCED;
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>SoloFM</title>
+    <title>SoloFileManager</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <!-- <link href="https://fonts.googleapis.com/css2?family=Playpen+Sans:wght@400;500;700&display=swap" rel="stylesheet"> -->
@@ -4789,7 +4789,7 @@ $FM_TERMINAL_ADVANCED_ENABLED = $FM_ENABLE_TERMINAL_ADVANCED;
     <link href="https://cdnjs.cloudflare.com/ajax/libs/normalize/8.0.1/normalize.min.css" rel="stylesheet" crossorigin="anonymous" referrerpolicy="no-referrer">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.13.1/font/bootstrap-icons.css" rel="stylesheet">
     <style>
-/* SoloFM inline styles — layout, popup, table, tree, setup/login. */
+/* SoloFileManager inline styles — layout, popup, table, tree, setup/login. */
 :root {
     --main-color: #da615b;
     --main-color-alpha-40: #da615b40;
@@ -8439,7 +8439,7 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
                 <span class="fm-rename-option-hint">Pure random filename — slightly better obscurity</span>
             </button>
             <button type="button" class="fm-rename-option" data-name="<?php echo htmlspecialchars($suggestedPrefixed, ENT_QUOTES); ?>">
-                <span class="fm-rename-option-label">With SoloFM prefix (easier to find)</span>
+                <span class="fm-rename-option-label">With SoloFileManager prefix (easier to find)</span>
                 <span class="fm-rename-option-name"><?php echo htmlspecialchars($suggestedPrefixed, ENT_QUOTES); ?></span>
                 <span class="fm-rename-option-hint">Starts with <code>solofm_</code> — easier for you to spot in the folder</span>
             </button>
@@ -8494,7 +8494,7 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
             <button class="fm-btn" id="fm-login-btn">Login</button>
         </div>
         <p class="fm-error" id="fm-login-error" style="display:none"></p>
-        <p class="fm-hint">SoloFM <?php echo htmlspecialchars(SOLOFM_VERSION, ENT_QUOTES); ?></p>
+        <p class="fm-hint">SoloFileManager <?php echo htmlspecialchars(SOLOFM_VERSION, ENT_QUOTES); ?></p>
     </div>
     <script>
         (function () {
@@ -8527,8 +8527,8 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
 <?php elseif ($needsPasswordChange): ?>
     <div class="fm-card">
         <h1>Set a password</h1>
-        <p class="fm-hint">Choose a new password before using SoloFM (the default <code>admin</code> login is only for first setup).</p>
-        <p class="fm-hint">SoloFM will try to update <code>$PASSWORD_HASH</code> in <code><?php echo htmlspecialchars($thisFileName, ENT_QUOTES); ?></code>. If the file is not writable, you will get a hash to paste manually.</p>
+        <p class="fm-hint">Choose a new password before using SoloFileManager (the default <code>admin</code> login is only for first setup).</p>
+        <p class="fm-hint">SoloFileManager will try to update <code>$PASSWORD_HASH</code> in <code><?php echo htmlspecialchars($thisFileName, ENT_QUOTES); ?></code>. If the file is not writable, you will get a hash to paste manually.</p>
         <div class="fm-pwd-fields">
             <label><span>New password (min 8 characters)</span><input class="fm-input" id="fm-pwd-new" type="password" autocomplete="new-password"></label>
             <label><span>Confirm new password</span><input class="fm-input" id="fm-pwd-confirm" type="password" autocomplete="new-password"></label>
@@ -8608,7 +8608,7 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     <div class="fm-table-wrapper">
         <div class="fm-table-header">
             <div class="fm-table-title">
-                <span>SoloFM</span>
+                <span>SoloFileManager</span>
                 <span class="fm-version-tag" style="color:rgba(255,255,255,.85);font-size:12px">v<?php echo htmlspecialchars(SOLOFM_VERSION, ENT_QUOTES); ?></span>
                 <span class="fm-hint" style="color:rgba(255,255,255,.85);font-size:12px"><?php echo htmlspecialchars($thisFileName); ?></span>
             </div>
@@ -8644,7 +8644,7 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
                         </div>
                         <div class="fm-sidebar-footer">
                             <button type="button" id="fm-sidebar-trash-btn" class="fm-sidebar-trash-btn" title="Trash (recycle bin)" aria-label="Trash" aria-pressed="false"><i class="bi bi-trash3" aria-hidden="true"></i> Trash</button>
-                            <p class="fm-sidebar-trash-hint">Open Trash and use Empty Trash (toolbar), or delete the <code><?php echo htmlspecialchars(fmTrashBasename(), ENT_QUOTES); ?></code> folder when you finish with SoloFM.</p>
+                            <p class="fm-sidebar-trash-hint">Open Trash and use Empty Trash (toolbar), or delete the <code><?php echo htmlspecialchars(fmTrashBasename(), ENT_QUOTES); ?></code> folder when you finish with SoloFileManager.</p>
                         </div>
                     </div>
                 </div>
@@ -8852,7 +8852,7 @@ function requireAuthFetch(url, opts) {
 
 /* ===== Popup layer ===== */
 /**
- * @fileoverview Modal / popup layer for SoloFM.
+ * @fileoverview Modal / popup layer for SoloFileManager.
  * Base: {@link FmPopup}. Domain subclasses include {@link FmDeletePopup}, {@link FmCompressPopup},
  * {@link FmDownloadArchivePopup}, {@link FmExtractPopup}, {@link FmCopyMovePopup}, {@link FmUploadPopup}, {@link FmChmodPopup}, {@link FmBulkRenamePopup}, {@link FmServerInfoPopup},
  * {@link FmNoticePopup}, {@link FmIndeterminateProgressPopup}, {@link FmImageViewerPopup}, and smaller dialogs (rename, new folder, …).
@@ -11351,7 +11351,7 @@ class FmServerInfoPopup extends FmPopup {
             ? FmPopup.escapeHtml(String(data.verbose_progress_min_items))
             : esc(null);
         const rows = [
-            ['SoloFM version',        esc(data.solofm_version)],
+            ['SoloFileManager version',        esc(data.solofm_version)],
             ['PHP version',           esc(data.php_version)],
             ['PHP exec()',            execLine],
             ['File ops mode',         fileOpsLine],
@@ -14956,7 +14956,7 @@ if (typeof window !== 'undefined') {
 
 /* ===== Folder tree ===== */
 /**
- * @fileoverview Folder tree for SoloFM. Base: {@link FmTree}. Sidebar + AJAX: {@link FmSidebarTree} extends FmTree.
+ * @fileoverview Folder tree for SoloFileManager. Base: {@link FmTree}. Sidebar + AJAX: {@link FmSidebarTree} extends FmTree.
  */
 
 /**
@@ -15726,7 +15726,7 @@ if (typeof window !== 'undefined') {
 
 /* ===== Table UI ===== */
 /**
- * @fileoverview Table UI for SoloFM. Base: {@link FmTable} (toolbar + sortable rows). File manager: {@link FmFileManagerTable}.
+ * @fileoverview Table UI for SoloFileManager. Base: {@link FmTable} (toolbar + sortable rows). File manager: {@link FmFileManagerTable}.
  */
 
 /**
@@ -17468,7 +17468,7 @@ class FmFileManagerTable extends FmTable {
                 '<p class="fm-trash-cleanup-hint">' +
                 this.escapeHtml('Tip: use Empty Trash in the toolbar, or delete the ') +
                 '<code>' + this.escapeHtml(tb) + '</code>' +
-                this.escapeHtml(' folder when you finish with SoloFM.') +
+                this.escapeHtml(' folder when you finish with SoloFileManager.') +
                 '</p>';
         }
 
@@ -17651,7 +17651,7 @@ class FmFileManagerTable extends FmTable {
                 '<p class="fm-table-empty-text fm-table-empty-text--trash-hint">' +
                 this.escapeHtml('Use Empty Trash in the toolbar, or delete the ') +
                 '<code>' + this.escapeHtml(tb) + '</code>' +
-                this.escapeHtml(' folder when you finish with SoloFM.') +
+                this.escapeHtml(' folder when you finish with SoloFileManager.') +
                 '</p>';
             return;
         }
@@ -20085,7 +20085,7 @@ if (typeof window !== 'undefined') {
 
 /* ===== App bootstrap ===== */
 /**
- * @fileoverview Bootstraps SoloFM: main table, sidebar tree, config / shortcuts / server-info wiring.
+ * @fileoverview Bootstraps SoloFileManager: main table, sidebar tree, config / shortcuts / server-info wiring.
  */
 const mainTableContainer = document.getElementById('fm-table-container');
 let mainTable   = null;
@@ -20485,7 +20485,7 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
     const fileOpsHtml =
         '<fieldset class="fm-cfg-server-fieldset">' +
         '<legend>Heavy file operations</legend>' +
-        '<p class="fm-cfg-server-desc">How SoloFM runs compress, extract, copy/move, delete-stream, and folder-size. Saved in this PHP file when changed.</p>' +
+        '<p class="fm-cfg-server-desc">How SoloFileManager runs compress, extract, copy/move, delete-stream, and folder-size. Saved in this PHP file when changed.</p>' +
         '<label class="fm-cfg-fileops-option"><input type="radio" name="cfg-fileops" value="auto" class="cfg-fileops" ' + (curOps === 'auto' ? 'checked' : '') + '> Auto <span class="fm-cfg-perm-example">OS first when exec() is available, then PHP</span></label>' +
         '<label class="fm-cfg-fileops-option"><input type="radio" name="cfg-fileops" value="php" class="cfg-fileops" ' + (curOps === 'php' ? 'checked' : '') + '> PHP only <span class="fm-cfg-perm-example">no OS shell for these actions</span></label>' +
         '<label class="fm-cfg-fileops-option' + (execOk ? '' : ' fm-cfg-fileops-disabled') + '"><input type="radio" name="cfg-fileops" value="os" class="cfg-fileops" ' + (curOps === 'os' ? 'checked' : '') + (execOk ? '' : ' disabled') + '> OS / shell only <span class="fm-cfg-perm-example">' + (execOk ? 'no PHP fallback' : 'unavailable — exec() disabled') + '</span></label>' +
@@ -20640,7 +20640,7 @@ const changePasswordBtn = document.getElementById('fm-change-password-btn');
 if (changePasswordBtn && typeof FmPopup !== 'undefined') {
     changePasswordBtn.addEventListener('click', () => {
         const content =
-            '<p class="fm-hint">SoloFM will try to update <code>$PASSWORD_HASH</code> in this PHP file. If that fails, a hash is shown for manual paste.</p>' +
+            '<p class="fm-hint">SoloFileManager will try to update <code>$PASSWORD_HASH</code> in this PHP file. If that fails, a hash is shown for manual paste.</p>' +
             '<div class="fm-pwd-fields">' +
             '<label><span>Current password</span><input class="fm-input" name="pwd-current" type="password" autocomplete="current-password"></label>' +
             '<label><span>New password (min 8 characters)</span><input class="fm-input" name="pwd-new" type="password" autocomplete="new-password"></label>' +
