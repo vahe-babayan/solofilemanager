@@ -25,44 +25,46 @@ Current version: **1.1.0**
 
 <table>
     <tr>
-        <td width="33%">
+        <td width="100%" colspan="3">
             <img src="./screenshots/screenshot-1.png" alt="SoloFileManager Dashboard" width="100%">
         </td>
-        <td width="33%">
+    </tr>
+    <tr>
+        <td width="50%">
             <img src="./screenshots/screenshot-2.png" alt="Keyboard shortcuts" width="100%">
         </td>
-        <td width="33%">
+        <td width="50%">
             <img src="./screenshots/screenshot-3.png" alt="Upload files" width="100%">
         </td>
     </tr>
     <tr>
-        <td width="33%">
+        <td width="50%">
             <img src="./screenshots/screenshot-4.png" alt="Copy to folder" width="100%">
         </td>
-        <td width="33%">
+        <td width="50%">
             <img src="./screenshots/screenshot-5.png" alt="Delete" width="100%">
-        </td>
-        <td width="33%">
-            <img src="./screenshots/screenshot-6.png" alt="Terminal" width="100%">
         </td>
     </tr>
     <tr>
-        <td width="33%">
+        <td width="50%">
+            <img src="./screenshots/screenshot-6.png" alt="Terminal" width="100%">
+        </td>
+        <td width="50%">
             <img src="./screenshots/screenshot-7.png" alt="Bulk rename" width="100%">
         </td>
-        <td width="33%">
+    </tr>
+    <tr>
+        <td width="50%">
             <img src="./screenshots/screenshot-8.png" alt="Configuration" width="100%">
         </td>
-        <td width="33%">
+        <td width="50%">
             <img src="./screenshots/screenshot-9.png" alt="Extract / Unzip" width="100%">
         </td>
     </tr>
     <tr>
-        <td width="33%">
+        <td width="50%">
             <img src="./screenshots/screenshot-10.png" alt="Permissions management" width="100%">
         </td>
-        <td width="33%"></td>
-        <td width="33%"></td>
     </tr>
 </table>
 
