@@ -1,8 +1,70 @@
 # SoloFileManager
 
-**SoloFileManager** is a single-file PHP file manager for small self-hosted setups (XAMPP, shared hosting, VPS, etc.). Drop one PHP file into a directory and manage files from the browser.
+### A powerful single-file PHP file manager for your server.
+
+Manage files directly from your browser — without installing WordPress, Laravel, a database, Node.js or any other framework.
+
+### One PHP file. No installation. No database.
 
 Current version: **1.1.0**
+
+## Why SoloFileManager?
+
+- 🚀 Single PHP file
+- 📦 No database required
+- 🔧 Works on shared hosting, VPS and XAMPP
+- 📁 Upload, download, copy, move and rename files
+- 🗑️ Trash and restore
+- 📦 ZIP compression and extraction
+- 🔐 Built-in authentication
+- 🖥️ Optional terminal
+- ⚡ Fast and lightweight
+- 🆓 MIT License
+
+## Screenshots
+
+<table>
+    <tr>
+        <td width="33%">
+            <img src="./screenshots/screenshot-1.png" alt="SoloFileManager Dashboard" width="100%">
+        </td>
+        <td width="33%">
+            <img src="./screenshots/screenshot-2.png" alt="Keyboard shortcuts" width="100%">
+        </td>
+        <td width="33%">
+            <img src="./screenshots/screenshot-3.png" alt="Upload files" width="100%">
+        </td>
+    </tr>
+    <tr>
+        <td width="33%">
+            <img src="./screenshots/screenshot-4.png" alt="Copy to folder" width="100%">
+        </td>
+        <td width="33%">
+            <img src="./screenshots/screenshot-5.png" alt="Delete" width="100%">
+        </td>
+        <td width="33%">
+            <img src="./screenshots/screenshot-6.png" alt="Terminal" width="100%">
+        </td>
+    </tr>
+    <tr>
+        <td width="33%">
+            <img src="./screenshots/screenshot-7.png" alt="Bulk rename" width="100%">
+        </td>
+        <td width="33%">
+            <img src="./screenshots/screenshot-8.png" alt="Configuration" width="100%">
+        </td>
+        <td width="33%">
+            <img src="./screenshots/screenshot-9.png" alt="Extract / Unzip" width="100%">
+        </td>
+    </tr>
+    <tr>
+        <td width="33%">
+            <img src="./screenshots/screenshot-10.png" alt="Permissions management" width="100%">
+        </td>
+        <td width="33%"></td>
+        <td width="33%"></td>
+    </tr>
+</table>
 
 ## Quick start
 

@@ -3759,6 +3759,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'extract' && isset($_POST['i
     };
 
     try {
+        $highlightNames = [];
         foreach ($archives as $a) {
             $base = $a['name'];
             $apath = $a['path'];
@@ -3771,6 +3772,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'extract' && isset($_POST['i
                     $sendError('Invalid folder name for: ' . $base);
                 }
                 $destDir = $dir . '/' . $sub;
+                $highlightNames[] = $sub;
             } else {
                 $destDir = $dir;
             }
@@ -3815,7 +3817,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'extract' && isset($_POST['i
         }
 
         $send(['n' => $processed, 'total' => $grandTotal]);
-        $send(['done' => true]);
+        $send(['done' => true, 'highlight' => array_values(array_unique($highlightNames))]);
     } catch (Throwable $e) {
         $sendError($e->getMessage());
     }
@@ -4314,6 +4316,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'duplicate-stream' && isset(
         $send(['n' => $n, 'name' => $relName, 'total' => $totalEstimate]);
     };
 
+    $created = [];
     $taken = [];
 
     foreach ($names as $name) {
@@ -4324,6 +4327,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'duplicate-stream' && isset(
 
         $dstName = fmNextDuplicateBasename($destDir, $name, $taken);
         $dstPath = $destDir . '/' . $dstName;
+        $created[] = $dstName;
 
         if (!pathInsideRoot($dstPath, $ROOT_DIR)) {
             $sendError('Invalid destination for: ' . $name);
@@ -4358,7 +4362,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'duplicate-stream' && isset(
         }
     }
 
-    $send(['done' => true]);
+    $send(['done' => true, 'created' => $created]);
     exit;
 }
 
@@ -6847,6 +6851,10 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     width: 3.25rem;
     padding: 0.2rem 0.35rem;
     font-size: 0.8125rem;
+    display: inline;
+    margin-top: 0;
+    border-radius: 5px;
+    border: 1px solid #767676;
 }
 
 .fm-bulk-rename-popup .fm-br-counter-fields .fm-br-c-sep {
@@ -14413,7 +14421,7 @@ class FmBulkRenamePopup extends FmPopup {
         super({
             title: 'Bulk rename',
             className: 'fm-bulk-rename-popup',
-            maxWidth: '580px',
+            maxWidth: '680px',
             submitOnEnter: true,
             content: content,
             buttons: [
@@ -18112,7 +18120,7 @@ class FmFileManagerTable extends FmTable {
                     .map((r) => r.name);
                 this.load(this._currentPath, () => {
                     if (heartbeatAfterRestore && restoredOk.length) {
-                        restoredOk.forEach((name) => this.highlightRowByName(name));
+                        this.highlightRowsByNames(restoredOk);
                     }
                     this._callHook('after', 'restore-trashed', {
                         currentPath: this._currentPath,
@@ -18294,9 +18302,11 @@ class FmFileManagerTable extends FmTable {
             sourcePath:    this._currentPath,
             names,
             execAvailable: this._execAvailable,
-            onSuccess:     () => {
+            onSuccess:     (createdNames) => {
+                const list = Array.isArray(createdNames) ? createdNames : [];
                 this.load(this._currentPath, () => {
-                    this._callHook('after', 'duplicate', { names, currentPath: this._currentPath });
+                    this.highlightRowsByNames(list);
+                    this._callHook('after', 'duplicate', { names, createdNames: list, currentPath: this._currentPath });
                 });
             },
         });
@@ -18405,9 +18415,11 @@ class FmFileManagerTable extends FmTable {
             rootDir:     this._rootDir,
             ajaxUrl:     this._ajaxUrl,
             rows,
-            onSuccess:   () => {
+            onSuccess:   (newNames) => {
+                const list = Array.isArray(newNames) ? newNames : [];
                 this.load(this._currentPath, () => {
-                    this._callHook('after', 'bulk-rename', { currentPath: this._currentPath });
+                    this.highlightRowsByNames(list);
+                    this._callHook('after', 'bulk-rename', { newNames: list, currentPath: this._currentPath });
                 });
             },
         }).show();
@@ -18452,9 +18464,11 @@ class FmFileManagerTable extends FmTable {
             ajaxUrl:     this._ajaxUrl,
             folderRows,
             fileRows,
-            onSuccess:   () => {
+            onSuccess:   (changedNames) => {
+                const list = Array.isArray(changedNames) ? changedNames : [];
                 this.load(this._currentPath, () => {
-                    this._callHook('after', 'change-permissions', { currentPath: this._currentPath });
+                    this.highlightRowsByNames(list);
+                    this._callHook('after', 'change-permissions', { names: list, currentPath: this._currentPath });
                 });
             },
         }).show();
@@ -18817,9 +18831,11 @@ class FmFileManagerTable extends FmTable {
             currentPath: this._currentPath,
             rootDir:     this._rootDir,
             ajaxUrl:     this._ajaxUrl,
-            onSuccess:   () => {
+            onSuccess:   (uploadedNames) => {
+                const list = Array.isArray(uploadedNames) ? uploadedNames : [];
                 this.load(this._currentPath, () => {
-                    this._callHook('after', 'upload', { currentPath: this._currentPath });
+                    this.highlightRowsByNames(list);
+                    this._callHook('after', 'upload', { names: list, currentPath: this._currentPath });
                 });
             },
         }).show();
@@ -18850,7 +18866,7 @@ class FmFileManagerTable extends FmTable {
             onSuccess: (archiveNames) => {
                 const list = Array.isArray(archiveNames) ? archiveNames : (archiveNames ? [archiveNames] : []);
                 this.load(this._currentPath, () => {
-                    list.forEach((n) => this.highlightRowByName(n));
+                    this.highlightRowsByNames(list);
                     this._callHook('after', 'compress', { currentPath: this._currentPath });
                 });
             },
@@ -18874,9 +18890,11 @@ class FmFileManagerTable extends FmTable {
             names,
             execAvailable: this._execAvailable,
             maxWidth:      '500px',
-            onSuccess:     () => {
+            onSuccess:     (highlightNames) => {
+                const list = Array.isArray(highlightNames) ? highlightNames : [];
                 this.load(this._currentPath, () => {
-                    this._callHook('after', 'extract', { currentPath: this._currentPath });
+                    this.highlightRowsByNames(list);
+                    this._callHook('after', 'extract', { names: list, currentPath: this._currentPath });
                 });
             },
         }).show();
@@ -19789,6 +19807,21 @@ class FmFileManagerTable extends FmTable {
         if (idx < 0) return;
         const tr = this.tableEl.querySelector(`tbody tr[data-index="${idx}"]`);
         this._flashRowHighlight(tr);
+    }
+
+    /**
+     * Flash multiple rows by basename (bulk rename, chmod, upload, duplicate, etc.).
+     * @param {string[]} names
+     */
+    highlightRowsByNames(names) {
+        if (!Array.isArray(names) || names.length === 0) return;
+        const seen = new Set();
+        names.forEach((name) => {
+            const n = name != null ? String(name) : '';
+            if (n === '' || seen.has(n)) return;
+            seen.add(n);
+            this.highlightRowByName(n);
+        });
     }
 
     /**
