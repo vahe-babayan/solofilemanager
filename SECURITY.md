@@ -4,6 +4,12 @@
 
 SoloFileManager is a file manager with destructive operations (delete, rename, upload, chmod, optional shell). Treat it as **high risk** if exposed publicly.
 
+## Built-in protections
+
+- **CSRF protection**: every state-changing request (POST) must carry a per-session token, so other websites cannot trigger actions through a logged-in browser. Pages opened before an update need a reload.
+- **Session cookie** is `HttpOnly` and `SameSite=Lax`, and `Secure` when served over HTTPS.
+- **Login delay** of ~200 ms on wrong passwords (a light brute-force slowdown — still use IP restrictions / Basic Auth for real protection).
+
 ## Minimum recommendations
 
 - Keep authentication enabled in `solofilemanager.php`:
@@ -18,7 +24,7 @@ SoloFileManager is a file manager with destructive operations (delete, rename, u
 
 - **Restrict by IP** (allowlist) at the web server
 - Add **HTTP Basic Auth** at the web server level
-- Serve over **HTTPS** only
+- Serve over **HTTPS** only (this also turns on the `Secure` flag for the session cookie)
 - Disable directory listing in the web server
 - Place the script **outside the public web root** if possible, or behind a private admin route
 - Ensure PHP errors are not displayed publicly (`display_errors=Off` — SoloFileManager ships with this off)

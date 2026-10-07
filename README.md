@@ -82,8 +82,9 @@ Current version: **1.1.0**
 - PHP **7.4+** (`declare(strict_types=1)`)
 - Extensions: **`json`**, **`session`** (required for the UI/API and login)
 - **`mbstring`** recommended (better text encoding handling; SoloFileManager degrades without it)
-- Archives (compress / extract / multi-download ZIP): **`zip`** (`ZipArchive`) and/or **`phar`** (`Phar` / `PharData`)
-- **`exec()`** optional — when available and not in `disable_functions`, SoloFileManager can use OS tools for faster copy/move/delete/compress/extract/folder-size (`$FM_FILE_OPS_MODE = 'auto'`). Without `exec()`, use `'php'` mode (or leave `'auto'` and rely on PHP fallbacks)
+- Compress / extract: **`zip`** (`ZipArchive`) and/or **`phar`** (`Phar` / `PharData`)
+- Download as archive (folders / multiple items): streams through OS `zip` / `tar` via **`proc_open`** when available, otherwise a built-in PHP writer that needs **`zlib`** for ZIP and TAR.GZ (TAR works without it)
+- **`exec()`** / **`proc_open()`** optional — when available and not in `disable_functions`, SoloFileManager can use OS tools for faster copy/move/delete/compress/extract/folder-size and streamed archive downloads (`$FM_FILE_OPS_MODE = 'auto'`). Without them, use `'php'` mode (or leave `'auto'` and rely on PHP fallbacks)
 
 **Filesystem**
 
@@ -112,7 +113,8 @@ Current version: **1.1.0**
 - Filter the current folder listing by name (search field in the breadcrumb bar)
 - Compress / extract archives
 - Change permissions (chmod) for folders and files, including recursive 0755 / 0644 style fixes
-- Upload, download, get info, copy paths
+- Upload, get info, copy paths
+- Download files, or folders and multiple items as ZIP / TAR / TAR.GZ — the browser download starts immediately while the archive is built; failures show the real reason
 - Configuration popup (columns, permissions display, folder-size behavior, heavy file-ops mode)
 - Change password from the UI (updates `$PASSWORD_HASH` in the same PHP file when writable)
 - Keyboard shortcuts, server info
@@ -147,10 +149,18 @@ SoloFileManager can create, rename, and delete files. Treat it as **high risk** 
 - Keep `$ENABLE_AUTH = true` and change the default `admin` password on first login
 - Do not rely on the random filename alone
 - Prefer HTTPS, IP allowlists, and/or HTTP Basic Auth at the web server
+- Built in: CSRF token on every state-changing request; session cookie is `HttpOnly` + `SameSite=Lax`
 
 See [SECURITY.md](SECURITY.md) for more.
 
 ## Changelog
+
+### Unreleased
+
+- Streaming downloads: the browser download starts immediately and the archive is built on the fly (OS `zip` / `tar` on Linux, built-in PHP writer elsewhere) — fixes "Failed to fetch" on large folders
+- Readable download errors ("Download failed: …", list of skipped files) instead of "Failed to fetch"; no progress toasts (the browser's downloads list shows progress)
+- Download dialog suggests the folder name when one folder is selected
+- Security: CSRF token required on every POST; session cookie `HttpOnly` + `SameSite=Lax` (`Secure` over HTTPS)
 
 ### 1.1.0
 

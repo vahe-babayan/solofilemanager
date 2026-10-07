@@ -653,8 +653,39 @@ function detectCms(string $rootDir): string {
  */
 function ensureSession(): void {
     if (session_status() !== PHP_SESSION_ACTIVE) {
+        if (PHP_VERSION_ID >= 70300 && !headers_sent()) {
+            $https = !empty($_SERVER['HTTPS']) && strtolower((string)$_SERVER['HTTPS']) !== 'off';
+            session_set_cookie_params(['httponly' => true, 'samesite' => 'Lax', 'secure' => $https] + session_get_cookie_params());
+        }
         session_start();
     }
+}
+
+/**
+ * Per-session token that must accompany every POST, so other sites cannot trigger actions through the user's browser.
+ *
+ * @return string
+ */
+function fmCsrfToken(): string {
+    ensureSession();
+    if (empty($_SESSION['fm_csrf']) || !is_string($_SESSION['fm_csrf'])) {
+        $_SESSION['fm_csrf'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['fm_csrf'];
+}
+
+/**
+ * True when the request carries the session's CSRF token, in the X-CSRF-Token header or a csrf_token field
+ * (plain form submits cannot set headers).
+ *
+ * @return bool
+ */
+function fmCsrfRequestIsValid(): bool {
+    ensureSession();
+    $expected = $_SESSION['fm_csrf'] ?? '';
+    if (!is_string($expected) || $expected === '') return false;
+    $sent = (string)($_SERVER['HTTP_X_CSRF_TOKEN'] ?? $_POST['csrf_token'] ?? '');
+    return $sent !== '' && hash_equals($expected, $sent);
 }
 
 /**
@@ -2213,9 +2244,178 @@ function fmCountArchiveEntries(string $path, string $type): int {
 }
 
 /**
- * Plain-text HTTP error for download-archive failures.
+ * Thrown by FmStreamOut when the browser closed the download connection.
  */
-function fmDownloadArchiveFail(int $code, string $msg): void {
+final class FmDlAbortedException extends RuntimeException {}
+
+/**
+ * Per-download status record (temp JSON keyed by the client's `dl_token`).
+ * The UI polls it (action download-status) so it can explain failures that happen after the download response started.
+ */
+final class FmDlStatus {
+    /** @var string|null */
+    private static $file = null;
+    /** @var array<string,mixed> */
+    private static $data = ['state' => 'none', 'skipped' => [], 'skipped_count' => 0];
+    /** @var float */
+    private static $lastWrite = 0.0;
+
+    public static function tokenIsValid(string $token): bool {
+        return (bool)preg_match('/^[a-f0-9]{16,64}$/', $token);
+    }
+
+    public static function path(string $token): string {
+        return sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'fm-dlstat-' . $token . '.json';
+    }
+
+    /**
+     * Start tracking the current request (no-op when the request has no valid dl_token).
+     */
+    public static function init(string $name): void {
+        $token = (string)($_POST['dl_token'] ?? $_GET['dl_token'] ?? '');
+        if (!self::tokenIsValid($token)) {
+            return;
+        }
+        self::cleanupOld();
+        self::$file = self::path($token);
+        self::$data = [
+            'state'         => 'preparing',
+            'name'          => $name,
+            'engine'        => null,
+            'bytes'         => 0,
+            'total'         => null,
+            'heartbeat'     => time(),
+            'error'         => null,
+            'warning'       => null,
+            'skipped'       => [],
+            'skipped_count' => 0,
+        ];
+        self::write();
+        register_shutdown_function([self::class, 'onShutdown']);
+    }
+
+    public static function streaming(string $engine, ?int $total): void {
+        self::$data['state'] = 'streaming';
+        self::$data['engine'] = $engine;
+        self::$data['total'] = $total;
+        self::write();
+    }
+
+    public static function progress(int $bytes): void {
+        self::$data['bytes'] = $bytes;
+        if (microtime(true) - self::$lastWrite >= 1.0) {
+            self::write();
+        }
+    }
+
+    public static function skip(string $rel, string $reason): void {
+        self::$data['skipped_count']++;
+        if (count(self::$data['skipped']) < 100) {
+            self::$data['skipped'][] = $rel . ' (' . $reason . ')';
+        }
+    }
+
+    public static function done(?string $warning = null): void {
+        self::$data['warning'] = $warning;
+        self::finish('done');
+    }
+
+    public static function fail(string $msg): void {
+        self::$data['error'] = $msg;
+        self::finish('error');
+    }
+
+    public static function aborted(): void {
+        self::finish('aborted');
+    }
+
+    private static function isFinal(): bool {
+        return in_array(self::$data['state'], ['done', 'error', 'aborted'], true);
+    }
+
+    private static function finish(string $state): void {
+        if (self::isFinal()) {
+            return;
+        }
+        self::$data['state'] = $state;
+        self::write();
+    }
+
+    private static function write(): void {
+        if (self::$file === null) {
+            return;
+        }
+        self::$data['heartbeat'] = time();
+        self::$lastWrite = microtime(true);
+        $flags = defined('JSON_INVALID_UTF8_SUBSTITUTE') ? JSON_INVALID_UTF8_SUBSTITUTE : 0;
+        $json = json_encode(self::$data, $flags);
+        if ($json !== false) {
+            @file_put_contents(self::$file, $json, LOCK_EX);
+        }
+    }
+
+    /**
+     * Record why the request ended if it ended without a final state (PHP fatal error, browser disconnect).
+     */
+    public static function onShutdown(): void {
+        if (self::$file === null || self::isFinal()) {
+            return;
+        }
+        $e = error_get_last();
+        $fatal = [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR];
+        if ($e !== null && in_array($e['type'], $fatal, true)) {
+            $msg = (string)$e['message'];
+            if (stripos($msg, 'Allowed memory size') !== false) {
+                self::fail('The server ran out of PHP memory (memory_limit = ' . ini_get('memory_limit') . ').');
+            } elseif (stripos($msg, 'Maximum execution time') !== false) {
+                self::fail('The server reached the PHP time limit (max_execution_time = ' . ini_get('max_execution_time') . ' s).');
+            } else {
+                self::fail('PHP error on the server: ' . $msg);
+            }
+            return;
+        }
+        if (connection_aborted()) {
+            self::aborted();
+            return;
+        }
+        self::fail('The download stopped unexpectedly on the server.');
+    }
+
+    /**
+     * Current status for the UI; final states are deleted once read.
+     *
+     * @return array<string,mixed>
+     */
+    public static function read(string $token): array {
+        $file = self::path($token);
+        if (!is_file($file)) {
+            return ['state' => 'pending'];
+        }
+        $data = json_decode((string)@file_get_contents($file), true);
+        if (!is_array($data)) {
+            return ['state' => 'unknown'];
+        }
+        if (in_array($data['state'] ?? '', ['done', 'error', 'aborted'], true)) {
+            @unlink($file);
+        }
+        return $data;
+    }
+
+    private static function cleanupOld(): void {
+        $old = time() - 3600;
+        foreach (glob(sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'fm-dlstat-*.json') ?: [] as $f) {
+            if ((int)@filemtime($f) < $old) {
+                @unlink($f);
+            }
+        }
+    }
+}
+
+/**
+ * Plain-text HTTP error for download failures before any file data was sent (the UI shows the text).
+ */
+function fmDownloadFail(int $code, string $msg): void {
+    FmDlStatus::fail($msg);
     while (ob_get_level()) {
         @ob_end_clean();
     }
@@ -2225,49 +2425,448 @@ function fmDownloadArchiveFail(int $code, string $msg): void {
 }
 
 /**
- * Stream a temp archive to the client, then delete it.
+ * Send attachment headers for a streamed download and disable everything that would buffer it.
  */
-function fmDownloadArchiveSendFile(string $path, string $downloadBaseName, string $mime): void {
-    if (!is_file($path)) {
-        fmDownloadArchiveFail(500, 'Archive missing');
-    }
+function fmBeginStreamDownload(string $downloadName, string $mime, ?int $length = null): void {
+    @set_time_limit(0);
+    ignore_user_abort(true);
     while (ob_get_level()) {
         @ob_end_clean();
     }
+    @ini_set('zlib.output_compression', '0');
+    if (function_exists('apache_setenv')) {
+        @apache_setenv('no-gzip', '1');
+    }
     header('Content-Type: ' . $mime);
-    header('Content-Length: ' . (string)filesize($path));
-    $safe = str_replace(['"', "\r", "\n"], '', $downloadBaseName);
-    header('Content-Disposition: attachment; filename="' . $safe . '"; filename*=UTF-8\'\'' . rawurlencode($downloadBaseName));
-    readfile($path);
-    @unlink($path);
-    exit;
+    if ($length !== null) {
+        header('Content-Length: ' . (string)$length);
+    }
+    $safe = str_replace(['"', "\r", "\n"], '', $downloadName);
+    header('Content-Disposition: attachment; filename="' . $safe . '"; filename*=UTF-8\'\'' . rawurlencode($downloadName));
+    header('Cache-Control: no-store');
+    header('X-Accel-Buffering: no');
+    header('X-Content-Type-Options: nosniff');
 }
 
 /**
- * POST action download-archive: build archive in temp (OS per $FM_FILE_OPS_MODE, PHP fallback), stream as attachment.
+ * Buffered download output (optionally gzip-compressed): flushes every 64 KB and updates FmDlStatus.
+ */
+final class FmStreamOut {
+    /** @var string */
+    private $buf = '';
+    /** @var int Bytes passed to write() (archive offsets, before optional gzip) */
+    private $position = 0;
+    /** @var int Bytes sent to the client */
+    private $sent = 0;
+    /** @var resource|object|null */
+    private $gzip = null;
+
+    public function __construct(bool $gzip) {
+        if ($gzip) {
+            $this->gzip = deflate_init(ZLIB_ENCODING_GZIP, ['level' => 6]);
+        }
+    }
+
+    public function position(): int {
+        return $this->position;
+    }
+
+    public function write(string $data): void {
+        $this->position += strlen($data);
+        if ($this->gzip !== null) {
+            $data = (string)deflate_add($this->gzip, $data, ZLIB_NO_FLUSH);
+        }
+        $this->buf .= $data;
+        if (strlen($this->buf) >= 65536) {
+            $this->flush();
+        }
+    }
+
+    public function finish(): void {
+        if ($this->gzip !== null) {
+            $this->buf .= (string)deflate_add($this->gzip, '', ZLIB_FINISH);
+            $this->gzip = null;
+        }
+        $this->flush();
+    }
+
+    private function flush(): void {
+        if ($this->buf === '') {
+            return;
+        }
+        echo $this->buf;
+        $this->sent += strlen($this->buf);
+        $this->buf = '';
+        flush();
+        FmDlStatus::progress($this->sent);
+        if (connection_aborted()) {
+            throw new FmDlAbortedException('Connection closed by the browser');
+        }
+    }
+}
+
+/**
+ * Whether proc_open() can be called (present and not listed in disable_functions).
+ */
+function fmIsProcOpenAvailable(): bool {
+    if (!function_exists('proc_open')) {
+        return false;
+    }
+    $disabled = strtolower((string)ini_get('disable_functions'));
+    if ($disabled === '') {
+        return true;
+    }
+    return !in_array('proc_open', array_map('trim', explode(',', $disabled)), true);
+}
+
+/**
+ * OS command that writes the archive of $names (relative to the working folder) to stdout, or null if none fits.
+ *
+ * @param string[] $names
+ * @return string[]|null argv
+ */
+function fmDownloadArchiveOsCommand(string $type, array $names, bool $isUnixLikeShell, bool $isWindows): ?array {
+    global $serverCapabilities;
+    foreach ($names as $n) {
+        if ($n[0] === '-') {
+            return null;
+        }
+    }
+    if ($isWindows) {
+        $tar = (getenv('SystemRoot') ?: 'C:\\Windows') . '\\System32\\tar.exe';
+        if (!is_file($tar)) {
+            return null;
+        }
+        $opts = ['zip' => ['--format', 'zip', '-c'], 'tar' => ['-c'], 'gzip' => ['-z', '-c']][$type];
+        return array_merge([$tar], $opts, ['-f', '-'], $names);
+    }
+    if (!$isUnixLikeShell) {
+        return null;
+    }
+    if ($type === 'zip') {
+        return $serverCapabilities['shell_zip'] ? array_merge(['zip', '-r', '-q', '-'], $names) : null;
+    }
+    if (!$serverCapabilities['shell_tar'] || ($type === 'gzip' && !$serverCapabilities['shell_gzip'])) {
+        return null;
+    }
+    return array_merge(['tar', $type === 'gzip' ? '-czf' : '-cf', '-'], $names);
+}
+
+/**
+ * Run an archive tool and pipe its stdout to the browser as an attachment.
+ * Headers are sent only after the tool produced its first bytes, so an early failure can still fall back.
+ *
+ * @param string[] $argv
+ * @return array{started: bool, error: string}
+ */
+function fmStreamCommandToClient(array $argv, string $cwd, string $downloadName, string $mime): array {
+    $tool = basename(str_replace('\\', '/', $argv[0]));
+    $errFile = tempnam(sys_get_temp_dir(), 'fm-dlerr');
+    if ($errFile === false) {
+        return ['started' => false, 'error' => 'could not create a temp file for ' . $tool . ' output'];
+    }
+    $readErr = static function () use ($errFile): string {
+        $t = trim((string)@file_get_contents($errFile));
+        @unlink($errFile);
+        return strlen($t) > 600 ? '...' . substr($t, -600) : $t;
+    };
+    // Array commands (PHP 7.4+) skip the shell, so file names need no quoting.
+    $cmd = PHP_VERSION_ID >= 70400 ? $argv : implode(' ', array_map('escapeshellarg', $argv));
+    $pipes = [];
+    $proc = @proc_open($cmd, [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['file', $errFile, 'w']], $pipes, $cwd);
+    if (!is_resource($proc)) {
+        $readErr();
+        return ['started' => false, 'error' => 'could not start ' . $tool];
+    }
+    fclose($pipes[0]);
+    $first = fread($pipes[1], 65536);
+    if ($first === false || $first === '') {
+        fclose($pipes[1]);
+        $code = proc_close($proc);
+        $err = $readErr();
+        return ['started' => false, 'error' => $tool . ' exited with code ' . $code . ($err !== '' ? ': ' . $err : '')];
+    }
+
+    fmBeginStreamDownload($downloadName, $mime);
+    FmDlStatus::streaming('os', null);
+    $out = new FmStreamOut(false);
+    try {
+        $out->write($first);
+        while (!feof($pipes[1])) {
+            $chunk = fread($pipes[1], 65536);
+            if ($chunk === false) {
+                break;
+            }
+            $out->write($chunk);
+        }
+        $out->finish();
+    } catch (FmDlAbortedException $e) {
+        proc_terminate($proc);
+        fclose($pipes[1]);
+        proc_close($proc);
+        $readErr();
+        FmDlStatus::aborted();
+        return ['started' => true, 'error' => ''];
+    }
+    fclose($pipes[1]);
+    $code = proc_close($proc);
+    $err = $readErr();
+    $isTar = stripos($tool, 'tar') === 0;
+    if ($code === 0 || $code === -1) {
+        FmDlStatus::done();
+    } elseif (($tool === 'zip' && $code === 18) || ($isTar && $code === 1)) {
+        FmDlStatus::done($tool . ' could not read some files (exit code ' . $code . ')' . ($err !== '' ? ': ' . $err : '.'));
+    } else {
+        FmDlStatus::fail($tool . ' stopped with exit code ' . $code . ($err !== '' ? ': ' . $err : '') . '. The downloaded archive is incomplete.');
+    }
+    return ['started' => true, 'error' => ''];
+}
+
+/**
+ * Files and folders under $dir/$names in archive order, as [absolute path, archive name, is folder].
+ * Unreadable folders, broken links and nested symlinked folders are recorded as skipped.
+ *
+ * @param string[] $names
+ * @return Generator<array{0: string, 1: string, 2: bool}>
+ */
+function fmArchiveWalk(string $dir, array $names): Generator {
+    foreach ($names as $n) {
+        yield from fmArchiveWalkPath($dir . '/' . $n, $n);
+    }
+}
+
+/**
+ * @return Generator<array{0: string, 1: string, 2: bool}>
+ */
+function fmArchiveWalkPath(string $abs, string $rel): Generator {
+    $isLink = is_link($abs);
+    if (is_dir($abs)) {
+        // Following nested folder links could loop forever.
+        if ($isLink && strpos($rel, '/') !== false) {
+            FmDlStatus::skip($rel . '/', 'linked folder');
+            return;
+        }
+        yield [$abs, $rel, true];
+        $entries = @scandir($abs);
+        if ($entries === false) {
+            FmDlStatus::skip($rel . '/', 'folder not readable');
+            return;
+        }
+        foreach ($entries as $e) {
+            if ($e !== '.' && $e !== '..') {
+                yield from fmArchiveWalkPath($abs . '/' . $e, $rel . '/' . $e);
+            }
+        }
+        return;
+    }
+    if (is_file($abs)) {
+        yield [$abs, $rel, false];
+    } elseif ($isLink) {
+        FmDlStatus::skip($rel, 'broken link');
+    }
+}
+
+/**
+ * @return array{0: int, 1: int} MS-DOS [time, date]
+ */
+function fmZipDosTime(int $ts): array {
+    $d = getdate($ts);
+    if ($d['year'] < 1980) {
+        return [0, (1 << 5) | 1];
+    }
+    $year = min($d['year'], 2107) - 1980;
+    return [
+        ($d['hours'] << 11) | ($d['minutes'] << 5) | intdiv($d['seconds'], 2),
+        ($year << 9) | ($d['mon'] << 5) | $d['mday'],
+    ];
+}
+
+function fmZipCentralEntry(string $name, int $flags, int $method, array $dos, int $crc, int $csize, int $usize, int $offset, int $extAttr, bool $zip64Sizes): string {
+    $z64 = '';
+    if ($zip64Sizes || $usize >= 0xFFFFFFFF || $csize >= 0xFFFFFFFF) {
+        $z64 .= pack('PP', $usize, $csize);
+        $usize = 0xFFFFFFFF;
+        $csize = 0xFFFFFFFF;
+    }
+    if ($offset >= 0xFFFFFFFF) {
+        $z64 .= pack('P', $offset);
+        $offset = 0xFFFFFFFF;
+    }
+    $extra = $z64 !== '' ? pack('vv', 0x0001, strlen($z64)) . $z64 : '';
+    $version = $extra !== '' ? 45 : 20;
+    return pack('VvvvvvvVVVvvvvvVV', 0x02014b50, $version, $version, $flags, $method, $dos[0], $dos[1], $crc, $csize, $usize, strlen($name), strlen($extra), 0, 0, 0, $extAttr, $offset)
+        . $name . $extra;
+}
+
+/**
+ * Stream a ZIP of $dir/$names: deflate, data descriptors (sizes written after the data), UTF-8 names, ZIP64 when needed.
+ *
+ * @param string[] $names
+ */
+function fmStreamZip(string $dir, array $names, FmStreamOut $out): void {
+    $central = [];
+    foreach (fmArchiveWalk($dir, $names) as [$abs, $rel, $isDir]) {
+        $dos = fmZipDosTime((int)(@filemtime($abs) ?: time()));
+        $offset = $out->position();
+        if ($isDir) {
+            $name = $rel . '/';
+            $out->write(pack('VvvvvvVVVvv', 0x04034b50, 20, 0x0800, 0, $dos[0], $dos[1], 0, 0, 0, strlen($name), 0) . $name);
+            $central[] = fmZipCentralEntry($name, 0x0800, 0, $dos, 0, 0, 0, $offset, 0x10, false);
+            continue;
+        }
+        $fh = @fopen($abs, 'rb');
+        if ($fh === false) {
+            FmDlStatus::skip($rel, 'not readable');
+            continue;
+        }
+        $zip64 = (int)@filesize($abs) >= 0xF0000000;
+        $flags = 0x0808;
+        $extra = $zip64 ? pack('vvPP', 0x0001, 16, 0, 0) : '';
+        $sizeField = $zip64 ? 0xFFFFFFFF : 0;
+        $out->write(pack('VvvvvvVVVvv', 0x04034b50, $zip64 ? 45 : 20, $flags, 8, $dos[0], $dos[1], 0, $sizeField, $sizeField, strlen($rel), strlen($extra)) . $rel . $extra);
+
+        $crc = hash_init('crc32b');
+        $deflate = deflate_init(ZLIB_ENCODING_RAW, ['level' => 1]);
+        $usize = 0;
+        $dataStart = $out->position();
+        while (!feof($fh)) {
+            $chunk = fread($fh, 1048576);
+            if ($chunk === false || $chunk === '') {
+                break;
+            }
+            $usize += strlen($chunk);
+            hash_update($crc, $chunk);
+            $out->write((string)deflate_add($deflate, $chunk, ZLIB_NO_FLUSH));
+        }
+        $out->write((string)deflate_add($deflate, '', ZLIB_FINISH));
+        fclose($fh);
+        $csize = $out->position() - $dataStart;
+        $crcVal = (int)hexdec(hash_final($crc));
+        $out->write($zip64
+            ? pack('VVPP', 0x08074b50, $crcVal, $csize, $usize)
+            : pack('VVVV', 0x08074b50, $crcVal, $csize, $usize));
+        $central[] = fmZipCentralEntry($rel, $flags, 8, $dos, $crcVal, $csize, $usize, $offset, 0, $zip64);
+    }
+
+    $cdOffset = $out->position();
+    foreach ($central as $entry) {
+        $out->write($entry);
+    }
+    $cdSize = $out->position() - $cdOffset;
+    $count = count($central);
+    if ($count >= 0xFFFF || $cdOffset >= 0xFFFFFFFF || $cdSize >= 0xFFFFFFFF) {
+        $eocd64Offset = $out->position();
+        $out->write(pack('VPvvVVPPPP', 0x06064b50, 44, 45, 45, 0, 0, $count, $count, $cdSize, $cdOffset));
+        $out->write(pack('VVPV', 0x07064b50, 0, $eocd64Offset, 1));
+    }
+    $out->write(pack('VvvvvVVv', 0x06054b50, 0, 0, min($count, 0xFFFF), min($count, 0xFFFF), min($cdSize, 0xFFFFFFFF), min($cdOffset, 0xFFFFFFFF), 0));
+}
+
+/**
+ * One GNU tar header (plus a ././@LongLink entry for names over 100 bytes).
+ */
+function fmTarWriteHeader(FmStreamOut $out, string $name, int $mode, int $size, int $mtime, string $type): void {
+    if (strlen($name) > 100) {
+        $long = $name . "\0";
+        fmTarWriteHeader($out, '././@LongLink', 0644, strlen($long), 0, 'L');
+        $out->write($long . str_repeat("\0", (512 - strlen($long) % 512) % 512));
+        $name = substr($name, 0, 100);
+    }
+    if ($size <= 077777777777) {
+        $sizeField = sprintf('%011o', $size) . "\0";
+    } else {
+        // Base-256 for sizes over 8 GB.
+        $sizeField = '';
+        for ($i = 0, $v = $size; $i < 11; $i++, $v >>= 8) {
+            $sizeField = chr($v & 0xFF) . $sizeField;
+        }
+        $sizeField = "\x80" . $sizeField;
+    }
+    $h = str_pad($name, 100, "\0")
+        . sprintf('%07o', $mode & 07777) . "\0"
+        . "0000000\0"
+        . "0000000\0"
+        . $sizeField
+        . sprintf('%011o', max(0, $mtime)) . "\0"
+        . '        '
+        . $type
+        . str_repeat("\0", 100)
+        . "ustar  \0"
+        . str_repeat("\0", 247);
+    $sum = array_sum(unpack('C*', $h));
+    $out->write(substr_replace($h, sprintf('%06o', $sum) . "\0 ", 148, 8));
+}
+
+/**
+ * Stream a tar of $dir/$names (gzip, if any, is applied by FmStreamOut).
+ *
+ * @param string[] $names
+ */
+function fmStreamTar(string $dir, array $names, FmStreamOut $out): void {
+    foreach (fmArchiveWalk($dir, $names) as [$abs, $rel, $isDir]) {
+        $mtime = (int)(@filemtime($abs) ?: time());
+        $perms = @fileperms($abs);
+        if ($isDir) {
+            fmTarWriteHeader($out, $rel . '/', $perms !== false ? $perms : 0755, 0, $mtime, '5');
+            continue;
+        }
+        $fh = @fopen($abs, 'rb');
+        if ($fh === false) {
+            FmDlStatus::skip($rel, 'not readable');
+            continue;
+        }
+        $size = (int)@filesize($abs);
+        fmTarWriteHeader($out, $rel, $perms !== false ? $perms : 0644, $size, $mtime, '0');
+        $left = $size;
+        while ($left > 0 && !feof($fh)) {
+            $chunk = fread($fh, (int)min(1048576, $left));
+            if ($chunk === false || $chunk === '') {
+                break;
+            }
+            $out->write($chunk);
+            $left -= strlen($chunk);
+        }
+        fclose($fh);
+        if ($left > 0) {
+            FmDlStatus::skip($rel, 'file changed while reading, end filled with zeros');
+            for (; $left > 0; $left -= 1048576) {
+                $out->write(str_repeat("\0", (int)min(1048576, $left)));
+            }
+        }
+        $out->write(str_repeat("\0", (512 - $size % 512) % 512));
+    }
+    $out->write(str_repeat("\0", 1024));
+}
+
+/**
+ * POST action download-archive: stream the archive to the browser while it is being built.
+ * On Linux/macOS, OS tools writing to stdout are tried first (per $FM_FILE_OPS_MODE), then the PHP streaming writer.
  */
 function fmDownloadArchiveHandlePost(string $rootDir, bool $isUnixLikeShell, bool $isWindows): void {
     global $serverCapabilities;
+    if (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
+    FmDlStatus::init(trim((string)$_POST['archive_name']));
     $dirIn = (string)$_POST['in'];
     $dir = $dirIn !== '' ? $rootDir . '/' . trim($dirIn, '/') : $rootDir;
     $dir = safeRealpath($dir);
     $type = (string)$_POST['archive_type'];
 
     if (!pathInsideRoot($dir, $rootDir) || !is_dir($dir)) {
-        fmDownloadArchiveFail(400, 'Invalid folder');
+        fmDownloadFail(400, 'The folder no longer exists or is outside the file manager root.');
     }
     if (!in_array($type, ['zip', 'tar', 'gzip'], true)) {
-        fmDownloadArchiveFail(400, 'Invalid archive type');
+        fmDownloadFail(400, 'Invalid archive type.');
     }
-    global $serverCapabilities;
     if (fmFileOpsMode() === 'os' && !$serverCapabilities['exec_available']) {
-        fmDownloadArchiveFail(500, 'File ops mode is OS-only but exec() is disabled. Set $FM_FILE_OPS_MODE to "auto" or "php".');
+        fmDownloadFail(500, 'File ops mode is OS-only but exec() is disabled. Set $FM_FILE_OPS_MODE to "auto" or "php".');
     }
 
     $baseName = trim((string)$_POST['archive_name']);
     $baseName = preg_replace('/[\\\\\/:*?"<>|]/', '', $baseName);
     if ($baseName === '') {
-        fmDownloadArchiveFail(400, 'Archive name is required');
+        fmDownloadFail(400, 'Archive name is required.');
     }
     $ext = ['zip' => '.zip', 'tar' => '.tar', 'gzip' => '.tar.gz'][$type];
     if (substr($baseName, -strlen($ext)) !== $ext) {
@@ -2289,17 +2888,7 @@ function fmDownloadArchiveHandlePost(string $rootDir, bool $isUnixLikeShell, boo
         }
     }
     if ($names === []) {
-        fmDownloadArchiveFail(400, 'No valid items to archive');
-    }
-
-    $token = bin2hex(random_bytes(12));
-    $tmpStem = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'fm-dl-' . $token;
-    if ($type === 'zip') {
-        $destPath = $tmpStem . '.zip';
-    } elseif ($type === 'tar') {
-        $destPath = $tmpStem . '.tar';
-    } else {
-        $destPath = $tmpStem . '.tar.gz';
+        fmDownloadFail(400, 'None of the selected items exist any more.');
     }
 
     $mime = [
@@ -2308,280 +2897,45 @@ function fmDownloadArchiveHandlePost(string $rootDir, bool $isUnixLikeShell, boo
         'gzip' => 'application/gzip',
     ][$type];
 
-    $tryShell = fmFileOpsTryShell();
-    $allowPhpFallback = fmFileOpsAllowPhpFallback();
-    $shellAttempted = false;
-    $gzipTarWork = ($type === 'gzip') ? ($tmpStem . '.tar') : null;
-
-    $cleanup = function () use ($destPath, $gzipTarWork): void {
-        if (is_file($destPath)) {
-            @unlink($destPath);
-        }
-        if ($gzipTarWork !== null && is_file($gzipTarWork)) {
-            @unlink($gzipTarWork);
-        }
-    };
-
-    try {
-        if ($tryShell && $isUnixLikeShell) {
-            if ($type === 'zip') {
-                if ($serverCapabilities['zip_archive']) {
-                    $shellAttempted = true;
-                    $dirEsc = escapeshellarg($dir);
-                    $destEsc = escapeshellarg($destPath);
-                    $itemsEsc = '';
-                    foreach ($names as $n) {
-                        $itemsEsc .= ' ' . escapeshellarg($n);
-                    }
-                    $cmd = 'cd ' . $dirEsc . ' && zip -r -q ' . $destEsc . $itemsEsc . ' 2>&1';
-                    exec($cmd, $out2, $ret2);
-                    if ($ret2 === 0 && is_file($destPath)) {
-                        fmDownloadArchiveSendFile($destPath, $baseName, $mime);
-                    }
-                    throw new RuntimeException('zip failed: ' . trim(implode("\n", (array)$out2)));
-                }
+    $osError = '';
+    // PHP reads Windows pipes at only a few MB/s, so the PHP writer is much faster there; tar.exe is for OS-only mode.
+    $tryOs = !$isWindows || fmFileOpsMode() === 'os';
+    if ($tryOs && fmFileOpsTryShell() && fmIsProcOpenAvailable()) {
+        $argv = fmDownloadArchiveOsCommand($type, $names, $isUnixLikeShell, $isWindows);
+        if ($argv !== null) {
+            $res = fmStreamCommandToClient($argv, $dir, $baseName, $mime);
+            if ($res['started']) {
+                exit;
             }
-
-            if ($type === 'tar' || $type === 'gzip') {
-                if ($serverCapabilities['shell_tar'] && ($type !== 'gzip' || $serverCapabilities['shell_gzip'])) {
-                    $shellAttempted = true;
-                    if ($type === 'gzip') {
-                        $tarPath = $gzipTarWork;
-                        if (file_exists($tarPath)) {
-                            @unlink($tarPath);
-                        }
-                    } else {
-                        $tarPath = $destPath;
-                        if (file_exists($tarPath)) {
-                            @unlink($tarPath);
-                        }
-                    }
-                    $dirEsc = escapeshellarg($dir);
-                    $tarEsc = escapeshellarg($tarPath);
-                    $itemsEsc = '';
-                    foreach ($names as $n) {
-                        $itemsEsc .= ' ' . escapeshellarg($n);
-                    }
-                    $cmd = 'cd ' . $dirEsc . ' && tar -cf ' . $tarEsc . $itemsEsc . ' 2>&1';
-                    exec($cmd, $out2, $ret2);
-                    if ($ret2 !== 0) {
-                        throw new RuntimeException('tar failed: ' . trim(implode("\n", (array)$out2)));
-                    }
-                    if ($type === 'gzip') {
-                        $cmd = 'gzip -f ' . $tarEsc . ' 2>&1';
-                        exec($cmd, $out3, $ret3);
-                        if ($ret3 !== 0 || !is_file($destPath)) {
-                            throw new RuntimeException('gzip failed: ' . trim(implode("\n", (array)$out3)));
-                        }
-                    }
-                    if (is_file($destPath)) {
-                        fmDownloadArchiveSendFile($destPath, $baseName, $mime);
-                    }
-                    throw new RuntimeException('Archive file not created');
-                }
-            }
-        }
-
-        if ($tryShell && $isWindows) {
-            if ($type === 'tar' || $type === 'gzip') {
-                if ($serverCapabilities['shell_tar']) {
-                    $shellAttempted = true;
-                    $tarPath = $destPath;
-                    $dirWin = str_replace('/', '\\', $dir);
-                    $tarEsc = escapeshellarg(str_replace('/', '\\', $tarPath));
-                    $dirEsc = escapeshellarg($dirWin);
-                    $itemsEsc = '';
-                    foreach ($names as $n) {
-                        $itemsEsc .= ' ' . escapeshellarg($n);
-                    }
-                    if ($type === 'tar') {
-                        $cmd = 'cd ' . $dirEsc . ' && tar -cf ' . $tarEsc . $itemsEsc . ' 2>&1';
-                    } else {
-                        $cmd = 'cd ' . $dirEsc . ' && tar -czf ' . $tarEsc . $itemsEsc . ' 2>&1';
-                    }
-                    exec($cmd, $out2, $ret2);
-                    if ($ret2 !== 0) {
-                        throw new RuntimeException('tar failed: ' . trim(implode("\n", (array)$out2)));
-                    }
-                    if (is_file($destPath)) {
-                        fmDownloadArchiveSendFile($destPath, $baseName, $mime);
-                    }
-                    throw new RuntimeException('Archive file not created');
-                }
-            }
-
-            if ($type === 'zip') {
-
-                exec('powershell -NoProfile -NonInteractive -Command "exit 0" 2>&1', $out, $ret);
-                $psOk = ($ret === 0);
-                if ($psOk) {
-                    $shellAttempted = true;
-                    $destWin = str_replace('/', '\\', $destPath);
-                    $useCreateFromDirectory = (count($names) === 1);
-                    if ($useCreateFromDirectory) {
-                        $srcFull = $dir . '/' . $names[0];
-                        $useCreateFromDirectory = is_dir($srcFull);
-                    }
-
-                    if ($useCreateFromDirectory) {
-                        $srcFull = $dir . '/' . $names[0];
-                        $srcWin = str_replace('/', '\\', $srcFull);
-                        $srcPs = str_replace("'", "''", $srcWin);
-                        $destPs = str_replace("'", "''", $destWin);
-                        $psScript = 'Add-Type -AssemblyName System.IO.Compression.FileSystem; ' .
-                            '[System.IO.Compression.ZipFile]::CreateFromDirectory(' .
-                            '\'' . $srcPs . '\',' .
-                            '\'' . $destPs . '\')';
-                        $cmd = 'powershell -NoProfile -NonInteractive -Command ' . escapeshellarg($psScript) . ' 2>&1';
-                        exec($cmd, $out2, $ret2);
-                        if ($ret2 !== 0) {
-                            throw new RuntimeException('ZipFile.CreateFromDirectory failed: ' . trim(implode("\n", (array)$out2)));
-                        }
-                    } else {
-                        $tarExe = getenv('SystemRoot') . '\\System32\\tar.exe';
-                        if (!is_file($tarExe)) {
-                            $tarExe = 'tar.exe';
-                        }
-                        $useTar = false;
-                        if (is_executable($tarExe)) {
-                            $cwd = getcwd();
-                            chdir($dir);
-                            $tarArgs = [];
-                            foreach ($names as $n) {
-                                $tarArgs[] = escapeshellarg($n);
-                            }
-                            $cmd = escapeshellarg($tarExe) . ' -a -c -f ' . escapeshellarg($destWin) . ' ' . implode(' ', $tarArgs) . ' 2>&1';
-                            exec($cmd, $out2, $ret2);
-                            chdir($cwd);
-                            if ($ret2 === 0) {
-                                $useTar = true;
-                            }
-                        }
-                        if (!$useTar) {
-                            $psDest = '"' . addslashes($destWin) . '"';
-                            $paths = [];
-                            foreach ($names as $n) {
-                                $full = $dir . '/' . $n;
-                                $fullWin = str_replace('/', '\\', $full);
-                                $paths[] = '"' . addslashes($fullWin) . '"';
-                            }
-                            $psPaths = implode(',', $paths);
-                            $cmd = 'powershell -NoProfile -NonInteractive -Command "Compress-Archive -Path ' . $psPaths . ' -DestinationPath ' . $psDest . ' -Force -CompressionLevel Fastest" 2>&1';
-                            exec($cmd, $out2, $ret2);
-                            if ($ret2 !== 0) {
-                                throw new RuntimeException('Compress-Archive failed: ' . trim(implode("\n", (array)$out2)));
-                            }
-                        }
-                    }
-
-                    if (is_file($destPath)) {
-                        fmDownloadArchiveSendFile($destPath, $baseName, $mime);
-                    }
-                    throw new RuntimeException('ZIP file not created');
-                }
-            }
-        }
-    } catch (Throwable $e) {
-        if ($shellAttempted) {
-            $cleanup();
-        }
-        if (!$allowPhpFallback) {
-            fmDownloadArchiveFail(500, 'Archive failed (OS only): ' . $e->getMessage());
+            $osError = $res['error'];
+        } else {
+            $osError = 'no suitable archive tool was found on the server';
         }
     }
-
-    if (!$allowPhpFallback) {
-        fmDownloadArchiveFail(500, 'Archive could not be created using OS commands only.');
+    if (!fmFileOpsAllowPhpFallback()) {
+        fmDownloadFail(500, 'Archive failed (OS-only mode): ' . ($osError !== '' ? $osError : 'proc_open() is not available') . '.');
+    }
+    if ($type !== 'tar' && !function_exists('deflate_init')) {
+        fmDownloadFail(500, 'Cannot build the archive: the PHP zlib extension is not available' . ($osError !== '' ? ' and OS tools failed (' . $osError . ')' : '') . '. Try TAR format.');
     }
 
+    fmBeginStreamDownload($baseName, $mime);
+    FmDlStatus::streaming('php', null);
+    $out = new FmStreamOut($type === 'gzip');
     try {
         if ($type === 'zip') {
-            if (!$serverCapabilities['zip_archive']) {
-                throw new RuntimeException('ZipArchive is not available');
-            }
-            $zip = new ZipArchive();
-            if ($zip->open($destPath, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
-                throw new RuntimeException('Could not create archive');
-            }
-            foreach ($names as $n) {
-                $full = normPath($dir . '/' . $n);
-                if (is_file($full)) {
-                    $zip->addFile($full, $n);
-                } elseif (is_dir($full)) {
-                    $it = new RecursiveIteratorIterator(
-                        new RecursiveDirectoryIterator($full, RecursiveDirectoryIterator::SKIP_DOTS)
-                    );
-                    $hadChild = false;
-                    foreach ($it as $fi) {
-                        $hadChild = true;
-                        $path = $fi->getPathname();
-                        $pathN = normPath($path);
-                        $baseN = normPath($dir . '/' . $n);
-                        $suffix = (strlen($pathN) > strlen($baseN)) ? substr($pathN, strlen($baseN) + 1) : '';
-                        $local = $suffix !== '' ? ($n . '/' . $suffix) : $n;
-                        $local = str_replace('\\', '/', $local);
-                        if ($fi->isDir()) {
-                            $zip->addEmptyDir($local);
-                        } else {
-                            $zip->addFile($path, $local);
-                        }
-                    }
-                    if (!$hadChild) {
-                        $zip->addEmptyDir(str_replace('\\', '/', $n));
-                    }
-                }
-            }
-            if (!$zip->close()) {
-                throw new RuntimeException('Could not finalize ZIP');
-            }
+            fmStreamZip($dir, $names, $out);
         } else {
-            if ($type === 'gzip') {
-                $tarPath = $gzipTarWork;
-                if ($tarPath === null) {
-                    throw new RuntimeException('Internal gzip path error');
-                }
-            } else {
-                $tarPath = $destPath;
-            }
-            if (file_exists($tarPath)) {
-                @unlink($tarPath);
-            }
-            $phar = new PharData($tarPath);
-            foreach ($names as $n) {
-                $full = $dir . '/' . $n;
-                if (is_file($full)) {
-                    $phar->addFile($full, $n);
-                } elseif (is_dir($full)) {
-                    $phar->buildFromDirectory($full);
-                    $rii = new RecursiveIteratorIterator(
-                        new RecursiveDirectoryIterator($full, RecursiveDirectoryIterator::SKIP_DOTS)
-                    );
-                    foreach ($rii as $fi) {
-                        $path = $fi->getPathname();
-                        $local = $n . '/' . substr($path, strlen($full) + 1);
-                        $local = str_replace('\\', '/', $local);
-                    }
-                }
-            }
-            if ($type === 'gzip') {
-                $phar->compress(Phar::GZ);
-                @unlink($tarPath);
-            }
-            if ($type === 'tar') {
-                sleep(1);
-                sleep(3);
-            }
+            fmStreamTar($dir, $names, $out);
         }
+        $out->finish();
+        FmDlStatus::done();
+    } catch (FmDlAbortedException $e) {
+        FmDlStatus::aborted();
     } catch (Throwable $e) {
-        $cleanup();
-        fmDownloadArchiveFail(500, 'Could not create archive: ' . $e->getMessage());
+        FmDlStatus::fail('The archive stopped while downloading: ' . $e->getMessage() . '. The downloaded file is incomplete.');
     }
-
-    if (!is_file($destPath)) {
-        $cleanup();
-        fmDownloadArchiveFail(500, 'Archive missing after build');
-    }
-    fmDownloadArchiveSendFile($destPath, $baseName, $mime);
+    exit;
 }
 
 // =========================
@@ -2594,6 +2948,16 @@ $needsRename = ($thisFileName === $DEFAULT_FILENAME);
 $isAuthed = (!$needsRename) ? isAuthed($ENABLE_AUTH) : false;
 $passwordIsDefault = $ENABLE_AUTH && fmPasswordIsDefault($PASSWORD_HASH);
 $needsPasswordChange = (!$needsRename) && $ENABLE_AUTH && $isAuthed && $passwordIsDefault;
+
+if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && !fmCsrfRequestIsValid()) {
+    // An expired session also loses its token; answer 401 so the client shows the usual sign-in message.
+    $postAction = (string)($_POST['action'] ?? '');
+    if (!$needsRename && !in_array($postAction, ['do-rename', 'login', 'logout'], true)) {
+        requireAuthOrExit($ENABLE_AUTH);
+    }
+    http_response_code(403);
+    jsonOut(['status' => 'error', 'msg' => 'Security token is missing or expired. Reload the page and try again.']);
+}
 
 // Handle rename POST (allowed even if not authed, because it happens before auth).
 if (isset($_POST['action']) && $_POST['action'] === 'do-rename') {
@@ -2970,17 +3334,53 @@ if (isset($_POST['action']) && $_POST['action'] === 'terminal-complete' && isset
     jsonOut(fmTerminalComplete($dir, $ROOT_DIR, $FM_ENABLE_TERMINAL_HERE, $partial, $limit));
 }
 
-if (isset($_GET['action']) && $_GET['action'] === 'download' && isset($_GET['path'])) {
-    $path = safeRealpath(rawurldecode((string)$_GET['path']));
-    if (!pathInsideRoot($path, $ROOT_DIR) || !is_file($path)) {
-        http_response_code(404);
-        exit;
+if (isset($_GET['action']) && $_GET['action'] === 'download-status' && isset($_GET['token'])) {
+    $token = (string)$_GET['token'];
+    if (!FmDlStatus::tokenIsValid($token)) {
+        jsonOut(['status' => 'error', 'msg' => 'Invalid download token']);
     }
+    if (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
+    jsonOut(['status' => 'success', 'now' => time()] + FmDlStatus::read($token));
+}
+
+if (isset($_GET['action']) && $_GET['action'] === 'download' && isset($_GET['path'])) {
+    if (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
+    $path = safeRealpath(rawurldecode((string)$_GET['path']));
     $bn = basename($path);
-    header('Content-Type: application/octet-stream');
-    header('Content-Disposition: attachment; filename="' . rawurlencode($bn) . '"');
-    header('Content-Length: ' . (string)filesize($path));
-    readfile($path);
+    FmDlStatus::init($bn);
+    if (!pathInsideRoot($path, $ROOT_DIR) || !is_file($path)) {
+        fmDownloadFail(404, 'The file no longer exists or is outside the file manager root.');
+    }
+    $fh = @fopen($path, 'rb');
+    if ($fh === false) {
+        fmDownloadFail(403, 'Cannot read "' . $bn . '": permission denied or the file is locked by another program.');
+    }
+    $size = (int)filesize($path);
+    fmBeginStreamDownload($bn, 'application/octet-stream', $size);
+    FmDlStatus::streaming('file', $size);
+    $out = new FmStreamOut(false);
+    try {
+        while (!feof($fh)) {
+            $chunk = fread($fh, 1048576);
+            if ($chunk === false || $chunk === '') {
+                break;
+            }
+            $out->write($chunk);
+        }
+        $out->finish();
+        if ($out->position() < $size) {
+            FmDlStatus::fail('Reading "' . $bn . '" stopped after ' . $out->position() . ' of ' . $size . ' bytes (the file changed or a disk error occurred). The downloaded file is incomplete.');
+        } else {
+            FmDlStatus::done();
+        }
+    } catch (FmDlAbortedException $e) {
+        FmDlStatus::aborted();
+    }
+    fclose($fh);
     exit;
 }
 
@@ -4779,6 +5179,7 @@ $FM_EXEC_AVAILABLE = $serverCapabilities['exec_available'];
 $FM_TERMINAL_HERE_ENABLED = $FM_ENABLE_TERMINAL_HERE;
 $FM_TERMINAL_MANUAL_ENABLED = $FM_ENABLE_TERMINAL_MANUAL;
 $FM_TERMINAL_ADVANCED_ENABLED = $FM_ENABLE_TERMINAL_ADVANCED;
+$csrfToken = fmCsrfToken();
 
 ?><!DOCTYPE html>
 <html lang="en">
@@ -5792,6 +6193,16 @@ html:has(.fm-table-wrapper) body {
 
 .fm-toast-msg {
     display: block;
+}
+
+/* Skipped files list after a download (FmDownloadTracker) */
+.fm-download-skipped {
+    max-height: 220px;
+    overflow: auto;
+    margin: 0 0 8px;
+    padding-left: 18px;
+    font-size: 12px;
+    word-break: break-all;
 }
 
 .fm-download-progress-popup .fm-download-progress-line {
@@ -7897,7 +8308,7 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     }
     25%,
     75% {
-        color: #6b8e23;
+        color: var(--main-color);
     }
 }
 
@@ -8427,6 +8838,15 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
         const fm_trash_basename = <?php echo json_encode(fmTrashBasename()); ?>;
         const fm_php_upload_max_filesize = <?php echo json_encode((string)ini_get('upload_max_filesize')); ?>;
         const fm_php_post_max_size = <?php echo json_encode((string)ini_get('post_max_size')); ?>;
+        const fm_csrf_token = <?php echo json_encode($csrfToken); ?>;
+        /**
+         * fetch() options for a POST to this script; the server rejects POSTs without the CSRF header.
+         * @param {FormData} body
+         * @returns {RequestInit}
+         */
+        function fmPostInit(body) {
+            return { method: 'POST', body, headers: { 'X-CSRF-Token': fm_csrf_token } };
+        }
         // Mirror critical runtime flags on window for explicit global access.
         window.fm_exec_available = fm_exec_available;
         window.fm_terminal_here_enabled = fm_terminal_here_enabled;
@@ -8479,7 +8899,7 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
                 const form = new FormData();
                 form.append('action', 'do-rename');
                 form.append('new_name', newName);
-                fetch(ajax_url, { method: 'POST', body: form })
+                fetch(ajax_url, fmPostInit(form))
                     .then(r => r.json())
                     .then(data => {
                         if (data.status === 'success' && data.redirect) {
@@ -8516,7 +8936,7 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
                 const form = new FormData();
                 form.append('action', 'login');
                 form.append('password', pass);
-                fetch(ajax_url, { method: 'POST', body: form })
+                fetch(ajax_url, fmPostInit(form))
                     .then(r => r.json())
                     .then(data => {
                         if (data.status === 'success') {
@@ -8575,7 +8995,7 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
                 form.append('current_password', '');
                 form.append('new_password', newEl.value || '');
                 form.append('confirm_password', confirmEl.value || '');
-                fetch(ajax_url, { method: 'POST', body: form })
+                fetch(ajax_url, fmPostInit(form))
                     .then(r => r.json())
                     .then(data => {
                         if (data.status !== 'success') {
@@ -9519,7 +9939,7 @@ function fmShowTerminalSettingsPopup(opts) {
                     form.append('manual', manual ? '1' : '0');
                     form.append('advanced', advanced ? '1' : '0');
                     form.append('password', passEl ? (passEl.value || '') : '');
-                    return fetch(ajaxUrl, { method: 'POST', body: form })
+                    return fetch(ajaxUrl, fmPostInit(form))
                         .then(r => r.json())
                         .then(data => {
                             if (data.status !== 'success') {
@@ -9602,10 +10022,12 @@ function fmShowTerminalHereTogglePopup(opts) {
 
 /**
  * Short non-blocking toast (top-right). Use when modal notices are suppressed or for lightweight success.
- * @param {{ message: string, title?: string, variant?: 'success'|'info'|'warning' }} opts
+ * @param {{ message: string, title?: string, variant?: 'success'|'info'|'warning', duration?: number }} opts
+ *   duration: ms before auto-hide (default 3800); 0 keeps the toast until close() or a click.
+ * @returns {{ update: (message: string) => void, close: () => void }|null}
  */
 function fmToast(opts) {
-    if (!opts || opts.message == null || String(opts.message) === '') return;
+    if (!opts || opts.message == null || String(opts.message) === '') return null;
 
     let stack = document.getElementById('fm-toast-stack');
     if (!stack) {
@@ -9642,11 +10064,168 @@ function fmToast(opts) {
         el.classList.add('fm-toast--visible');
     });
 
-    hideTimer = window.setTimeout(removeEl, 3800);
+    const duration = typeof opts.duration === 'number' ? opts.duration : 3800;
+    if (duration > 0) {
+        hideTimer = window.setTimeout(removeEl, duration);
+    }
     el.addEventListener('click', () => {
         window.clearTimeout(hideTimer);
         removeEl();
     });
+    return {
+        update(message) {
+            const msgEl = el.querySelector('.fm-toast-msg');
+            if (msgEl) msgEl.textContent = String(message);
+        },
+        close() {
+            window.clearTimeout(hideTimer);
+            removeEl();
+        },
+    };
+}
+
+/**
+ * Follows one native browser download via `download-status` polling to report readable failure reasons.
+ * Progress is left to the browser's own downloads UI.
+ * The download itself runs in a hidden iframe, so the browser streams it straight to disk.
+ */
+class FmDownloadTracker {
+    /**
+     * @param {{ ajaxUrl: string, token: string, label: string, iframe: HTMLIFrameElement }} options
+     */
+    constructor({ ajaxUrl, token, label, iframe }) {
+        this._ajaxUrl = ajaxUrl;
+        this._token = token;
+        this._label = label || 'download';
+        this._iframe = iframe;
+        this._startedAt = Date.now();
+        this._finished = false;
+        this._pollFailures = 0;
+        this._emptyErrorPage = false;
+        this._timer = 0;
+    }
+
+    start() {
+        this._iframe.addEventListener('load', () => this._onFrameLoad());
+        this._schedule(700);
+    }
+
+    /** Attachments never fire `load`; a load means the server answered with an error page instead. */
+    _onFrameLoad() {
+        if (this._finished) return;
+        let text = '';
+        try {
+            const doc = this._iframe.contentDocument;
+            if (!doc || doc.location.href === 'about:blank') return;
+            text = ((doc.body && (doc.body.innerText || doc.body.textContent)) || '').trim();
+        } catch (e) {
+            text = '';
+        }
+        if (text === '') {
+            this._emptyErrorPage = true;
+            return;
+        }
+        let msg = text;
+        try {
+            const j = JSON.parse(text);
+            if (j && typeof j === 'object') msg = String(j.msg || j.message || text);
+        } catch (e) { /* plain text */ }
+        if (/^unauthorized$/i.test(msg)) msg = 'Your session has expired. Reload the page and sign in again.';
+        this._fail(msg.slice(0, 1000));
+    }
+
+    _schedule(ms) {
+        if (!this._finished) this._timer = window.setTimeout(() => this._poll(), ms);
+    }
+
+    _poll() {
+        if (this._finished) return;
+        requireAuthFetch(this._ajaxUrl + '?' + new URLSearchParams({ action: 'download-status', token: this._token }))
+            .then((r) => r.json())
+            .then((d) => {
+                this._pollFailures = 0;
+                this._handleStatus(d || {});
+            })
+            .catch((err) => {
+                if (this._finished) return;
+                if (err && err.message === 'unauthorized') {
+                    this._fail('Your session has expired. Reload the page and sign in again.');
+                    return;
+                }
+                this._pollFailures++;
+                if (this._pollFailures >= 5) {
+                    this._fail('Lost contact with the server while downloading "' + this._label + '". Check your browser\'s downloads to see whether the file finished.');
+                    return;
+                }
+                this._schedule(2000);
+            });
+    }
+
+    _handleStatus(d) {
+        if (this._finished) return;
+        const st = d.state;
+        const waited = Date.now() - this._startedAt;
+        if (!st || st === 'pending' || st === 'unknown') {
+            if (this._emptyErrorPage && waited > 3000) {
+                this._fail('The server returned an error without details. Check the PHP / web server error log.');
+            } else if (st !== 'unknown' && waited > 15000) {
+                this._fail('The server did not start the download of "' + this._label + '". The request may have been blocked or timed out before it reached the file manager.');
+            } else {
+                this._schedule(1000);
+            }
+            return;
+        }
+        if (st === 'preparing' || st === 'streaming') {
+            const age = (typeof d.now === 'number' && typeof d.heartbeat === 'number') ? d.now - d.heartbeat : 0;
+            if (age > (st === 'preparing' ? 120 : 30)) {
+                this._fail(
+                    'The download of "' + this._label + '" stopped making progress on the server. ' +
+                    'This usually means a hosting timeout or the PHP process was stopped. ' +
+                    'Try fewer files, or TAR format. (If you paused the download in the browser, you can ignore this.)'
+                );
+                return;
+            }
+            this._schedule(1000);
+            return;
+        }
+        if (st === 'done') {
+            this._done(d);
+        } else if (st === 'aborted') {
+            this._finish();
+        } else if (st === 'error') {
+            this._fail(d.error || 'The download failed on the server.');
+        } else {
+            this._schedule(1000);
+        }
+    }
+
+    _done(d) {
+        this._finish();
+        const skipped = Array.isArray(d.skipped) ? d.skipped : [];
+        const skippedCount = d.skipped_count || skipped.length;
+        if (skippedCount === 0 && !d.warning) return;
+        const esc = FmPopup.escapeHtml;
+        let html = '';
+        if (d.warning) html += '<p class="mt-0">' + esc(String(d.warning)) + '</p>';
+        if (skippedCount > 0) {
+            html += '<p class="mt-0">' + skippedCount + ' item(s) could not be added to the archive:</p>' +
+                '<ul class="fm-download-skipped">' + skipped.map((s) => '<li>' + esc(String(s)) + '</li>').join('') + '</ul>';
+            if (skippedCount > skipped.length) html += '<p class="mb-0">…and ' + (skippedCount - skipped.length) + ' more.</p>';
+        }
+        fmUserNotice({ variant: 'warning', title: 'Download finished with problems', messageHtml: html });
+    }
+
+    _fail(message) {
+        this._finish();
+        fmUserNotice({ variant: 'error', title: 'Download failed', message });
+    }
+
+    _finish() {
+        this._finished = true;
+        window.clearTimeout(this._timer);
+        const iframe = this._iframe;
+        window.setTimeout(() => iframe.remove(), 60000);
+    }
 }
 
 /**
@@ -9716,7 +10295,7 @@ class FmCreateNewFolderPopup extends FmPopup {
         form.append('in', this._currentPath === this._rootDir ? '' : this._currentPath.slice(this._rootDir.length + 1));
         form.append('name', name);
 
-        requireAuthFetch(this._ajaxUrl, { method: 'POST', body: form })
+        requireAuthFetch(this._ajaxUrl, fmPostInit(form))
             .then(r => r.json())
             .then(data => {
                 if (data.status === 'success') {
@@ -9899,7 +10478,7 @@ class FmCreateFilePopup extends FmPopup {
         form.append('in', this._currentPath === this._rootDir ? '' : this._currentPath.slice(this._rootDir.length + 1));
         form.append('name', name);
 
-        requireAuthFetch(this._ajaxUrl, { method: 'POST', body: form })
+        requireAuthFetch(this._ajaxUrl, fmPostInit(form))
             .then(r => r.json())
             .then(data => {
                 if (data.status === 'success') {
@@ -10100,7 +10679,7 @@ class FmDeletePopup extends FmPopup {
         form.append('action', 'trash-move');
         form.append('in', pathIn);
         names.forEach((n) => form.append('names[]', n));
-        fetch(this._ajaxUrl, { method: 'POST', body: form })
+        fetch(this._ajaxUrl, fmPostInit(form))
             .then((r) => r.json())
             .then((data) => {
                 const errs = data.errors || [];
@@ -10126,7 +10705,7 @@ class FmDeletePopup extends FmPopup {
         form.append('action', 'trash-delete-forever');
         form.append('in', pathIn);
         names.forEach((n) => form.append('names[]', n));
-        fetch(this._ajaxUrl, { method: 'POST', body: form })
+        fetch(this._ajaxUrl, fmPostInit(form))
             .then((r) => r.json())
             .then((data) => {
                 const errs = data.errors || [];
@@ -10187,7 +10766,7 @@ class FmDeletePopup extends FmPopup {
             countForm.append('in', pathIn);
             liveNames.forEach((n) => countForm.append('names[]', n));
 
-            fetch(this._ajaxUrl, { method: 'POST', body: countForm })
+            fetch(this._ajaxUrl, fmPostInit(countForm))
                 .then((r) => r.json())
                 .then((countData) => {
                     loadPopup.hideAndDestroy();
@@ -10264,7 +10843,7 @@ class FmDeletePopup extends FmPopup {
         streamForm.append('in', pathIn);
         names.forEach((n) => streamForm.append('names[]', n));
 
-        fetch(this._ajaxUrl, { method: 'POST', body: streamForm })
+        fetch(this._ajaxUrl, fmPostInit(streamForm))
             .then((response) => {
                 if (!response.ok || !response.body) {
                     progressPopup.hideAndDestroy();
@@ -10710,7 +11289,7 @@ class FmCompressPopup extends FmPopup {
                     form.append('overwrite',    allowOverwrite ? '1' : '0');
                     jobNames.forEach(n => form.append('names[]', n));
 
-                    fetch(this._ajaxUrl, { method: 'POST', body: form })
+                    fetch(this._ajaxUrl, fmPostInit(form))
                         .then(response => {
                             if (!response.ok)   throw new Error('HTTP ' + response.status);
                             if (!response.body) throw new Error('No response body');
@@ -10761,7 +11340,7 @@ class FmCompressPopup extends FmPopup {
                 countFormJob.append('mode',   'files');
                 countFormJob.append('in',     pathInJob);
                 jobNames.forEach(n => countFormJob.append('names[]', n));
-                fetch(this._ajaxUrl, { method: 'POST', body: countFormJob })
+                fetch(this._ajaxUrl, fmPostInit(countFormJob))
                     .then(r => r.json())
                     .then(countData => {
                         const total = (countData.status === 'success' && typeof countData.total === 'number') ? countData.total : jobNames.length;
@@ -10817,7 +11396,7 @@ class FmCompressPopup extends FmPopup {
             form.append('overwrite',    allowOverwrite ? '1' : '0');
             names.forEach(n => form.append('names[]', n));
 
-            fetch(this._ajaxUrl, { method: 'POST', body: form })
+            fetch(this._ajaxUrl, fmPostInit(form))
                 .then(response => {
                     if (!response.ok)   throw new Error('HTTP ' + response.status);
                     if (!response.body) throw new Error('No response body');
@@ -10866,7 +11445,7 @@ class FmCompressPopup extends FmPopup {
         countForm.append('in',     pathIn);
         names.forEach(n => countForm.append('names[]', n));
 
-        fetch(this._ajaxUrl, { method: 'POST', body: countForm })
+        fetch(this._ajaxUrl, fmPostInit(countForm))
             .then(r => r.json())
             .then(countData => {
                 const total = (countData.status === 'success' && typeof countData.total === 'number') ? countData.total : names.length;
@@ -11001,7 +11580,7 @@ class FmExtractPopup extends FmPopup {
         form.append('separate_folders', separate ? '1' : '0');
         names.forEach(n => form.append('names[]', n));
 
-        fetch(ajaxUrl, { method: 'POST', body: form })
+        fetch(ajaxUrl, fmPostInit(form))
             .then(response => {
                 if (!response.ok) throw new Error('HTTP ' + response.status);
                 if (!response.body) throw new Error('No response body');
@@ -11212,7 +11791,7 @@ class FmGetInfoPopup extends FmPopup {
             form.append('names[]', name);
         }
 
-        requireAuthFetch(this._ajaxUrl, { method: 'POST', body: form })
+        requireAuthFetch(this._ajaxUrl, fmPostInit(form))
             .then(r => r.json())
             .then(data => {
                 const filesEl   = this.el && this.el.querySelector('.fm-info-files-count');
@@ -11571,8 +12150,8 @@ class FmTerminalHerePopup extends FmPopup {
         }
 
         const run = typeof requireAuthFetch === 'function'
-            ? requireAuthFetch(this._ajaxUrl, { method: 'POST', body: form })
-            : fetch(this._ajaxUrl, { method: 'POST', body: form });
+            ? requireAuthFetch(this._ajaxUrl, fmPostInit(form))
+            : fetch(this._ajaxUrl, fmPostInit(form));
         run
             .then((r) => r.text().then((t) => ({ ok: r.ok, status: r.status, text: t })))
             .then(({ ok, status, text }) => {
@@ -11979,8 +12558,8 @@ class FmTerminalHerePopup extends FmPopup {
         form.append('partial', String(partialToken || ''));
         form.append('limit', '40');
         const req = typeof requireAuthFetch === 'function'
-            ? requireAuthFetch(this._ajaxUrl, { method: 'POST', body: form })
-            : fetch(this._ajaxUrl, { method: 'POST', body: form });
+            ? requireAuthFetch(this._ajaxUrl, fmPostInit(form))
+            : fetch(this._ajaxUrl, fmPostInit(form));
         return req
             .then((r) => r.text().then((t) => ({ ok: r.ok, text: t })))
             .then(({ ok, text }) => {
@@ -12626,7 +13205,7 @@ class FmCopyMovePopup extends FmPopup {
             countForm.append('action', 'get-files-and-folders-count');
             countForm.append('in', pathIn);
             this._names.forEach(n => countForm.append('names[]', n));
-            fetch(this._ajaxUrl, { method: 'POST', body: countForm })
+            fetch(this._ajaxUrl, fmPostInit(countForm))
                 .then(r => r.json())
                 .then(countData => {
                     loadPopup.hideAndDestroy();
@@ -12711,7 +13290,7 @@ class FmCopyMovePopup extends FmPopup {
         form.append('dest', destRel);
         this._names.forEach(n => form.append('names[]', n));
 
-        fetch(this._ajaxUrl, { method: 'POST', body: form })
+        fetch(this._ajaxUrl, fmPostInit(form))
             .then(response => {
                 if (!response.ok || !response.body) {
                     progressPopup.hideAndDestroy();
@@ -12878,7 +13457,7 @@ class FmCopyMovePopup extends FmPopup {
         form.append('in', pathIn);
         this._names.forEach(n => form.append('names[]', n));
 
-        fetch(this._ajaxUrl, { method: 'POST', body: form })
+        fetch(this._ajaxUrl, fmPostInit(form))
             .then(response => {
                 if (!response.ok || !response.body) {
                     progressPopup.hideAndDestroy();
@@ -13047,7 +13626,7 @@ class FmCopyMovePopup extends FmPopup {
         form.append('name', folderName);
         this._names.forEach((n) => form.append('names[]', n));
 
-        fetch(this._ajaxUrl, { method: 'POST', body: form })
+        fetch(this._ajaxUrl, fmPostInit(form))
             .then((response) => {
                 if (!response.ok || !response.body) {
                     progressPopup.hideAndDestroy();
@@ -13201,7 +13780,7 @@ class FmCopyMovePopup extends FmPopup {
             countForm.append('action', 'get-files-and-folders-count');
             countForm.append('in', pathIn);
             names.forEach((n) => countForm.append('names[]', n));
-            fetch(ajaxUrl, { method: 'POST', body: countForm })
+            fetch(ajaxUrl, fmPostInit(countForm))
                 .then((r) => r.json())
                 .then((countData) => {
                     loadPopup.hideAndDestroy();
@@ -13323,7 +13902,7 @@ class FmCopyMovePopup extends FmPopup {
             countForm.append('action', 'get-files-and-folders-count');
             countForm.append('in', pathIn);
             names.forEach(n => countForm.append('names[]', n));
-            fetch(ajaxUrl, { method: 'POST', body: countForm })
+            fetch(ajaxUrl, fmPostInit(countForm))
                 .then(r => r.json())
                 .then(countData => {
                     loadPopup.hideAndDestroy();
@@ -13397,7 +13976,7 @@ class FmCopyMovePopup extends FmPopup {
             countForm.append('action', 'get-files-and-folders-count');
             countForm.append('in', pathIn);
             names.forEach(n => countForm.append('names[]', n));
-            fetch(ajaxUrl, { method: 'POST', body: countForm })
+            fetch(ajaxUrl, fmPostInit(countForm))
                 .then(r => r.json())
                 .then(countData => {
                     loadPopup.hideAndDestroy();
@@ -13456,9 +14035,9 @@ class FmDownloadArchivePopup extends FmPopup {
             pad(stamp.getHours()) + pad(stamp.getMinutes()) + pad(stamp.getSeconds()) + '.zip';
         const initialName = defaultArchiveName || autoDefault;
 
-        const hint = execOk
-            ? 'The server tries OS archive tools first when possible, then PHP if needed (see file ops mode on the server).'
-            : 'PHP exec() is disabled; archives are built with PHP only.';
+        const hint = 'The download starts right away; the archive is built while it downloads. ' + (execOk
+            ? 'The server uses OS archive tools when possible, otherwise PHP (see file ops mode on the server).'
+            : 'PHP exec() is disabled; archives are built with PHP.');
 
         super({
             title:   'Download as archive',
@@ -13809,6 +14388,7 @@ class FmUploadPopup extends FmPopup {
 
             const xhr = new XMLHttpRequest();
             xhr.open('POST', this._ajaxUrl);
+            xhr.setRequestHeader('X-CSRF-Token', fm_csrf_token);
             xhr.withCredentials = true;
 
             xhr.upload.addEventListener('progress', (e) => {
@@ -14189,7 +14769,7 @@ class FmChmodPopup extends FmPopup {
         super({
             title: 'Change permissions',
             className: 'fm-chmod-popup',
-            maxWidth: '520px',
+            maxWidth: '530px',
             submitOnEnter: true,
             content:
                 intro +
@@ -14331,8 +14911,8 @@ class FmChmodPopup extends FmPopup {
         if (primary) primary.disabled = true;
 
         const run = typeof requireAuthFetch === 'function'
-            ? requireAuthFetch(this._ajaxUrl, { method: 'POST', body: form })
-            : fetch(this._ajaxUrl, { method: 'POST', body: form });
+            ? requireAuthFetch(this._ajaxUrl, fmPostInit(form))
+            : fetch(this._ajaxUrl, fmPostInit(form));
 
         run
             .then((r) => r.json())
@@ -14685,8 +15265,8 @@ class FmBulkRenamePopup extends FmPopup {
         if (primary) primary.disabled = true;
 
         const run = typeof requireAuthFetch === 'function'
-            ? requireAuthFetch(this._ajaxUrl, { method: 'POST', body: form })
-            : fetch(this._ajaxUrl, { method: 'POST', body: form });
+            ? requireAuthFetch(this._ajaxUrl, fmPostInit(form))
+            : fetch(this._ajaxUrl, fmPostInit(form));
 
         run
             .then((r) => r.json())
@@ -16268,28 +16848,6 @@ class FmFileManagerTable extends FmTable {
     static BREADCRUMB_COLLAPSE_THRESHOLD = 5;
     /** When collapsed, show this many trailing crumbs after the ellipsis (includes current folder). */
     static BREADCRUMB_TAIL_COUNT = 3;
-
-    /**
-     * Best-effort filename from a Content-Disposition header (attachment).
-     * @param {string|null} header
-     * @returns {string|null}
-     */
-    static _parseContentDispositionFilename(header) {
-        if (!header || typeof header !== 'string') return null;
-        const star = header.match(/filename\*=UTF-8''([^;]+)/i);
-        if (star) {
-            try {
-                return decodeURIComponent(star[1].trim());
-            } catch (e) {
-                return star[1].trim();
-            }
-        }
-        const quoted = header.match(/filename="((?:\\"|[^"])*)"/i);
-        if (quoted) return quoted[1].replace(/\\"/g, '"');
-        const plain = header.match(/filename=([^;]+)/i);
-        if (plain) return plain[1].trim().replace(/^["']|["']$/g, '');
-        return null;
-    }
 
     /**
      * Tooltip suffix for toolbar / row actions (shown as "Title (shortcut)").
@@ -18105,7 +18663,7 @@ class FmFileManagerTable extends FmTable {
         form.append('in', pathIn);
         names.forEach((n) => form.append('names[]', n));
         const heartbeatAfterRestore = !inTrashTree;
-        fetch(this._ajaxUrl, { method: 'POST', body: form })
+        fetch(this._ajaxUrl, fmPostInit(form))
             .then((r) => r.json())
             .then((data) => {
                 const errs = data.errors || [];
@@ -18193,7 +18751,7 @@ class FmFileManagerTable extends FmTable {
                         confirm.hideAndDestroy();
                         const form = new FormData();
                         form.append('action', 'trash-empty');
-                        fetch(this._ajaxUrl, { method: 'POST', body: form })
+                        fetch(this._ajaxUrl, fmPostInit(form))
                             .then((r) => r.json())
                             .then((data) => {
                                 const errs = data.errors || [];
@@ -18371,7 +18929,7 @@ class FmFileManagerTable extends FmTable {
             form.append('in',       this._currentPath === this._rootDir ? '' : this._currentPath.slice(this._rootDir.length + 1));
             form.append('name',     selectedRow.name);
             form.append('new_name', newName);
-            fetch(this._ajaxUrl, { method: 'POST', body: form })
+            fetch(this._ajaxUrl, fmPostInit(form))
                 .then(r => r.json())
                 .then(data => {
                     if (data.status === 'success') {
@@ -18594,110 +19152,55 @@ class FmFileManagerTable extends FmTable {
     }
 
     /**
-     * Blocking modal while the server prepares a file or ZIP (indeterminate progress bar).
-     * @param {boolean} isArchive - true when building a multi-item ZIP on the server
-     * @returns {FmIndeterminateProgressPopup}
-     */
-    _openDownloadProgressPopup(isArchive) {
-        const title = isArchive ? 'Preparing archive' : 'Download';
-        const messageHtml = isArchive
-            ? '<p class="mt-0">The server is building your archive. Large folders may take a while.</p>'
-            : '<p>Preparing the file download.</p>';
-        return new FmIndeterminateProgressPopup({ title, messageHtml });
-    }
-
-    /**
-     * Fetch file or ZIP as a blob: show progress until the response body is received, close the modal, then start the browser download.
-     * @param {boolean} isArchive
-     * @param {string} url - Request URL (GET may include query string)
-     * @param {{ method: string, body?: FormData }} req
-     * @param {string} [fallbackFilename] - If Content-Disposition is missing
+     * Start a native browser download in a hidden iframe (the browser streams it straight to disk and shows
+     * its own progress), and follow the server-side status to report progress and explain failures.
+     * @param {{ method: 'GET'|'POST', url: string, fields?: Array<[string, string]>, label: string }} req
      * @returns {void}
      */
-    _fetchThenDownloadWithProgress(isArchive, url, req, fallbackFilename) {
-        const popup = this._openDownloadProgressPopup(isArchive);
-        popup.show();
-        const t0 = Date.now();
-        const minSpinnerMs = 450;
+    _nativeDownload({ method, url, fields = [], label }) {
+        const bytes = new Uint8Array(16);
+        window.crypto.getRandomValues(bytes);
+        const token = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 
-        /**
-         * FmPopup.hide() only removes .show after animationDuration; starting the save dialog in the
-         * same frame as hide() leaves the modal on screen. Wait until hide + destroy finish, then run fn.
-         */
-        const hidePopupThen = (fn) => {
-            const delay = Math.max(0, minSpinnerMs - (Date.now() - t0));
-            window.setTimeout(() => {
-                const run = () => window.requestAnimationFrame(fn);
-                try {
-                    if (popup.el && popup.isVisible) {
-                        popup.hideAndDestroy(null, run);
-                    } else {
-                        run();
-                    }
-                } catch (e) {
-                    run();
-                }
-            }, delay);
-        };
+        const frameName = 'fm-dl-frame-' + token;
+        const iframe = document.createElement('iframe');
+        iframe.name = frameName;
+        iframe.style.display = 'none';
+        iframe.setAttribute('aria-hidden', 'true');
+        document.body.appendChild(iframe);
 
-        const triggerBlobDownload = (blob, filename) => {
-            const objectUrl = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = objectUrl;
-            a.download = filename || fallbackFilename || 'download';
-            a.style.display = 'none';
-            document.body.appendChild(a);
-            a.click();
-            a.remove();
-            window.setTimeout(() => URL.revokeObjectURL(objectUrl), 4000);
-        };
+        new FmDownloadTracker({ ajaxUrl: this._ajaxUrl, token, label, iframe }).start();
 
-        requireAuthFetch(url, {
-            method: req.method,
-            body:   req.body,
-        })
-            .then((r) => {
-                const cd = r.headers.get('Content-Disposition');
-                if (!r.ok) {
-                    return r.text().then((t) => {
-                        throw new Error((t && String(t).trim().slice(0, 500)) || ('HTTP ' + r.status));
-                    });
-                }
-                const ct = (r.headers.get('Content-Type') || '').toLowerCase();
-                if (ct.indexOf('text/plain') !== -1) {
-                    return r.text().then((t) => {
-                        throw new Error((t && String(t).trim().slice(0, 500)) || 'Download failed');
-                    });
-                }
-                return r.blob().then((blob) => ({ blob, cd }));
-            })
-            .then((pack) => {
-                const named = FmFileManagerTable._parseContentDispositionFilename(pack.cd);
-                const filename = named || fallbackFilename || 'download';
-                hidePopupThen(() => triggerBlobDownload(pack.blob, filename));
-            })
-            .catch((err) => {
-                const msg = err && err.message ? err.message : String(err);
-                hidePopupThen(() => {
-                    if (typeof fmUserNotice === 'function') {
-                        fmUserNotice({ title: 'Download', message: msg || 'Download failed.' });
-                    } else {
-                        alert(msg || 'Download failed');
-                    }
-                });
+        if (method === 'POST') {
+            const form = document.createElement('form');
+            form.method = 'POST';
+            form.action = url;
+            form.target = frameName;
+            form.style.display = 'none';
+            fields.concat([['dl_token', token], ['csrf_token', fm_csrf_token]]).forEach(([name, value]) => {
+                const input = document.createElement('input');
+                input.type = 'hidden';
+                input.name = name;
+                input.value = value;
+                form.appendChild(input);
             });
+            document.body.appendChild(form);
+            form.submit();
+            form.remove();
+        } else {
+            iframe.src = url + (url.indexOf('?') === -1 ? '?' : '&') + 'dl_token=' + token;
+        }
     }
 
     /**
-     * Single-file GET download (fetch blob, then save).
+     * Single-file GET download (native browser download).
      * @param {string} fullPath - Absolute path string the server expects (same as open/list API)
      * @returns {void}
      */
     _downloadSingleFileViaIframe(fullPath) {
-        const url = this._downloadUrl(fullPath);
         const slash = fullPath.replace(/\\/g, '/').split('/').filter(Boolean);
-        const fallback = slash.length ? slash[slash.length - 1] : 'download';
-        this._fetchThenDownloadWithProgress(false, url, { method: 'GET' }, fallback);
+        const label = slash.length ? slash[slash.length - 1] : 'download';
+        this._nativeDownload({ method: 'GET', url: this._downloadUrl(fullPath), label });
     }
 
     /**
@@ -18786,11 +19289,8 @@ class FmFileManagerTable extends FmTable {
             return;
         }
         const names = rowsDl.map(r => r.name);
-        const stamp = new Date();
-        const pad = (n) => String(n).padStart(2, '0');
-        const defaultArchiveName =
-            'download-' + stamp.getFullYear() + '-' + pad(stamp.getMonth() + 1) + '-' + pad(stamp.getDate()) + '-' +
-            pad(stamp.getHours()) + pad(stamp.getMinutes()) + pad(stamp.getSeconds()) + '.zip';
+        // Several items keep the popup's timestamped "download-…" default.
+        const defaultArchiveName = names.length === 1 ? names[0] + '.zip' : undefined;
         new FmDownloadArchivePopup({
             currentPath:         this._currentPath,
             rootDir:             this._rootDir,
@@ -18805,7 +19305,7 @@ class FmFileManagerTable extends FmTable {
     }
 
     /**
-     * POST download-archive: temp archive via OS/PHP (see $FM_FILE_OPS_MODE), then browser saves file.
+     * POST download-archive: the server streams the archive while building it (OS tools or PHP, see $FM_FILE_OPS_MODE).
      * @param {string[]} names - Basenames under the current folder
      * @param {string} archiveName - Filename with extension
      * @param {string} archiveType - zip | tar | gzip
@@ -18813,13 +19313,14 @@ class FmFileManagerTable extends FmTable {
      */
     _postDownloadArchive(names, archiveName, archiveType) {
         const relIn = this._currentPath === this._rootDir ? '' : this._currentPath.slice(this._rootDir.length + 1);
-        const form = new FormData();
-        form.append('action', 'download-archive');
-        form.append('in', relIn);
-        form.append('archive_name', archiveName);
-        form.append('archive_type', archiveType);
-        names.forEach((n) => form.append('names[]', n));
-        this._fetchThenDownloadWithProgress(true, this._ajaxUrl, { method: 'POST', body: form }, archiveName);
+        const fields = [
+            ['action', 'download-archive'],
+            ['in', relIn],
+            ['archive_name', archiveName],
+            ['archive_type', archiveType],
+        ];
+        names.forEach((n) => fields.push(['names[]', n]));
+        this._nativeDownload({ method: 'POST', url: this._ajaxUrl, fields, label: archiveName });
     }
 
     /**
@@ -20606,7 +21107,7 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
                 form.append('action', 'set-file-ops-mode');
                 form.append('mode', nextOps);
                 form.append('password', opsPass ? (opsPass.value || '') : '');
-                return fetch(ajax_url, { method: 'POST', body: form })
+                return fetch(ajax_url, fmPostInit(form))
                     .then(r => r.json())
                     .then(data => {
                         if (data.status !== 'success') {
@@ -20664,7 +21165,7 @@ if (authBtn) {
     authBtn.addEventListener('click', () => {
         const form = new FormData();
         form.append('action','logout');
-        fetch(ajax_url, { method:'POST', body: form }).then(() => location.reload());
+        fetch(ajax_url, fmPostInit(form)).then(() => location.reload());
     });
 }
 
@@ -20713,7 +21214,7 @@ if (changePasswordBtn && typeof FmPopup !== 'undefined') {
                         form.append('current_password', current ? current.value : '');
                         form.append('new_password', next ? next.value : '');
                         form.append('confirm_password', confirm ? confirm.value : '');
-                        return fetch(ajax_url, { method: 'POST', body: form })
+                        return fetch(ajax_url, fmPostInit(form))
                             .then(r => r.json())
                             .then(data => {
                                 if (data.status !== 'success') {
