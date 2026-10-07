@@ -6,7 +6,7 @@ Manage files directly from your browser — without installing WordPress, Larave
 
 ### One PHP file. No installation. No database.
 
-Current version: **1.1.0**
+Current version: **1.2.0** — see [CHANGELOG.md](CHANGELOG.md)
 
 ## Why SoloFileManager?
 
@@ -155,33 +155,7 @@ See [SECURITY.md](SECURITY.md) for more.
 
 ## Changelog
 
-### Unreleased
-
-- Streaming downloads: the browser download starts immediately and the archive is built on the fly (OS `zip` / `tar` on Linux, built-in PHP writer elsewhere) — fixes "Failed to fetch" on large folders
-- Readable download errors ("Download failed: …", list of skipped files) instead of "Failed to fetch"; no progress toasts (the browser's downloads list shows progress)
-- Download dialog suggests the folder name when one folder is selected
-- Security: CSRF token required on every POST; session cookie `HttpOnly` + `SameSite=Lax` (`Secure` over HTTPS)
-
-### 1.1.0
-
-- Filter current folder by name (search field in the breadcrumb bar)
-- Empty Trash (toolbar confirm + API); clearer Restore visibility with Show trashed
-- Delete forever confirm for dimmed trashed rows; archive overwrite confirm
-- Faster folder size via OS tools when `exec()` / file-ops mode allows
-- Keyboard shortcut labels on actions; F5 refresh; extract syncs sidebar tree
-- Scrollbars: show on hover (fine pointer); always visible on touch
-- Fix: restore / empty trash update the sidebar without a full tree reload (avoids lag)
-
-### 1.0.2
-
-- Fix: after changing password from the header, the page reloads as promised
-- Docs: clarify setup, Configuration (file-ops mode), and terminal settings UX
-
-### 1.0.1
-
-- Dual first-run rename suggestions (random / `solofilemanager_` prefix)
-- In-app password change and Terminal settings (Standard / Manual / Advanced)
-- Configuration can set `$FM_FILE_OPS_MODE` with password confirmation
+See [CHANGELOG.md](CHANGELOG.md). Latest: **1.2.0** — streaming downloads, readable download errors, CSRF protection.
 
 ## License
 

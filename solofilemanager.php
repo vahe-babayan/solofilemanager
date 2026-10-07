@@ -8,7 +8,7 @@ declare(strict_types=1);
  */
 
 /** Product version (semver). Shown in UI / server info. */
-const SOLOFILEMANAGER_VERSION = '1.1.0';
+const SOLOFILEMANAGER_VERSION = '1.2.0';
 
 // Set max execution time to 1 day (86400 seconds)
 @set_time_limit(86400);
