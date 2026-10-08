@@ -6,7 +6,7 @@ Manage files directly from your browser — without installing WordPress, Larave
 
 ### One PHP file. No installation. No database.
 
-Current version: **1.2.0** — see [CHANGELOG.md](CHANGELOG.md)
+Current version: **1.3.0** — see [CHANGELOG.md](CHANGELOG.md)
 
 ## Why SoloFileManager?
 
@@ -89,9 +89,10 @@ Current version: **1.2.0** — see [CHANGELOG.md](CHANGELOG.md)
 **Filesystem**
 
 - The web server user must be able to **read** `$ROOT_DIR` and **write** where you create/upload/rename/delete files
+- Upload size per file is limited by PHP **`upload_max_filesize`** and **`post_max_size`** (and the web server's request limit, e.g. nginx `client_max_body_size`). The upload dialog shows these limits and flags larger files before sending
 - First-run self-rename needs write permission on the directory that contains `solofilemanager.php`
-- Trash uses a hidden folder under root (default `.trash`); that path must be creatable/writable
-- When you finish with SoloFileManager, **empty Trash** or delete the trash folder (default `.trash`) so removed files are not left on the server
+- Trash uses a hidden folder under root (default `.trash`); that path must be creatable/writable. It exists only while Trash holds items (created on the first delete, removed when Trash becomes empty). Deleted items are stored in `.trash/files/`, their original location in `.trash/info/`. On Apache an `.htaccess` blocks web access to it; on nginx / IIS deny that folder yourself (see [SECURITY.md](SECURITY.md))
+- When you finish with SoloFileManager, **empty Trash** so removed files are not left on the server. The Trash button shows how many items are left, and Logout offers "Empty Trash and log out" when Trash is not empty
 
 **Browser & network**
 
@@ -109,7 +110,7 @@ Current version: **1.2.0** — see [CHANGELOG.md](CHANGELOG.md)
 - File/folder listing with sortable columns
 - Create folder/file, rename, bulk rename, duplicate
 - Copy / move with progress; drag and drop
-- Delete to trash (recycle) or delete forever; restore; Empty Trash (with confirm); cleanup reminders in the Trash UI
+- Delete to Trash or delete forever. Trash works like the Windows Recycle Bin: a flat list showing each item's original name, the folder it came from, deletion date and size, with Restore (back to where it was, renamed to "name (restored)" if that name is taken) and Delete forever; Empty Trash (with confirm); item count on the Trash button, a reminder on Logout, and Server info shows how many items / how much space Trash holds; the `.trash` folder is removed as soon as it is empty
 - Filter the current folder listing by name (search field in the breadcrumb bar)
 - Compress / extract archives
 - Change permissions (chmod) for folders and files, including recursive 0755 / 0644 style fixes
@@ -155,7 +156,7 @@ See [SECURITY.md](SECURITY.md) for more.
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). Latest: **1.2.0** — streaming downloads, readable download errors, CSRF protection.
+See [CHANGELOG.md](CHANGELOG.md). Latest: **1.3.0** — Recycle-Bin-style Trash (restore to the original place, protected from web access, reminders while it holds items), clearer upload limits and errors.
 
 ## License
 

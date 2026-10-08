@@ -2,6 +2,38 @@
 
 All notable changes to SoloFileManager are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] - 2026-10-08
+
+### Added
+
+- Server info: "Trash" row with the trash folder name and how many items / how much space it holds (size counted in the background, capped at 5000 files); click the name to open Trash
+- Trash button in the sidebar shows how many items Trash holds (badge, highlighted button, "N items still stored on the server" hint), updated after every action
+- Logout with a non-empty Trash asks first: "Empty Trash and log out", "Log out" or "Cancel", showing the item count and size
+
+### Changed
+
+- Trash works like the Windows Recycle Bin: one flat list of deleted items with their original name, the folder they came from, the deletion date and size. Each item has Restore (back to where it was) and Delete forever; Empty Trash clears everything
+- Deleting the same name twice keeps both copies in Trash; restoring onto an existing name gives "name (restored).ext", "name (restored 2).ext" and says so; a missing original folder is recreated on restore
+- Trash storage: items are kept in `.trash/files/` and their original location in `.trash/info/` (on the server, not in the browser); next to them there is only the protective `.htaccess` and `index.html`. An old-style `.trash` (mirror of the folder tree) is converted automatically the first time Trash is used, including any `.htaccess` / `index.html` that had been deleted into it, which become normal restorable items
+- The trash folder only exists while it holds items: it is created on the first delete to Trash and removed again once Restore, Delete forever or Empty Trash leaves it empty (opening Trash no longer creates it)
+- Upload: files larger than the server limit (`upload_max_filesize` / `post_max_size`) are flagged in the queue and not sent, with the limit shown
+- Upload errors are readable: PHP upload error codes become plain reasons (e.g. "larger than the server limit upload_max_filesize (40M)", "could not write the file to disk"), and web-server rejections (HTTP 413) are explained
+
+### Fixed
+
+- An upload over `post_max_size` returned the HTML page and showed "Invalid response"; the server now answers with a clear JSON error (HTTP 413)
+- Row highlight after create / upload / extract etc.: the item icon no longer flashes green between pulses (it keeps its normal colour)
+
+### Removed
+
+- "Show trashed" checkbox and the merged view of trashed items inside normal folders (with "Original location (merged)" / "Open in Trash" links): everything deleted is now in the Trash list only
+- Browsing, renaming, downloading and editing items inside Trash: restore an item first
+
+### Security
+
+- With `$ENABLE_AUTH = false`: a permanent warning in the header, "Authentication: Off" in Server info, and terminal modes can no longer be enabled from the UI (turning them off still works; enabling requires editing the PHP file)
+- The trash folder gets an `.htaccess` (deny all, Apache 2.2 and 2.4) and empty `index.html` files, so deleted files cannot be downloaded by URL on Apache. On nginx / IIS deny the trash folder in the server config (see SECURITY.md)
+
 ## [1.2.0] - 2026-10-07
 
 ### Added
