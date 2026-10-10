@@ -8,7 +8,7 @@ declare(strict_types=1);
  */
 
 /** Product version (semver). Shown in UI / server info. */
-const SOLOFILEMANAGER_VERSION = '1.3.0';
+const SOLOFILEMANAGER_VERSION = '1.3.1';
 
 // Set max execution time to 1 day (86400 seconds)
 @set_time_limit(86400);
@@ -136,7 +136,12 @@ function safeRealpath(string $p): string {
 function pathInsideRoot(string $path, string $root): bool {
     $path = safeRealpath($path);
     $root = safeRealpath($root);
-    return $path !== '' && $root !== '' && strpos($path, $root) === 0;
+    if ($path === '' || $root === '') {
+        return false;
+    }
+    $path = rtrim($path, '/');
+    $root = rtrim($root, '/');
+    return $path === $root || strpos($path . '/', $root . '/') === 0;
 }
 
 /**

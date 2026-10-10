@@ -9,6 +9,7 @@ SoloFileManager is a file manager with destructive operations (delete, rename, u
 - **CSRF protection**: every state-changing request (POST) must carry a per-session token, so other websites cannot trigger actions through a logged-in browser. Pages opened before an update need a reload.
 - **Session cookie** is `HttpOnly` and `SameSite=Lax`, and `Secure` when served over HTTPS.
 - **Login delay** of ~200 ms on wrong passwords (a light brute-force slowdown — still use IP restrictions / Basic Auth for real protection).
+- **Root folder boundary**: every path is resolved (`realpath`, so `..` and symlinks are followed) and must be the root folder itself or inside it; neighbouring folders with a similar name (e.g. `files-private` next to `files`) are rejected.
 - **Trash not reachable by URL**: the trash folder (default `.trash`) gets an `.htaccess` that denies all requests (Apache 2.2 and 2.4) plus empty `index.html` files. Restored paths are validated so an item can only go back inside the root folder.
 - **Auth off guard**: with `$ENABLE_AUTH = false`, the header shows a permanent warning, Server info shows "Authentication: Off", and terminal modes cannot be enabled from the UI — so a leaked URL cannot be used to switch on command execution. Turning terminal modes off still works; enabling them without auth requires editing the PHP file.
 

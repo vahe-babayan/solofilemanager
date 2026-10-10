@@ -2,6 +2,12 @@
 
 All notable changes to SoloFileManager are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.3.1] - 2026-10-10
+
+### Security
+
+- Root folder boundary: a folder next to the root whose name starts with the root's name (e.g. `files-private` next to root `files`) was treated as inside the root, so a logged-in user could list, download, upload into, delete or change files there. Paths now count as inside only when they are the root itself or below `root/`. Reported by [@HuzaifaDal](https://github.com/HuzaifaDal) - thank you
+
 ## [1.3.0] - 2026-10-08
 
 ### Added
