@@ -2,6 +2,20 @@
 
 All notable changes to SoloFileManager are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.3.2] - 2026-10-14
+
+### Security
+
+- Root folder boundary for new files: a path that did not exist yet (upload target, new folder / file, rename target) was checked by its text only, so a logged-in user could write outside the root through a symlink or junction inside it (e.g. upload `link/shell.php` where `link` points to a web folder outside the root, then run it), through a dangling link, or with `../` in the new name on rename. Such paths are now judged by the real location of their nearest existing parent; `.`, `..` and dangling links are rejected, and rename refuses names with `\ / : * ? " < > |`. Reported by levanduy181 - thank you
+
+### Fixed
+
+- Error messages in the Rename, Create new folder, Create new file and New folder from selection popups were never shown (e.g. a name with `/` or an existing name did nothing); they now appear under the field
+
+- After deleting (or moving out, or restoring from Trash) nothing stays selected; the neighbouring row only gets the keyboard focus frame, so the arrow keys continue from there
+- Trash: the "from /folder" line under a selected item is now light and readable on the highlighted row (was grey)
+- Bulk rename: the popup no longer changes height while you edit the rules. The red "Every new name matches the current name…" line is gone; Apply is simply disabled until at least one name changes and the preview has no invalid / duplicate names, with a short static hint under the counter row. Server errors on Apply are shown in a notice
+
 ## [1.3.1] - 2026-10-10
 
 ### Security

@@ -6,7 +6,7 @@ Manage files directly from your browser — without installing WordPress, Larave
 
 ### One PHP file. No installation. No database.
 
-Current version: **1.3.1** — see [CHANGELOG.md](CHANGELOG.md)
+Current version: **1.3.2** — see [CHANGELOG.md](CHANGELOG.md)
 
 ## Why SoloFileManager?
 
@@ -156,7 +156,7 @@ See [SECURITY.md](SECURITY.md) for more.
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). Latest: **1.3.1** — security fix: folders next to the root with a similar name (e.g. `files-private` next to `files`) are no longer reachable. Update recommended.
+See [CHANGELOG.md](CHANGELOG.md). Latest: **1.3.2** — security fix: uploads, new files / folders and renames can no longer escape the root through symlinks, junctions or `../`. Update recommended.
 
 ## License
 

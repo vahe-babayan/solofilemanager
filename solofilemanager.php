@@ -8,7 +8,7 @@ declare(strict_types=1);
  */
 
 /** Product version (semver). Shown in UI / server info. */
-const SOLOFILEMANAGER_VERSION = '1.3.1';
+const SOLOFILEMANAGER_VERSION = '1.3.2';
 
 // Set max execution time to 1 day (86400 seconds)
 @set_time_limit(86400);
@@ -127,14 +127,54 @@ function safeRealpath(string $p): string {
 }
 
 /**
- * Check if a path is inside the root
- * 
+ * Real location of a path that may not exist yet (a file about to be created / uploaded / renamed to).
+ * The nearest existing ancestor is resolved with realpath() (symlinks / junctions followed) and the
+ * missing tail is appended. Returns '' when the location cannot be trusted: the tail contains "." / ".."
+ * or a dangling symlink, or no ancestor exists.
+ *
+ * @param string $path
+ * @return string
+ */
+function fmResolvePathForCheck(string $path): string {
+    $path = normPath($path);
+    $real = realpath($path);
+    if ($real !== false) {
+        return normPath($real);
+    }
+    $tail = [];
+    $cur = rtrim($path, '/');
+    while (!file_exists($cur)) {
+        if (@lstat($cur) !== false) {
+            return '';
+        }
+        $base = basename($cur);
+        if ($base === '' || $base === '.' || $base === '..') {
+            return '';
+        }
+        array_unshift($tail, $base);
+        $parent = normPath(dirname($cur));
+        if ($parent === $cur || $parent === '' || $parent === '.') {
+            return '';
+        }
+        $cur = rtrim($parent, '/') === '' ? '/' : $parent;
+    }
+    $realParent = realpath($cur);
+    if ($realParent === false) {
+        return '';
+    }
+    return rtrim(normPath($realParent), '/') . '/' . implode('/', $tail);
+}
+
+/**
+ * Check if a path is inside the root (the root itself or below it), judged by its real location
+ * so symlinks, junctions and ".." cannot lead outside, also for paths that do not exist yet.
+ *
  * @param string $path
  * @param string $root
  * @return bool
  */
 function pathInsideRoot(string $path, string $root): bool {
-    $path = safeRealpath($path);
+    $path = fmResolvePathForCheck($path);
     $root = safeRealpath($root);
     if ($path === '' || $root === '') {
         return false;
@@ -3824,8 +3864,16 @@ if (isset($_POST['action']) && $_POST['action'] === 'rename' && isset($_POST['in
     $dir = $dirIn !== '' ? $ROOT_DIR . '/' . trim($dirIn, '/') : $ROOT_DIR;
     $dir = safeRealpath($dir);
     if (!pathInsideRoot($dir, $ROOT_DIR)) jsonOut(['status' => 'error', 'msg' => 'Invalid path']);
-    $oldPath = $dir . '/' . (string)$_POST['name'];
-    $newPath = $dir . '/' . (string)$_POST['new_name'];
+    $oldName = (string)$_POST['name'];
+    $newName = (string)$_POST['new_name'];
+    if (in_array($oldName, ['', '.', '..'], true) || preg_match('~[\\\\/]~', $oldName)) {
+        jsonOut(['status' => 'error', 'msg' => 'Invalid path']);
+    }
+    if (in_array($newName, ['', '.', '..'], true) || preg_match('/[\\\\\/:*?"<>|]/', $newName)) {
+        jsonOut(['status' => 'error', 'msg' => 'Name cannot be empty or contain \\ / : * ? " < > |']);
+    }
+    $oldPath = $dir . '/' . $oldName;
+    $newPath = $dir . '/' . $newName;
     if (!pathInsideRoot($oldPath, $ROOT_DIR) || !pathInsideRoot($newPath, $ROOT_DIR)) jsonOut(['status' => 'error', 'msg' => 'Invalid path']);
     if (!file_exists($oldPath)) jsonOut(['status' => 'error', 'msg' => 'File or folder not found']);
     if (file_exists($newPath)) jsonOut(['status' => 'error', 'msg' => 'A file or folder with that name already exists']);
@@ -7657,8 +7705,11 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     font-size: 0.75rem;
 }
 
-.fm-bulk-rename-popup .fm-br-err {
-    margin-top: 0.5rem;
+.fm-bulk-rename-popup .fm-br-hint {
+    margin: 0.35rem 0 0;
+    font-size: 0.75rem;
+    line-height: 1.4;
+    color: var(--muted-text, #6c757d);
 }
 
 /* Terminal here popup */
@@ -8742,6 +8793,10 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     white-space: nowrap;
     font-size: 11px;
     color: #777;
+}
+
+.fm-table tbody tr.fm-table-row-selected .fm-trash-origin {
+    color: rgba(255, 255, 255, .8);
 }
 
 .fm-table .fm-table-name {
@@ -10604,7 +10659,7 @@ class FmCreateNewFolderPopup extends FmPopup {
 
         super({
             title: 'Create new folder',
-            content: `<label><span>Folder name</span><input type="text" name="folder-name" class="fm-input-focus-on-open fm-input" autocomplete="off" placeholder="folder-name"></label><p class="fm-error fm-hidden" data-err></p>`,
+            content: `<label><span>Folder name</span><input type="text" name="folder-name" class="fm-input-focus-on-open fm-input" autocomplete="off" placeholder="folder-name"></label><p class="fm-error" data-err style="display:none"></p>`,
             buttons: [
                 { label: 'Cancel', close: true },
                 { label: 'Create', primary: true, close: false, onClick: () => this._handleCreate() }
@@ -10693,7 +10748,7 @@ class FmNewFolderFromSelectionPopup extends FmPopup {
                 '<p class="fm-hint mt-0 mb-2">Selected items will be moved into a new subfolder in this directory.</p>' +
                 '<label><span>New folder name</span>' +
                 '<input type="text" name="folder-name" class="fm-input-focus-on-open fm-input" autocomplete="off" placeholder="folder-name"></label>' +
-                '<p class="fm-error fm-hidden" data-err></p>',
+                '<p class="fm-error" data-err style="display:none"></p>',
             buttons: [
                 { label: 'Cancel', close: true },
                 { label: 'Create and move', primary: true, close: false, onClick: () => this._handleSubmit() },
@@ -10787,7 +10842,7 @@ class FmCreateFilePopup extends FmPopup {
 
         super({
             title: 'Create new file',
-            content: `<label><span>File name</span><input type="text" name="file-name" class="fm-input-focus-on-open fm-input" autocomplete="off" placeholder="filename.txt"></label><p class="fm-error fm-hidden" data-err></p>`,
+            content: `<label><span>File name</span><input type="text" name="file-name" class="fm-input-focus-on-open fm-input" autocomplete="off" placeholder="filename.txt"></label><p class="fm-error" data-err style="display:none"></p>`,
             buttons: [
                 { label: 'Cancel', close: true },
                 { label: 'Create', primary: true, close: false, onClick: () => this._handleCreate() }
@@ -11918,7 +11973,7 @@ class FmRenamePopup extends FmPopup {
 
         super({
             title:   'Rename',
-            content: '<p><label><span>New name</span><input type="text" name="new-name" class="fm-input-focus-on-open fm-input" autocomplete="off"></label><p class="fm-error fm-hidden" data-err></p></p>',
+            content: '<p><label><span>New name</span><input type="text" name="new-name" class="fm-input-focus-on-open fm-input" autocomplete="off"></label></p><p class="fm-error" data-err style="display:none"></p>',
             submitOnEnter: true,
             buttons: [
                 { label: 'Cancel', close: true },
@@ -15356,11 +15411,12 @@ class FmBulkRenamePopup extends FmPopup {
             '<label>step <input type="number" class="fm-br-c-step" value="1" step="1"></label> ' +
             '<label>digits <input type="number" class="fm-br-c-digits" min="1" max="9" value="3"></label> ' +
             '<label>sep <input type="text" class="fm-br-c-sep" maxlength="4" value="-"></label>' +
-            '</span></div></div>' +
+            '</span></div>' +
+            '<p class="fm-br-hint">Apply becomes available once at least one name changes and every new name is valid. ' +
+            'The counter numbers the items, e.g. photo-001.jpg, photo-002.jpg.</p></div>' +
             '<div class="fm-br-preview-wrap">' +
             '<table class="fm-br-preview"><thead><tr><th>Current name</th><th>New name</th></tr></thead>' +
-            '<tbody class="fm-br-tbody"></tbody></table></div>' +
-            '<p class="fm-error fm-hidden fm-br-err" data-br-err></p>';
+            '<tbody class="fm-br-tbody"></tbody></table></div>';
 
         super({
             title: 'Bulk rename',
@@ -15462,7 +15518,6 @@ class FmBulkRenamePopup extends FmPopup {
     _refreshPreview() {
         const esc = FmPopup.escapeHtml.bind(FmPopup);
         const tbody = this.el && this.el.querySelector('.fm-br-tbody');
-        const errEl = this.el && this.el.querySelector('[data-br-err]');
         if (!tbody) return;
         const o = this._readOpts();
         const invalidRe = /[\\/:*?"<>|]/;
@@ -15503,17 +15558,18 @@ class FmBulkRenamePopup extends FmPopup {
         }
         tbody.innerHTML = html;
 
-        if (errEl) {
-            if (changeCount === 0 && this._rows.length > 0) {
-                errEl.textContent = 'Every new name matches the current name — change rules or add a counter.';
-                errEl.classList.remove('fm-hidden');
-                hasErr = true;
-            } else {
-                errEl.textContent = '';
-                errEl.classList.add('fm-hidden');
-            }
-        }
         this._previewHasError = hasErr;
+        this._previewChangeCount = changeCount;
+        this._syncApplyButton();
+    }
+
+    /**
+     * Apply is enabled only when the preview renames something and has no invalid / duplicate names.
+     */
+    _syncApplyButton() {
+        const primary = this.el && this.el.querySelector('.fm-popup-primary-btn');
+        if (!primary) return;
+        primary.disabled = !!this._applyBusy || !!this._previewHasError || !this._previewChangeCount;
     }
 
     _wire() {
@@ -15594,14 +15650,7 @@ class FmBulkRenamePopup extends FmPopup {
 
     _apply() {
         this._refreshPreview();
-        const errEl = this.el && this.el.querySelector('[data-br-err]');
-        if (this._previewHasError) {
-            if (errEl && !errEl.textContent) {
-                errEl.textContent = 'Fix invalid or duplicate names in the preview before applying.';
-                errEl.classList.remove('fm-hidden');
-            }
-            return;
-        }
+        if (this._applyBusy || this._previewHasError || !this._previewChangeCount) return;
         const o = this._readOpts();
         const pairs = [];
         for (let i = 0; i < this._rows.length; i++) {
@@ -15625,8 +15674,8 @@ class FmBulkRenamePopup extends FmPopup {
             form.append('to[]', p[1]);
         });
 
-        const primary = this.el.querySelector('.fm-buttons .fm-popup-action-button.fm-popup-primary, .fm-buttons .fm-popup-action-button:last-of-type');
-        if (primary) primary.disabled = true;
+        this._applyBusy = true;
+        this._syncApplyButton();
 
         const run = typeof requireAuthFetch === 'function'
             ? requireAuthFetch(this._ajaxUrl, fmPostInit(form))
@@ -15635,28 +15684,19 @@ class FmBulkRenamePopup extends FmPopup {
         run
             .then((r) => r.json())
             .then((data) => {
-                if (primary) primary.disabled = false;
+                this._applyBusy = false;
+                this._syncApplyButton();
                 if (data && data.status === 'success') {
                     this.hideAndDestroy();
                     if (this._onSuccess) this._onSuccess();
                     return;
                 }
-                const msg = (data && data.msg) || 'Bulk rename failed.';
-                if (errEl) {
-                    errEl.textContent = msg;
-                    errEl.classList.remove('fm-hidden');
-                } else if (typeof fmUserNotice === 'function') {
-                    fmUserNotice({ title: 'Bulk rename', message: msg });
-                }
+                fmUserNotice({ title: 'Bulk rename', message: (data && data.msg) || 'Bulk rename failed.' });
             })
             .catch(() => {
-                if (primary) primary.disabled = false;
-                if (errEl) {
-                    errEl.textContent = 'Request failed.';
-                    errEl.classList.remove('fm-hidden');
-                } else if (typeof fmUserNotice === 'function') {
-                    fmUserNotice({ title: 'Bulk rename', message: 'Request failed.' });
-                }
+                this._applyBusy = false;
+                this._syncApplyButton();
+                fmUserNotice({ title: 'Bulk rename', message: 'Request failed.' });
             });
     }
 }
@@ -20328,7 +20368,8 @@ class FmFileManagerTable extends FmTable {
     }
 
     /**
-     * Focus/select one row after delete/move reload so ArrowUp/Down continue from a sensible position.
+     * Put the keyboard focus (not the selection) on one row after a delete/move reload,
+     * so ArrowUp/Down continue from a sensible position while nothing stays selected.
      */
     _applyPendingKeyboardAnchor() {
         const a = this._pendingKeyboardAnchor;
@@ -20345,7 +20386,6 @@ class FmFileManagerTable extends FmTable {
         if (idx < 0) idx = 0;
         if (idx >= len) idx = len - 1;
         this._selectionAnchor = idx;
-        this._selectRow(idx);
         this._focusRow(idx);
     }
 
