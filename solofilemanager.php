@@ -8,7 +8,7 @@ declare(strict_types=1);
  */
 
 /** Product version (semver). Shown in UI / server info. */
-const SOLOFILEMANAGER_VERSION = '1.3.2';
+const SOLOFILEMANAGER_VERSION = '1.3.3';
 
 // Set max execution time to 1 day (86400 seconds)
 @set_time_limit(86400);
@@ -1954,6 +1954,167 @@ function fmEnsureParentDirs(string $path): bool {
  * 
  * @throws RuntimeException If $folder does not exist, is not readable, or an error occurs while checking its contents.
  */
+/**
+ * Whether $path itself is a symlink or a Windows junction.
+ * is_link() does not report junctions, so a path whose real location differs from "real parent + own name" counts as a link too.
+ */
+function fmIsLinkPath(string $path): bool {
+    if (is_link($path)) {
+        return true;
+    }
+    $real = realpath($path);
+    $parent = realpath(dirname($path));
+    if ($real === false || $parent === false) {
+        return false;
+    }
+    $own = rtrim(normPath($parent), '/') . '/' . basename($path);
+    $real = normPath($real);
+    return PHP_OS_FAMILY === 'Windows' ? strcasecmp($real, $own) !== 0 : $real !== $own;
+}
+
+/**
+ * Remove a symlink / junction itself, never what it points to.
+ * On Windows folder links need rmdir() and file links unlink(); is_dir() is unreliable for junctions, so both are tried.
+ */
+function fmRemoveLink(string $path): bool {
+    if (PHP_OS_FAMILY === 'Windows' && @rmdir($path)) {
+        return true;
+    }
+    return @unlink($path);
+}
+
+/**
+ * Link details for a folder entry, or null when the entry is not a link.
+ *
+ * @param string $full    Folder + '/' + entry name
+ * @param string $rootDir
+ * @return array{link: true, link_target?: string, link_outside?: true, link_broken?: true}|null
+ */
+function fmLinkInfo(string $full, string $rootDir): ?array {
+    if (!fmIsLinkPath($full)) {
+        return null;
+    }
+    $real = realpath($full);
+    if ($real === false) {
+        return ['link' => true, 'link_broken' => true];
+    }
+    $real = normPath($real);
+    if (!pathInsideRoot($real, $rootDir)) {
+        return ['link' => true, 'link_outside' => true];
+    }
+    return ['link' => true, 'link_target' => $real];
+}
+
+/**
+ * Local path stored in a Windows Shell Link (.lnk) file, or null if not a readable shortcut.
+ * (Explorer "Create shortcut" files — not the same as a symlink / junction.)
+ */
+function fmParseLnkTarget(string $lnkPath): ?string {
+    $raw = @file_get_contents($lnkPath);
+    if ($raw === false || strlen($raw) < 76) {
+        return null;
+    }
+    $headerSize = unpack('V', substr($raw, 0, 4));
+    if ($headerSize === false || (int)$headerSize[1] !== 0x4C) {
+        return null;
+    }
+    $flagsU = unpack('V', substr($raw, 20, 4));
+    if ($flagsU === false) {
+        return null;
+    }
+    $flags  = (int)$flagsU[1];
+    $offset = 76;
+    $len    = strlen($raw);
+    if ($flags & 0x01) {
+        if ($len < $offset + 2) {
+            return null;
+        }
+        $idListSize = unpack('v', substr($raw, $offset, 2));
+        if ($idListSize === false) {
+            return null;
+        }
+        $offset += 2 + (int)$idListSize[1];
+    }
+    if (!($flags & 0x02) || $len < $offset + 28) {
+        return null;
+    }
+    $linkInfoSize       = (int)unpack('V', substr($raw, $offset, 4))[1];
+    $linkInfoHeaderSize = (int)unpack('V', substr($raw, $offset + 4, 4))[1];
+    $linkInfoFlags      = (int)unpack('V', substr($raw, $offset + 8, 4))[1];
+    if ($linkInfoSize < 28 || !($linkInfoFlags & 0x01)) {
+        return null;
+    }
+    $infoEnd = $offset + $linkInfoSize;
+    if ($infoEnd > $len) {
+        $infoEnd = $len;
+    }
+    if ($linkInfoHeaderSize >= 0x24 && $len >= $offset + 32) {
+        $uRel = (int)unpack('V', substr($raw, $offset + 28, 4))[1];
+        if ($uRel > 0 && $offset + $uRel + 1 < $infoEnd) {
+            $uOff = $offset + $uRel;
+            $bytes = '';
+            for ($i = $uOff; $i + 1 < $infoEnd; $i += 2) {
+                $pair = substr($raw, $i, 2);
+                if ($pair === "\x00\x00") {
+                    break;
+                }
+                $bytes .= $pair;
+            }
+            if ($bytes !== '') {
+                $path = @iconv('UTF-16LE', 'UTF-8//IGNORE', $bytes);
+                if (is_string($path) && $path !== '') {
+                    return normPath($path);
+                }
+            }
+        }
+    }
+    $aRel = (int)unpack('V', substr($raw, $offset + 16, 4))[1];
+    if ($aRel <= 0 || $offset + $aRel >= $infoEnd) {
+        return null;
+    }
+    $aOff = $offset + $aRel;
+    $end  = strpos($raw, "\x00", $aOff);
+    if ($end === false || $end > $infoEnd) {
+        return null;
+    }
+    $path = substr($raw, $aOff, $end - $aOff);
+    return ($path !== false && $path !== '') ? normPath($path) : null;
+}
+
+/**
+ * Windows .lnk shortcut details, or null when $full is not a .lnk file.
+ *
+ * @return array{link: true, link_shortcut: true, link_target?: string, link_outside?: true, link_broken?: true, link_target_is_dir?: true}|null
+ */
+function fmShortcutLinkInfo(string $full, string $rootDir): ?array {
+    if (strtolower(pathinfo($full, PATHINFO_EXTENSION)) !== 'lnk') {
+        return null;
+    }
+    $base = ['link' => true, 'link_shortcut' => true];
+    $target = fmParseLnkTarget($full);
+    if ($target === null || $target === '') {
+        return $base + ['link_broken' => true];
+    }
+    $real = realpath($target);
+    if ($real === false) {
+        return $base + ['link_broken' => true];
+    }
+    $real  = normPath($real);
+    $isDir = is_dir($real);
+    if (!pathInsideRoot($real, $rootDir)) {
+        $out = $base + ['link_outside' => true];
+        if ($isDir) {
+            $out['link_target_is_dir'] = true;
+        }
+        return $out;
+    }
+    $out = $base + ['link_target' => $real];
+    if ($isDir) {
+        $out['link_target_is_dir'] = true;
+    }
+    return $out;
+}
+
 function getFilesAndFoldersList(string $path, string $rootDir, array $excludeNames = [], bool $excludeTrashFolder = false): array {
     $folder = rawurldecode($path);
     $folder = safeRealpath($folder);
@@ -1979,14 +2140,28 @@ function getFilesAndFoldersList(string $path, string $rootDir, array $excludeNam
         $mtime = @filemtime($full);
         $mtime = $mtime !== false ? $mtime : null;
         if (is_dir($full)) {
-            $result['folders'][$f] = ['permissions' => $permissions, 'mtime' => $mtime];
+            $result['folders'][$f] = ['permissions' => $permissions, 'mtime' => $mtime] + (fmLinkInfo($full, $rootDir) ?? []);
         } elseif (is_file($full)) {
-            $result['files'][$f] = [
-                'ext' => pathinfo($full, PATHINFO_EXTENSION),
-                'size' => @filesize($full) ?: 0,
-                'permissions' => $permissions,
-                'mtime' => $mtime
-            ];
+            $shortcut = fmShortcutLinkInfo($full, $rootDir);
+            if ($shortcut !== null && !empty($shortcut['link_target_is_dir'])) {
+                unset($shortcut['link_target_is_dir']);
+                $result['folders'][$f] = ['permissions' => $permissions, 'mtime' => $mtime] + $shortcut;
+            } elseif ($shortcut !== null) {
+                unset($shortcut['link_target_is_dir']);
+                $result['files'][$f] = [
+                    'ext' => 'lnk',
+                    'size' => @filesize($full) ?: 0,
+                    'permissions' => $permissions,
+                    'mtime' => $mtime,
+                ] + $shortcut;
+            } else {
+                $result['files'][$f] = [
+                    'ext' => pathinfo($full, PATHINFO_EXTENSION),
+                    'size' => @filesize($full) ?: 0,
+                    'permissions' => $permissions,
+                    'mtime' => $mtime,
+                ] + (fmLinkInfo($full, $rootDir) ?? []);
+            }
         }
     }
     return $result;
@@ -2026,7 +2201,12 @@ function getFolderTree(string $path, string $rootDir, int $depth = 0, int $maxDe
             }
             $full = $path . '/' . $f;
             if (is_dir($full) && pathInsideRoot($full, $rootDir)) {
-                $children[] = getFolderTree($full, $rootDir, $depth + 1, $maxDepth);
+                $child = getFolderTree($full, $rootDir, $depth + 1, $maxDepth);
+                if ($child && fmLinkInfo($full, $rootDir) !== null) {
+                    $child['name'] = $f;
+                    $child['link'] = true;
+                }
+                $children[] = $child;
             }
         }
     }
@@ -2047,6 +2227,7 @@ function getFolderTree(string $path, string $rootDir, int $depth = 0, int $maxDe
  */
 function deletePath(string $path, string $rootDir): bool {
     if (!pathInsideRoot($path, $rootDir)) return false;
+    if (fmIsLinkPath($path)) return fmRemoveLink($path);
     if (is_file($path)) return @unlink($path);
     if (is_dir($path)) {
         $items = @scandir($path);
@@ -2074,8 +2255,9 @@ function deletePath(string $path, string $rootDir): bool {
  */
 function deletePathWithProgress(string $path, string $rootDir, int &$count, callable $onProgress): bool {
     if (!pathInsideRoot($path, $rootDir)) return false;
-    if (is_file($path)) {
-        if (@unlink($path)) {
+    $isLink = fmIsLinkPath($path);
+    if ($isLink || is_file($path)) {
+        if ($isLink ? fmRemoveLink($path) : @unlink($path)) {
             $count++;
             $onProgress($count, $path);
             return true;
@@ -2126,6 +2308,8 @@ function osDeletePath(string $path, string $rootDir): bool {
     }
 
     @exec($cmd, $output, $returnCode);
+    // Per-path clearing misses the cached entry of a junction.
+    clearstatcache(true);
     return !file_exists($path);
 }
 
@@ -2176,6 +2360,45 @@ function pathIsStrictDescendant(string $path, string $ancestor): bool {
  * 
  * @throws RuntimeException If $src or $dst does not exist, is not readable, or an error occurs while checking its contents.
  */
+/**
+ * Copy a symlink / junction as a link (do not copy the target's contents).
+ */
+function fmCopyLinkAsLink(string $src, string $dst, string $rootDir, int &$count, callable $onProgress): bool {
+    if (!pathInsideRoot($dst, $rootDir) || file_exists($dst)) {
+        return false;
+    }
+    $parent = dirname($dst);
+    if (!is_dir($parent) && !@mkdir($parent, 0755, true)) {
+        return false;
+    }
+    $ok = false;
+    $linkText = @readlink($src);
+    if ($linkText !== false && $linkText !== '') {
+        $ok = @symlink($linkText, $dst);
+    }
+    if (!$ok) {
+        $real = realpath($src);
+        if ($real === false) {
+            return false;
+        }
+        if (PHP_OS_FAMILY === 'Windows') {
+            $cmd = 'cmd /c mklink /J ' . escapeshellarg(str_replace('/', '\\', $dst))
+                . ' ' . escapeshellarg(str_replace('/', '\\', $real)) . ' 2>nul';
+            @exec($cmd, $out, $rc);
+            clearstatcache(true);
+            $ok = file_exists($dst);
+        } else {
+            $ok = @symlink($real, $dst);
+        }
+    }
+    if (!$ok) {
+        return false;
+    }
+    $count++;
+    $onProgress($count, $dst);
+    return true;
+}
+
 function copyPathPhp(string $src, string $dst, string $rootDir, int &$count, callable $onProgress): bool {
     if (!pathInsideRoot($src, $rootDir) || !file_exists($src)) {
         return false;
@@ -2185,6 +2408,10 @@ function copyPathPhp(string $src, string $dst, string $rootDir, int &$count, cal
     }
     if (file_exists($dst)) {
         return false;
+    }
+    // Symlink / junction: recreate the link, do not walk into the target (cycles / disk fill).
+    if (fmIsLinkPath($src)) {
+        return fmCopyLinkAsLink($src, $dst, $rootDir, $count, $onProgress);
     }
     if (is_file($src)) {
         $parent = dirname($dst);
@@ -2410,6 +2637,16 @@ function countPathFiles(string $path, string $rootDir): array {
             $full = $dir . '/' . $item;
             if (!pathInsideRoot($full, $rootDir)) continue;
 
+            // Do not follow symlinks / junctions (cycles).
+            if (fmIsLinkPath($full)) {
+                if (is_dir($full)) {
+                    $foldersCount++;
+                } else {
+                    $filesCount++;
+                }
+                continue;
+            }
+
             if (is_dir($full)) {
                 $stack[] = $full;
             } elseif (is_file($full)) {
@@ -2430,6 +2667,7 @@ function countPathFiles(string $path, string $rootDir): array {
 
 /**
  * Folder size via recursive PHP walk (no exec).
+ * Symlinks / junctions are not entered (avoids cycles and double-counting).
  *
  * @param string $path
  * @param string $rootDir
@@ -2449,6 +2687,9 @@ function getFolderSizePhp(string $path, string $rootDir): int {
             continue;
         }
         $full = $path . '/' . $f;
+        if (fmIsLinkPath($full)) {
+            continue;
+        }
         if (is_file($full)) {
             $size += (int) (@filesize($full) ?: 0);
         } elseif (is_dir($full)) {
@@ -3122,9 +3363,9 @@ function fmArchiveWalk(string $dir, array $names): Generator {
  * @return Generator<array{0: string, 1: string, 2: bool}>
  */
 function fmArchiveWalkPath(string $abs, string $rel): Generator {
-    $isLink = is_link($abs);
+    $isLink = fmIsLinkPath($abs);
     if (is_dir($abs)) {
-        // Following nested folder links could loop forever.
+        // Nested folder links (symlink / junction): do not follow (cycles).
         if ($isLink && strpos($rel, '/') !== false) {
             FmDlStatus::skip($rel . '/', 'linked folder');
             return;
@@ -3564,8 +3805,34 @@ if (!$needsRename) {
 }
 
 if (isset($_GET['action']) && $_GET['action'] === 'open' && isset($_GET['folder'])) {
-    $folderRaw = rawurldecode((string)$_GET['folder']);
-    $folder = safeRealpath($folderRaw);
+    $folderRaw = normPath(rawurldecode((string)$_GET['folder']));
+    $folder = '';
+    // Windows Explorer .lnk that points at a folder: open the target, not the shortcut file.
+    if (is_file($folderRaw) && strtolower(pathinfo($folderRaw, PATHINFO_EXTENSION)) === 'lnk') {
+        $si = fmShortcutLinkInfo($folderRaw, $ROOT_DIR);
+        if ($si !== null && !empty($si['link_outside'])) {
+            jsonOut([
+                'status'  => 'invalid',
+                'reason'  => 'outside_root',
+                'msg'     => 'That path is outside the file manager root.',
+                'folders' => [],
+                'files'   => [],
+            ]);
+        }
+        if ($si !== null && !empty($si['link_target']) && !empty($si['link_target_is_dir'])) {
+            $folder = $si['link_target'];
+        } else {
+            jsonOut([
+                'status'  => 'invalid',
+                'reason'  => 'not_found',
+                'msg'     => 'This folder does not exist or is not accessible.',
+                'folders' => [],
+                'files'   => [],
+            ]);
+        }
+    } else {
+        $folder = safeRealpath($folderRaw);
+    }
     if (!pathInsideRoot($folder, $ROOT_DIR)) {
         jsonOut([
             'status'  => 'invalid',
@@ -3594,6 +3861,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'open' && isset($_GET['folder'
         }
         jsonOut([
             'status'         => 'ok',
+            'path'           => $folder,
             'trash_view'     => true,
             'trash_basename' => fmTrashBasename(),
             'trash_items'    => $items,
@@ -3614,6 +3882,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'open' && isset($_GET['folder'
     $exclude = array_merge($EXCLUDE_NAMES, [$thisFileName]);
     $payload = getFilesAndFoldersList($folder, $ROOT_DIR, $exclude, true);
     $payload['status'] = 'ok';
+    $payload['path'] = $folder;
     $payload['trash_basename'] = fmTrashBasename();
     $payload['trash_count'] = fmTrashCount($ROOT_DIR);
     jsonOut($payload);
@@ -3659,26 +3928,52 @@ if (isset($_GET['action']) && $_GET['action'] === 'get-folder-size' && isset($_G
 }
 
 if (isset($_GET['action']) && $_GET['action'] === 'get-info' && isset($_GET['path'])) {
-    $path = safeRealpath(rawurldecode((string)$_GET['path']));
-    if (!pathInsideRoot($path, $ROOT_DIR) || !file_exists($path)) jsonOut(['status' => 'error', 'msg' => 'Not found']);
-    $name = basename($path);
-    $isDir = is_dir($path);
-    $size = $isDir ? getFolderSize($path, $ROOT_DIR) : (int) (@filesize($path) ?: 0);
-    $modified = @filemtime($path);
+    $raw = rtrim(normPath(rawurldecode((string)$_GET['path'])), '/');
+    $path = safeRealpath($raw);
+    $linkName = basename($raw);
+    $linkPath = rtrim(safeRealpath(dirname($raw)), '/') . '/' . $linkName;
+    $link = null;
+    $shortcutDir = false;
+    if (!in_array($linkName, ['', '.', '..'], true) && pathInsideRoot(dirname($linkPath), $ROOT_DIR)) {
+        if (is_file($linkPath) && strtolower(pathinfo($linkPath, PATHINFO_EXTENSION)) === 'lnk') {
+            $link = fmShortcutLinkInfo($linkPath, $ROOT_DIR);
+            if ($link !== null) {
+                $shortcutDir = !empty($link['link_target_is_dir']);
+                unset($link['link_target_is_dir']);
+            }
+        } elseif (file_exists($path)) {
+            $link = fmLinkInfo($linkPath, $ROOT_DIR);
+        }
+    }
+    $outside = $link !== null && !empty($link['link_outside']);
+    $shortcutFolder = $link !== null && !empty($link['link_shortcut']) && !empty($link['link_target']) && is_dir($link['link_target']);
+    if ($shortcutFolder) {
+        $path = $link['link_target'];
+    }
+    if ((!$outside && !pathInsideRoot($path, $ROOT_DIR)) || (!file_exists($path) && !$outside)) jsonOut(['status' => 'error', 'msg' => 'Not found']);
+    $name = $link !== null ? $linkName : basename($path);
+    $isDir = is_dir($path) || $shortcutFolder || ($outside && !empty($shortcutDir));
+    if ($outside) {
+        $size = null;
+    } else {
+        $size = $isDir ? getFolderSize($path, $ROOT_DIR) : (int) (@filesize($path) ?: 0);
+    }
+    $statPath = ($link !== null && !empty($link['link_shortcut'])) ? $linkPath : $path;
+    $modified = @filemtime($statPath);
     $modifiedStr = $modified ? date('Y-m-d H:i:s', $modified) : '';
-    $ext = $isDir ? null : pathinfo($path, PATHINFO_EXTENSION);
-    $perms = @fileperms($path);
+    $ext = $isDir ? null : pathinfo($name, PATHINFO_EXTENSION);
+    $perms = @fileperms($statPath);
     $permissions = $perms !== false ? substr(sprintf('%o', $perms), -4) : '';
     $out = [
         'status'      => 'success',
         'name'        => $name,
-        'path'        => $path,
+        'path'        => $link !== null ? $linkPath : $path,
         'type'        => $isDir ? 'folder' : 'file',
-        'size'        => (int)$size,
+        'size'        => $size === null ? null : (int)$size,
         'modified'    => $modifiedStr,
         'extension'   => $ext,
         'permissions' => $permissions
-    ];
+    ] + ($link ?? []);
     jsonOut($out);
 }
 
@@ -5390,7 +5685,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'trash-empty') {
     $infoDir  = fmTrashInfoDir($ROOT_DIR);
     foreach (fmTrashList($ROOT_DIR) as $item) {
         $full = $filesDir . '/' . $item['id'];
-        if (!pathInsideRoot($full, $ROOT_DIR) || !fmIsUnderTrashTree($full, $ROOT_DIR)) {
+        if (!pathInsideRoot($full, $ROOT_DIR) || !fmIsUnderTrashTree(fmIsLinkPath($full) ? $filesDir : $full, $ROOT_DIR)) {
             $errors[] = $item['name'] . ': skipped';
             continue;
         }
@@ -6086,6 +6381,7 @@ html:has(.fm-table-wrapper) body {
 }
 
 .fm-tree-link .bi-folder-fill,
+.fm-tree-link .bi-folder-symlink-fill,
 .fm-tree-link .bi-house-fill {
     display: flex;
     flex-shrink: 0;
@@ -8769,6 +9065,29 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
 
 .fm-table td.fm-table-col-icon i::before {
     display: block;
+}
+
+.fm-table-icon-cell--link {
+    position: relative;
+    display: inline-block;
+}
+
+.fm-table td.fm-table-col-icon i.fm-link-badge {
+    position: absolute;
+    right: -5px;
+    bottom: -3px;
+    font-size: 11px;
+    line-height: 1;
+    background: #fff;
+    border-radius: 50%;
+}
+
+.fm-table tbody tr.fm-table-row-selected .fm-table-col-icon i.fm-link-badge {
+    background: var(--main-color);
+}
+
+.fm-link-outside {
+    opacity: .5;
 }
 
 .fm-table-name-cell {
@@ -12080,7 +12399,7 @@ class FmGetInfoPopup extends FmPopup {
                     return;
                 }
                 this._setContent(this._buildContent(data));
-                if (data.type === 'folder') {
+                if (data.type === 'folder' && !data.link_outside) {
                     this._fetchCounts(data.name, data.path);
                 }
             })
@@ -12134,7 +12453,8 @@ class FmGetInfoPopup extends FmPopup {
 
     _buildContent(data) {
         const isFolder  = data.type === 'folder';
-        const typeLabel = isFolder ? 'Folder' : (data.extension ? data.extension.toUpperCase() + ' File' : 'File');
+        let typeLabel   = isFolder ? 'Folder' : (data.extension ? data.extension.toUpperCase() + ' File' : 'File');
+        if (data.link) typeLabel += data.link_shortcut ? ' (Windows shortcut)' : ' link';
         const sizeLabel = data.size != null ? FmGetInfoPopup._bytesToSize(data.size) : '\u2014';
 
         const rootDisplay = FmGetInfoPopup._normSlashes(this._rootDir) || '\u2014';
@@ -12149,10 +12469,16 @@ class FmGetInfoPopup extends FmPopup {
             ['Root path',       FmPopup.escapeHtml(rootDisplay), ''],
             ['Path (relative)', relDisplay, ''],
             ['Type',            FmPopup.escapeHtml(typeLabel), ''],
-            ['Size',            FmPopup.escapeHtml(sizeLabel), ''],
         ];
+        if (data.link) {
+            const target = data.link_outside
+                ? 'Outside the file manager root'
+                : '/' + (FmGetInfoPopup._pathWithoutRoot(data.link_target, this._rootDir) || '');
+            rows.push(['Link to', FmPopup.escapeHtml(target), '']);
+        }
+        rows.push(['Size', FmPopup.escapeHtml(sizeLabel), '']);
 
-        if (isFolder) {
+        if (isFolder && !data.link_outside) {
             rows.push(['Files',   spinner, ' class="fm-info-files-count"']);
             rows.push(['Folders', spinner, ' class="fm-info-folders-count"']);
         }
@@ -16237,7 +16563,7 @@ class FmTree {
         if (node.name === 'ROOT') {
             html += '<i class="bi bi-house-fill"></i> - /';
         } else {
-            html += '<i class="bi bi-folder-fill"></i> ' + escapeHtml(node.name);
+            html += '<i class="bi ' + (node.link ? 'bi-folder-symlink-fill' : 'bi-folder-fill') + '"></i> ' + escapeHtml(node.name);
         }
         html += '</a></div>';
 
@@ -17940,6 +18266,11 @@ class FmFileManagerTable extends FmTable {
      */
     _folderSizeQueryPath(row) {
         if (!row || row.type !== 'folder' || !row.name) return null;
+        const raw = row.raw;
+        if (raw && raw.link) {
+            if (raw.link_outside || raw.link_broken) return null;
+            if (raw.link_target) return raw.link_target;
+        }
         return this._rowPhysicalPath(row);
     }
 
@@ -18548,16 +18879,59 @@ class FmFileManagerTable extends FmTable {
     }
 
     /**
+     * Symlink / junction details of a listing row.
+     * @param {Object} row
+     * @returns {{outside: boolean, title: string}|null}
+     */
+    _rowLink(row) {
+        const raw = row && row.raw;
+        if (!raw || !raw.link) return null;
+        const via = raw.link_shortcut ? 'Windows shortcut to ' : 'Link to ';
+        if (raw.link_outside) {
+            return { outside: true, title: via + 'a location outside the file manager root (cannot be opened here)' };
+        }
+        if (raw.link_broken) {
+            return { outside: true, title: (raw.link_shortcut ? 'Broken Windows shortcut' : 'Broken link') };
+        }
+        const rel = FmGetInfoPopup._pathWithoutRoot(raw.link_target, this._rootDir);
+        return { outside: false, title: via + '/' + (rel || '') };
+    }
+
+    /**
+     * Folder path to open for a row: resolved link target when available, else path/name.
+     * @param {Object} row
+     * @returns {string|null}
+     */
+    _folderNavigatePath(row) {
+        if (!row || row.type !== 'folder' || !row.name) return null;
+        const raw = row.raw;
+        if (raw && raw.link) {
+            if (raw.link_outside || raw.link_broken) return null;
+            if (raw.link_target) return raw.link_target;
+        }
+        return this._currentPath.replace(/\/$/, '') + '/' + row.name;
+    }
+
+    /**
      * Render a single cell. Handles all file-manager-specific columns.
      * @override
      */
     renderCell(col, row, index) {
         switch (col.key) {
             case 'icon': {
+                const link = this._rowLink(row);
                 if (row.type === 'folder') {
+                    if (link) {
+                        return `<span class="fm-table-icon-cell" title="${this.escapeAttr(link.title)}"><i class="bi bi-folder-symlink-fill${link.outside ? ' fm-link-outside' : ''}"></i></span>`;
+                    }
                     return '<span class="fm-table-icon-cell"><i class="bi bi-folder-fill"></i></span>';
                 }
                 const dispName = row.displayName || row.name;
+                if (link) {
+                    return `<span class="fm-table-icon-cell fm-table-icon-cell--link${link.outside ? ' fm-link-outside' : ''}" title="${this.escapeAttr(link.title)}">` +
+                        FmFileManagerTable.getFileIcon(row.ext, dispName) +
+                        '<i class="bi bi-arrow-up-right-circle-fill fm-link-badge"></i></span>';
+                }
                 if (this.options.showImagePreviews && FmFileManagerTable.isImagePreviewExt(row.ext, dispName)) {
                     const fp = this._fileRowAbsolutePath(row);
                     if (fp) {
@@ -18573,7 +18947,10 @@ class FmFileManagerTable extends FmTable {
             case 'name': {
                 if (this._inTrashView()) return this._trashNameCellHtml(row);
                 const isImgFile = row.type === 'file' && FmFileManagerTable.isImagePreviewExt(row.ext, row.name);
-                const nameTitle = isImgFile
+                const nameLink  = this._rowLink(row);
+                const nameTitle = nameLink
+                    ? this.escapeAttr(row.name + ' — ' + nameLink.title)
+                    : isImgFile
                     ? this.escapeAttr(row.name + ' — Click to view; use arrows to browse images in this folder')
                     : this.escapeAttr(row.name);
                 const nameCls = isImgFile ? 'fm-table-name fm-table-name--image-preview' : 'fm-table-name';
@@ -18587,6 +18964,9 @@ class FmFileManagerTable extends FmTable {
                 }
                 return this.escapeHtml(row.size != null ? FmFileManagerTable.bytesToSize(row.size) : '—');
             case 'type':
+                if (this._rowLink(row)) {
+                    return this.escapeHtml(row.type === 'folder' ? 'Folder link' : ((row.ext || 'File') + ' link'));
+                }
                 return this.escapeHtml(row.type === 'folder' ? 'Folder' : (row.ext || '—'));
             case 'mtime':
                 return this.escapeHtml(FmFileManagerTable.formatMtime(row.mtime));
@@ -18754,7 +19134,7 @@ class FmFileManagerTable extends FmTable {
 
     _bookmarkRowFolderPath(row) {
         if (!row || row.type !== 'folder' || !row.name) return null;
-        return this._currentPath.replace(/\/$/, '') + '/' + row.name;
+        return this._folderNavigatePath(row);
     }
 
     _bookmarkIsSaved(path) {
@@ -18793,7 +19173,17 @@ class FmFileManagerTable extends FmTable {
      */
     _handleOpen({ selectedRow } = {}) {
         if (!selectedRow || selectedRow.type !== 'folder' || !this._onNavigate || this._inTrashView()) return;
-        this._navigateFolder(this._currentPath.replace(/\/$/, '') + '/' + selectedRow.name);
+        const target = this._folderNavigatePath(selectedRow);
+        if (!target) {
+            if (typeof fmUserNotice === 'function') {
+                fmUserNotice({
+                    title:   'Open',
+                    message: 'This link points outside the file manager root (or is broken) and cannot be opened here.',
+                });
+            }
+            return;
+        }
+        this._navigateFolder(target);
     }
 
     /**
@@ -19362,7 +19752,16 @@ class FmFileManagerTable extends FmTable {
             ? selectedRows[0]
             : selectedRow;
         if (!row || row.type !== 'folder') return;
-        const target = this._currentPath.replace(/\/$/, '') + '/' + row.name;
+        const target = this._folderNavigatePath(row);
+        if (!target) {
+            if (typeof fmUserNotice === 'function') {
+                fmUserNotice({
+                    title:   'Open',
+                    message: 'This link points outside the file manager root (or is broken) and cannot be opened here.',
+                });
+            }
+            return;
+        }
         const hash = 'action=open&folder=' + encodeURIComponent(target);
         const base = window.location.href.split('#')[0];
         const url = base + '#' + hash;
@@ -19375,7 +19774,7 @@ class FmFileManagerTable extends FmTable {
             ? selectedRows[0]
             : selectedRow;
         if (row && row.type === 'folder') {
-            return this._currentPath.replace(/\/$/, '') + '/' + row.name;
+            return this._folderNavigatePath(row) || this._currentPath;
         }
         return this._currentPath;
     }
@@ -20119,8 +20518,9 @@ class FmFileManagerTable extends FmTable {
             return !(Array.isArray(this._allRows) && this._allRows.length);
         }
 
-        if (actionId === 'open') {
-            return !payload.selectedRow || payload.selectedRow.type !== 'folder';
+        if (actionId === 'open' || actionId === 'open-in-new-tab') {
+            if (!payload.selectedRow || payload.selectedRow.type !== 'folder') return true;
+            return this._folderNavigatePath(payload.selectedRow) === null;
         }
 
         if (actionId === 'rename' || actionId === 'get-info') {
@@ -20227,7 +20627,9 @@ class FmFileManagerTable extends FmTable {
 
                 this._invalidFolderMessage = null;
 
-                this._currentPath = path;
+                // Prefer the resolved path (symlink / junction / .lnk target) so breadcrumbs show the real folder.
+                const resolved = (data && data.path) ? String(data.path) : path;
+                this._currentPath = resolved;
                 this.setData(data);
                 if (data && typeof data.trash_count === 'number' && this._onTrashCount) {
                     this._onTrashCount(data.trash_count);
@@ -20246,7 +20648,7 @@ class FmFileManagerTable extends FmTable {
                         this._pendingKeyboardAnchor = null;
                     }
                 }
-                if (typeof onLoaded === 'function') onLoaded();
+                if (typeof onLoaded === 'function') onLoaded(resolved);
             })
             .catch((err) => {
                 console.error('Load folder failed', err);
@@ -20589,7 +20991,12 @@ class FmFileManagerTable extends FmTable {
                 .filter((it) => it && it.type === 'folder' && it.id)
                 .map((it) => [it.id, this._trashFilesPath() + '/' + it.id]);
         } else if (data.folders) {
-            entries = Object.keys(data.folders).map((n) => [n, basePath + '/' + n]);
+            entries = Object.keys(data.folders).map((n) => {
+                const meta = data.folders[n] || {};
+                if (meta.link && (meta.link_outside || meta.link_broken)) return null;
+                const p = (meta.link && meta.link_target) ? meta.link_target : (basePath + '/' + n);
+                return [n, p];
+            }).filter(Boolean);
         } else {
             return;
         }
@@ -20618,7 +21025,17 @@ class FmFileManagerTable extends FmTable {
         if (row.type !== 'folder') return;
 
         if (e.target.closest('span.fm-table-name')) {
-            this._navigateFolder(this._currentPath.replace(/\/$/, '') + '/' + row.name);
+            const target = this._folderNavigatePath(row);
+            if (!target) {
+                if (typeof fmUserNotice === 'function') {
+                    fmUserNotice({
+                        title:   'Open',
+                        message: 'This link points outside the file manager root (or is broken) and cannot be opened here.',
+                    });
+                }
+                return;
+            }
+            this._navigateFolder(target);
         }
     }
 
@@ -20626,7 +21043,17 @@ class FmFileManagerTable extends FmTable {
         if (this._inTrashView()) return;
         if (e && (e.target.closest('.fm-table-row-action') || e.target.closest('.fm-table-folder-size-trigger'))) return;
         if (row.type === 'folder') {
-            this._navigateFolder(this._currentPath.replace(/\/$/, '') + '/' + row.name);
+            const target = this._folderNavigatePath(row);
+            if (!target) {
+                if (typeof fmUserNotice === 'function') {
+                    fmUserNotice({
+                        title:   'Open',
+                        message: 'This link points outside the file manager root (or is broken) and cannot be opened here.',
+                    });
+                }
+                return;
+            }
+            this._navigateFolder(target);
         } else if (FmFileManagerTable.isImagePreviewExt(row.ext, row.name)) {
             this._openImageViewerForRow(row);
         } else {
@@ -20940,11 +21367,31 @@ function applyFolderLocation(path) {
     if (sidebarTree) sidebarTree.highlight(path);
 }
 
+/**
+ * Sync hash to the resolved folder path without firing hashchange (avoids a second load).
+ * @param {string} path
+ */
+function replaceFolderLocation(path) {
+    const newHash = '#action=open&folder=' + encodeURIComponent(path);
+    if (location.hash !== newHash) {
+        try {
+            history.replaceState(null, '', newHash);
+        } catch (e) {
+            location.hash = 'action=open&folder=' + encodeURIComponent(path);
+        }
+    }
+    if (sidebarTree) sidebarTree.highlight(path);
+}
+
 // Login is handled server-side (we render only the login page when unauthenticated).
 
 function fetchAndShowFolder(path, callback) {
-    mainTable.load(path, () => {
-        currentPath = path;
+    mainTable.load(path, (resolved) => {
+        const p = resolved || path;
+        currentPath = p;
+        if (typeof norm === 'function' ? norm(p) !== norm(path) : p !== path) {
+            replaceFolderLocation(p);
+        }
         if (sidebarTree) sidebarTree.render(currentPath);
         syncTrashSidebarButton(currentPath);
         renderBookmarks(window.fmBookmarks || [], currentPath);

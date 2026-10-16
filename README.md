@@ -6,7 +6,7 @@ Manage files directly from your browser — without installing WordPress, Larave
 
 ### One PHP file. No installation. No database.
 
-Current version: **1.3.2** — see [CHANGELOG.md](CHANGELOG.md)
+Current version: **1.3.3** — see [CHANGELOG.md](CHANGELOG.md)
 
 ## Why SoloFileManager?
 
@@ -108,6 +108,7 @@ Current version: **1.3.2** — see [CHANGELOG.md](CHANGELOG.md)
 
 - Folder tree (sidebar) with bookmarks and trash
 - File/folder listing with sortable columns
+- Symlinks and Windows junctions shown as links (folder-link icon, arrow badge on file links); tooltip and Info show the target; links outside the root are dimmed and cannot be opened. Windows `.lnk` shortcuts to a folder inside the root open like a Folder link. Size, counts, PHP copy and archives do not follow links; copying a link recreates the link
 - Create folder/file, rename, bulk rename, duplicate
 - Copy / move with progress; drag and drop
 - Delete to Trash or delete forever. Trash works like the Windows Recycle Bin: a flat list showing each item's original name, the folder it came from, deletion date and size, with Restore (back to where it was, renamed to "name (restored)" if that name is taken) and Delete forever; Empty Trash (with confirm); item count on the Trash button, a reminder on Logout, and Server info shows how many items / how much space Trash holds; the `.trash` folder is removed as soon as it is empty
@@ -156,7 +157,7 @@ See [SECURITY.md](SECURITY.md) for more.
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). Latest: **1.3.2** — security fix: uploads, new files / folders and renames can no longer escape the root through symlinks, junctions or `../`. Update recommended.
+See [CHANGELOG.md](CHANGELOG.md). Latest: **1.3.3** — symlink / junction icons, `.lnk` folder shortcuts, safer delete / copy / size walks that do not follow links.
 
 ## License
 

@@ -2,6 +2,21 @@
 
 All notable changes to SoloFileManager are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.3.3] - 2026-10-16
+
+### Added
+
+- Symlinks and Windows junctions are marked in the file list (folder-link icon, small arrow badge on file icons, Type "Folder link" / "txt link") and in the folder tree; the tooltip and Info show where the link points. Links to a location outside the root are dimmed and say they cannot be opened; Info now works for them too
+- Windows Explorer shortcuts (`.lnk`) that point to a folder inside the root are shown as Folder links (same icon) and open the target folder instead of downloading the `.lnk` file
+
+### Fixed
+
+- Deleting a link to a folder (Delete forever, Empty Trash, or deleting a folder that contains such a link) also deleted the files inside the linked folder when file operations ran in PHP (no `exec()`); now only the link itself is removed
+- Empty Trash skipped links ("skipped"), so they stayed in Trash forever
+- Deleting a Windows junction with OS commands reported "Could not delete" although it was removed
+- Breadcrumbs and the URL hash now use the resolved target folder after opening a symlink / junction / `.lnk`, so the path shows the real folder name (not the link name)
+- Folder size / file counts / PHP copy / archive walk no longer follow symlinks or Windows junctions (a link to a parent folder can no longer inflate size, hang, or fill the disk); copying a link recreates the link instead of copying its target
+
 ## [1.3.2] - 2026-10-14
 
 ### Security
