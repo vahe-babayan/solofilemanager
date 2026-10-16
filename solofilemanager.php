@@ -8,7 +8,7 @@ declare(strict_types=1);
  */
 
 /** Product version (semver). Shown in UI / server info. */
-const SOLOFILEMANAGER_VERSION = '1.3.3';
+const SOLOFILEMANAGER_VERSION = '1.3.4';
 
 // Set max execution time to 1 day (86400 seconds)
 @set_time_limit(86400);
@@ -66,6 +66,14 @@ $FM_VERBOSE_PROGRESS_MIN_ITEMS = 800;
 
 /** Hidden trash folder under root (mirror layout: ROOT/rel -> ROOT/.trash/rel). */
 $FM_TRASH_BASENAME = '.trash';
+
+/**
+ * Idle session lock (minutes). 0 = off (default). Allowed: 0, 15, 30, 60, 120.
+ * After this many minutes without an authenticated request, the session is cleared.
+ * Long jobs keep the session alive: each API request / progress / session-touch resets the timer.
+ * Can also be changed from Configuration in the UI (password) when the script file is writable.
+ */
+$FM_IDLE_TIMEOUT_MINUTES = 0;
 
 /**
  * Terminal-here (standard): allowlisted shell commands in a folder.
@@ -776,6 +784,113 @@ function fmCsrfRequestIsValid(): bool {
 }
 
 /**
+ * Idle timeout in minutes (0 = disabled).
+ */
+function fmIdleTimeoutMinutes(): int {
+    global $FM_IDLE_TIMEOUT_MINUTES;
+    $n = isset($FM_IDLE_TIMEOUT_MINUTES) ? (int)$FM_IDLE_TIMEOUT_MINUTES : 0;
+    return in_array($n, [0, 15, 30, 60, 120], true) ? $n : 0;
+}
+
+/**
+ * Normalize idle timeout to an allowed value.
+ */
+function fmNormalizeIdleTimeoutMinutes($raw): int {
+    $n = (int)$raw;
+    return in_array($n, [0, 15, 30, 60, 120], true) ? $n : 0;
+}
+
+/**
+ * Record activity for idle timeout (call while session is active and user is authed).
+ */
+function fmTouchSessionActivity(): void {
+    if (fmIdleTimeoutMinutes() <= 0) {
+        return;
+    }
+    ensureSession();
+    $_SESSION['fm_last_activity'] = time();
+}
+
+/**
+ * Clear auth flags (idle lock / logout).
+ */
+function fmClearAuthSession(): void {
+    ensureSession();
+    $_SESSION['fm_auth'] = false;
+    unset($_SESSION['fm_last_activity']);
+}
+
+/**
+ * Write $FM_IDLE_TIMEOUT_MINUTES = N in this script file.
+ *
+ * @return array{ok:bool, reason?:string}
+ */
+function fmWriteIdleTimeoutToScript(int $minutes): array {
+    $minutes = fmNormalizeIdleTimeoutMinutes($minutes);
+    return fmEditScriptWithCallback(
+        '/(\$FM_IDLE_TIMEOUT_MINUTES\s*=\s*)(\d+)(\s*;)/',
+        static function (array $m) use ($minutes): string {
+            return $m[1] . (string)$minutes . $m[3];
+        }
+    );
+}
+
+/**
+ * Save idle timeout after password confirmation.
+ *
+ * @return array{status:string,msg?:string,saved?:bool,minutes?:int,line?:string,file?:string}
+ */
+function fmSetIdleTimeout(
+    string $password,
+    $minutesRaw,
+    string $passwordHash,
+    bool $authEnabled,
+    int $currentMinutes
+): array {
+    if ($authEnabled) {
+        if ($password === '' || !password_verify($password, $passwordHash)) {
+            usleep(200000);
+            return ['status' => 'error', 'msg' => 'Password is incorrect'];
+        }
+    }
+    $minutes = fmNormalizeIdleTimeoutMinutes($minutesRaw);
+    $current = fmNormalizeIdleTimeoutMinutes($currentMinutes);
+    if ($current === $minutes) {
+        return [
+            'status'  => 'success',
+            'saved'   => true,
+            'minutes' => $minutes,
+            'msg'     => 'Idle timeout is unchanged.',
+        ];
+    }
+    $write = fmWriteIdleTimeoutToScript($minutes);
+    $line = '$FM_IDLE_TIMEOUT_MINUTES = ' . $minutes . ';';
+    if (!empty($write['ok'])) {
+        return [
+            'status'  => 'success',
+            'saved'   => true,
+            'minutes' => $minutes,
+            'msg'     => 'Idle timeout saved in this PHP file. Reloading…',
+        ];
+    }
+    $reason = (string)($write['reason'] ?? 'write_failed');
+    $hint = 'Could not update this PHP file automatically';
+    if ($reason === 'not_writable' || $reason === 'replace_failed' || $reason === 'write_failed') {
+        $hint .= ' (check write permissions on the script file)';
+    } elseif ($reason === 'pattern_failed') {
+        $hint .= ' (could not find $FM_IDLE_TIMEOUT_MINUTES in the script)';
+    }
+    return [
+        'status'  => 'success',
+        'saved'   => false,
+        'minutes' => $minutes,
+        'line'    => $line,
+        'file'    => pathinfo(__FILE__, PATHINFO_BASENAME),
+        'msg'     => $hint . '. Set this line near the top of the script, save, then reload:',
+    ];
+}
+
+/**
  * Check if user is authenticated
  * 
  * @param bool $enableAuth
@@ -784,7 +899,19 @@ function fmCsrfRequestIsValid(): bool {
 function isAuthed(bool $enableAuth): bool {
     if (!$enableAuth) return true;
     ensureSession();
-    return !empty($_SESSION['fm_auth']) && $_SESSION['fm_auth'] === true;
+    if (empty($_SESSION['fm_auth']) || $_SESSION['fm_auth'] !== true) {
+        return false;
+    }
+    $mins = fmIdleTimeoutMinutes();
+    if ($mins > 0) {
+        $last = (int)($_SESSION['fm_last_activity'] ?? 0);
+        if ($last > 0 && (time() - $last) > ($mins * 60)) {
+            fmClearAuthSession();
+            return false;
+        }
+        $_SESSION['fm_last_activity'] = time();
+    }
+    return true;
 }
 
 /**
@@ -3730,6 +3857,9 @@ if (isset($_POST['action']) && $_POST['action'] === 'login') {
     $pass = (string)($_POST['password'] ?? '');
     if ($pass !== '' && password_verify($pass, $PASSWORD_HASH)) {
         $_SESSION['fm_auth'] = true;
+        if (fmIdleTimeoutMinutes() > 0) {
+            $_SESSION['fm_last_activity'] = time();
+        }
         jsonOut(['status' => 'success']);
     }
     // very light delay to reduce brute force effectiveness
@@ -3738,8 +3868,18 @@ if (isset($_POST['action']) && $_POST['action'] === 'login') {
 }
 if (isset($_POST['action']) && $_POST['action'] === 'logout') {
     ensureSession();
-    $_SESSION['fm_auth'] = false;
+    fmClearAuthSession();
     jsonOut(['status' => 'success']);
+}
+if (isset($_POST['action']) && $_POST['action'] === 'set-idle-timeout') {
+    requireAuthOrExit($ENABLE_AUTH);
+    jsonOut(fmSetIdleTimeout(
+        (string)($_POST['password'] ?? ''),
+        $_POST['minutes'] ?? 0,
+        $PASSWORD_HASH,
+        $ENABLE_AUTH,
+        fmIdleTimeoutMinutes()
+    ));
 }
 if (isset($_POST['action']) && $_POST['action'] === 'change-password') {
     requireAuthOrExit($ENABLE_AUTH);
@@ -4006,9 +4146,15 @@ if (isset($_GET['action']) && $_GET['action'] === 'get-server-info') {
         'terminal_manual_enabled'   => $FM_ENABLE_TERMINAL_MANUAL,
         'terminal_advanced_enabled' => $FM_ENABLE_TERMINAL_ADVANCED,
         'file_ops_mode'             => fmFileOpsMode(),
+        'idle_timeout_minutes'      => fmIdleTimeoutMinutes(),
         'verbose_progress_min_items'=> fmVerboseProgressMinItems(),
         'capabilities'              => $serverCapabilities,
     ]);
+}
+
+// Lightweight keepalive while a long job runs (resets idle timer via isAuthed / requireAuth).
+if (isset($_GET['action']) && $_GET['action'] === 'session-touch') {
+    jsonOut(['status' => 'success', 'idle_timeout_minutes' => fmIdleTimeoutMinutes()]);
 }
 
 if (isset($_GET['action']) && $_GET['action'] === 'get-trash-info') {
@@ -8130,31 +8276,51 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     color: #7f8b96;
 }
 
-.fm-popup-content .fm-cfg-permissions-fieldset {
-    border: 1px solid #ddd;
-    border-radius: 4px;
-    padding: 8px 10px;
-    margin: 10px 0 0;
+.fm-popup-content .fm-cfg-tabs {
+    display: flex;
+    gap: 4px;
+    margin: 0 0 14px;
+    border-bottom: 1px solid #c9d7e8;
+    padding-bottom: 0;
 }
-
-.fm-popup-content .fm-cfg-permissions-fieldset legend {
-    font-size: 12px;
-    padding: 0 4px;
+.fm-popup-content .fm-cfg-tab {
+    appearance: none;
+    border: 1px solid transparent;
+    border-bottom: none;
+    background: transparent;
+    color: var(--muted-text, #6c757d);
+    font: inherit;
+    font-size: 13px;
     font-weight: 600;
-}
-
-.fm-popup-content .fm-cfg-perm-option {
-    display: block;
-    margin: 4px 0;
+    padding: 8px 14px;
+    margin-bottom: -1px;
+    border-radius: 4px 4px 0 0;
     cursor: pointer;
 }
-
-.fm-popup-content .fm-cfg-perm-example {
-    color: var(--muted-text, #6c757d);
-    font-size: 12px;
+.fm-popup-content .fm-cfg-tab:hover {
+    color: #234;
+    background: rgba(0, 80, 180, 0.06);
+}
+.fm-popup-content .fm-cfg-tab[aria-selected="true"] {
+    color: #1a3a5c;
+    background: rgba(0, 80, 180, 0.08);
+    border-color: #c9d7e8;
+    border-bottom-color: #fff;
+}
+.fm-popup-content .fm-cfg-tab:focus-visible {
+    outline: 2px solid var(--main-color, #0d6efd);
+    outline-offset: 1px;
+}
+.fm-popup-content .fm-cfg-panel[hidden] {
+    display: none;
+}
+.fm-popup-content .fm-cfg-fieldset:last-child {
+    margin-bottom: 0;
 }
 
-.fm-popup-content .fm-cfg-server-fieldset {
+.fm-popup-content .fm-cfg-fieldset,
+.fm-popup-content .fm-cfg-server-fieldset,
+.fm-popup-content .fm-cfg-permissions-fieldset {
     border: 1px solid #c9d7e8;
     border-radius: 4px;
     padding: 8px 10px;
@@ -8162,10 +8328,32 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     background: rgba(0, 80, 180, 0.04);
 }
 
-.fm-popup-content .fm-cfg-server-fieldset legend {
+.fm-popup-content .fm-cfg-fieldset legend,
+.fm-popup-content .fm-cfg-server-fieldset legend,
+.fm-popup-content .fm-cfg-permissions-fieldset legend {
     font-size: 12px;
     padding: 0 4px;
     font-weight: 600;
+}
+
+.fm-popup-content .fm-cfg-perm-example {
+    color: var(--muted-text, #6c757d);
+    font-size: 12px;
+}
+
+.fm-popup-content .fm-cfg-pagestep-label {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin: 8px 0 0;
+    font-size: 13px;
+}
+
+.fm-popup-content .fm-cfg-pagestep-label .cfg-pagestep,
+.fm-popup-content .fm-cfg-pagestep-label .cfg-idle {
+    min-width: 5.5rem;
+    max-width: 12rem;
 }
 
 .fm-popup-content .fm-cfg-server-legend-hint {
@@ -8201,7 +8389,9 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     font-size: 11px;
 }
 
-.fm-popup-content .fm-cfg-fileops-option {
+.fm-popup-content .fm-cfg-fileops-option,
+.fm-popup-content .fm-cfg-perm-option,
+.fm-popup-content .fm-cfg-option {
     display: flex;
     align-items: flex-start;
     gap: 8px;
@@ -8210,7 +8400,9 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     cursor: pointer;
     line-height: 1.35;
 }
-.fm-popup-content .fm-cfg-fileops-option input {
+.fm-popup-content .fm-cfg-fileops-option input,
+.fm-popup-content .fm-cfg-perm-option input,
+.fm-popup-content .fm-cfg-option input {
     margin-top: 2px;
     flex-shrink: 0;
 }
@@ -9353,6 +9545,44 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     color: #fff;
 }
 
+/* Idle session lock overlay */
+.fm-idle-lock {
+    position: fixed;
+    inset: 0;
+    z-index: 100000;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    background: rgba(20, 24, 32, .72);
+    padding: 16px;
+}
+.fm-idle-lock.fm-idle-lock-on {
+    display: flex;
+}
+.fm-idle-lock-card {
+    width: 100%;
+    max-width: 400px;
+    background: #fff;
+    border-radius: 10px;
+    padding: 22px 22px 18px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, .28);
+}
+.fm-idle-lock-card h2 {
+    margin: 0 0 8px;
+    font-size: 1.25rem;
+}
+.fm-idle-lock-card .fm-hint {
+    margin: 0 0 14px;
+}
+.fm-idle-lock-card .fm-row {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+.fm-idle-lock-card .fm-input {
+    flex: 1 1 160px;
+}
+
 /* responsive */
 @media (max-width: 900px) {
     #sidebar-and-content {
@@ -9562,6 +9792,7 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
         const fm_terminal_manual_enabled = <?php echo $FM_TERMINAL_MANUAL_ENABLED ? 'true' : 'false'; ?>;
         const fm_terminal_advanced_enabled = <?php echo $FM_TERMINAL_ADVANCED_ENABLED ? 'true' : 'false'; ?>;
         const fm_file_ops_mode = <?php echo json_encode(fmFileOpsMode()); ?>;
+        const fm_idle_timeout_minutes = <?php echo (int)fmIdleTimeoutMinutes(); ?>;
         const fm_verbose_progress_min_items = <?php echo (int)fmVerboseProgressMinItems(); ?>;
         const fm_trash_basename = <?php echo json_encode(fmTrashBasename()); ?>;
         const fm_php_upload_max_filesize = <?php echo json_encode((string)ini_get('upload_max_filesize')); ?>;
@@ -9580,6 +9811,7 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
         window.fm_terminal_here_enabled = fm_terminal_here_enabled;
         window.fm_terminal_manual_enabled = fm_terminal_manual_enabled;
         window.fm_terminal_advanced_enabled = fm_terminal_advanced_enabled;
+        window.fm_idle_timeout_minutes = fm_idle_timeout_minutes;
     </script>
 </head>
 <body>
@@ -9897,6 +10129,20 @@ function getCurrentPath() {
 }
 
 /**
+ * True when $path is the root or a path under it (client-side string check; server still validates).
+ * @param {string} path
+ * @returns {boolean}
+ */
+function pathLooksInsideRoot(path) {
+    const p = norm(path);
+    const r = norm(root_dir);
+    if (!p || !r) return false;
+    const pc = p.toLowerCase();
+    const rc = r.toLowerCase();
+    return pc === rc || pc.startsWith(rc + '/');
+}
+
+/**
  * Get the parent path of a given path.
  * This is useful for getting the parent folder path of a given path.
  * 
@@ -9992,16 +10238,239 @@ function fmShouldShowVerboseItemProgress(data, fallbackTotal) {
 /**
  * Perform a fetch to the given URL with the provided options,
  * and if the response status is 401 (unauthorized), it throws an error; otherwise, it returns the response.
- * 
+ *
+ * Marks the request as a "busy" idle-keepalive (long jobs pause client idle lock) and notes activity.
+ *
  * For example:
  *   requireAuthFetch('/api/data', { method: 'GET' }) // returns the response
  *   requireAuthFetch('/api/data', { method: 'GET' }) // throws an error if the response status is 401
  */
 function requireAuthFetch(url, opts) {
+    if (typeof fmIdleBusyEnter === 'function') fmIdleBusyEnter();
+    if (typeof fmIdleNoteActivity === 'function') fmIdleNoteActivity();
     return fetch(url, opts).then(async (r) => {
-        if (r.status === 401) throw new Error('unauthorized');
+        if (r.status === 401) {
+            if (typeof fmIdleHandleUnauthorized === 'function') fmIdleHandleUnauthorized();
+            throw new Error('unauthorized');
+        }
         return r;
+    }).finally(() => {
+        if (typeof fmIdleBusyLeave === 'function') fmIdleBusyLeave();
     });
+}
+
+/**
+ * Idle session lock: optional timeout from $FM_IDLE_TIMEOUT_MINUTES.
+ * Server clears auth after idle; client shows a lock overlay. Heavy ops (in-flight
+ * requireAuthFetch / explicit busy) pause the client timer and send session-touch keepalives.
+ */
+const FmIdleLock = (function () {
+    let enabled = false;
+    let timeoutMs = 0;
+    let busyDepth = 0;
+    let locked = false;
+    let locking = false;
+    let timer = null;
+    let heartbeat = null;
+    let overlay = null;
+    let passInput = null;
+    let errEl = null;
+    let lastNoteAt = 0;
+
+    function minsFromPage() {
+        const n = typeof fm_idle_timeout_minutes !== 'undefined' ? parseInt(fm_idle_timeout_minutes, 10) : 0;
+        return (n === 15 || n === 30 || n === 60 || n === 120) ? n : 0;
+    }
+
+    function clearTimer() {
+        if (timer) {
+            clearTimeout(timer);
+            timer = null;
+        }
+    }
+
+    function scheduleTimer() {
+        clearTimer();
+        if (!enabled || locked || locking || busyDepth > 0) return;
+        timer = window.setTimeout(() => { void triggerLock(); }, timeoutMs);
+    }
+
+    function startHeartbeat() {
+        if (heartbeat || !enabled) return;
+        heartbeat = window.setInterval(() => {
+            if (busyDepth <= 0 || locked) return;
+            const url = ajax_url + '?' + new URLSearchParams({ action: 'session-touch' });
+            fetch(url, { credentials: 'same-origin', headers: { 'X-CSRF-Token': fm_csrf_token } })
+                .then((r) => {
+                    if (r.status === 401) fmIdleHandleUnauthorized();
+                })
+                .catch(() => {});
+        }, 60000);
+    }
+
+    function stopHeartbeat() {
+        if (heartbeat) {
+            clearInterval(heartbeat);
+            heartbeat = null;
+        }
+    }
+
+    function ensureOverlay() {
+        if (overlay) return;
+        overlay = document.createElement('div');
+        overlay.className = 'fm-idle-lock';
+        overlay.setAttribute('role', 'dialog');
+        overlay.setAttribute('aria-modal', 'true');
+        overlay.setAttribute('aria-label', 'Session locked');
+        overlay.innerHTML =
+            '<div class="fm-idle-lock-card">' +
+            '<h2>Session locked</h2>' +
+            '<p class="fm-hint">You were idle too long. Enter the password to continue (your folder view stays here).</p>' +
+            '<div class="fm-row">' +
+            '<input class="fm-input" type="password" autocomplete="current-password" placeholder="Password" data-fm-idle-pass>' +
+            '<button type="button" class="fm-btn" data-fm-idle-unlock>Unlock</button>' +
+            '</div>' +
+            '<p class="fm-error" data-fm-idle-err style="display:none"></p>' +
+            '</div>';
+        document.body.appendChild(overlay);
+        passInput = overlay.querySelector('[data-fm-idle-pass]');
+        errEl = overlay.querySelector('[data-fm-idle-err]');
+        const btn = overlay.querySelector('[data-fm-idle-unlock]');
+        const doUnlock = () => { void unlock(); };
+        if (btn) btn.addEventListener('click', doUnlock);
+        if (passInput) {
+            passInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    doUnlock();
+                }
+            });
+        }
+    }
+
+    function showOverlay() {
+        ensureOverlay();
+        if (errEl) { errEl.style.display = 'none'; errEl.textContent = ''; }
+        if (passInput) passInput.value = '';
+        overlay.classList.add('fm-idle-lock-on');
+        locked = true;
+        clearTimer();
+        stopHeartbeat();
+        try { if (passInput) passInput.focus(); } catch (e) {}
+    }
+
+    function hideOverlay() {
+        if (overlay) overlay.classList.remove('fm-idle-lock-on');
+        locked = false;
+        locking = false;
+        scheduleTimer();
+    }
+
+    async function triggerLock() {
+        if (!enabled || locked || locking || busyDepth > 0) return;
+        locking = true;
+        clearTimer();
+        try {
+            const form = new FormData();
+            form.append('action', 'logout');
+            await fetch(ajax_url, fmPostInit(form));
+        } catch (e) { /* still show lock */ }
+        showOverlay();
+        locking = false;
+    }
+
+    async function unlock() {
+        if (!passInput) return;
+        if (errEl) { errEl.style.display = 'none'; errEl.textContent = ''; }
+        const pass = passInput.value || '';
+        const form = new FormData();
+        form.append('action', 'login');
+        form.append('password', pass);
+        try {
+            const r = await fetch(ajax_url, fmPostInit(form));
+            const data = await r.json();
+            if (data && data.status === 'success') {
+                hideOverlay();
+                return;
+            }
+            if (errEl) {
+                errEl.textContent = (data && data.msg) ? data.msg : 'Unlock failed';
+                errEl.style.display = 'block';
+            }
+        } catch (e) {
+            if (errEl) {
+                errEl.textContent = 'Unlock failed';
+                errEl.style.display = 'block';
+            }
+        }
+    }
+
+    function noteActivity(force) {
+        if (!enabled || locked || locking) return;
+        const now = Date.now();
+        if (!force && (now - lastNoteAt) < 2000) return;
+        lastNoteAt = now;
+        scheduleTimer();
+    }
+
+    function busyEnter() {
+        busyDepth++;
+        if (busyDepth === 1) {
+            clearTimer();
+            startHeartbeat();
+        }
+    }
+
+    function busyLeave() {
+        busyDepth = Math.max(0, busyDepth - 1);
+        if (busyDepth === 0) {
+            stopHeartbeat();
+            noteActivity(true);
+        }
+    }
+
+    function handleUnauthorized() {
+        if (!enabled) return;
+        if (!locked) showOverlay();
+    }
+
+    function init() {
+        if (typeof enable_auth !== 'undefined' && !enable_auth) return;
+        const mins = minsFromPage();
+        if (mins <= 0) return;
+        enabled = true;
+        timeoutMs = mins * 60 * 1000;
+        const bump = () => noteActivity();
+        ['mousedown', 'keydown', 'touchstart', 'scroll', 'mousemove'].forEach((ev) => {
+            document.addEventListener(ev, bump, { passive: true, capture: true });
+        });
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') noteActivity();
+        });
+        scheduleTimer();
+    }
+
+    return {
+        init,
+        noteActivity,
+        busyEnter,
+        busyLeave,
+        handleUnauthorized,
+        isLocked: () => locked,
+    };
+})();
+
+function fmIdleNoteActivity() {
+    if (FmIdleLock && typeof FmIdleLock.noteActivity === 'function') FmIdleLock.noteActivity();
+}
+function fmIdleBusyEnter() {
+    if (FmIdleLock && typeof FmIdleLock.busyEnter === 'function') FmIdleLock.busyEnter();
+}
+function fmIdleBusyLeave() {
+    if (FmIdleLock && typeof FmIdleLock.busyLeave === 'function') FmIdleLock.busyLeave();
+}
+function fmIdleHandleUnauthorized() {
+    if (FmIdleLock && typeof FmIdleLock.handleUnauthorized === 'function') FmIdleLock.handleUnauthorized();
 }
 
 /* ===== Popup layer ===== */
@@ -12624,6 +13093,7 @@ class FmServerInfoPopup extends FmPopup {
             ? FmPopup.escapeHtml(data.exec_available ? 'Available' : 'Disabled (php.ini disable_functions)')
             : esc(null);
         const fileOpsLine = FmServerInfoPopup._fileOpsModeLine(data.file_ops_mode);
+        const idleLine = FmServerInfoPopup._idleTimeoutLine(data.idle_timeout_minutes);
         const verboseTh = typeof data.verbose_progress_min_items === 'number'
             ? FmPopup.escapeHtml(String(data.verbose_progress_min_items))
             : esc(null);
@@ -12636,6 +13106,7 @@ class FmServerInfoPopup extends FmPopup {
             ['PHP version',           esc(data.php_version)],
             ['PHP exec()',            execLine],
             ['File ops mode',         fileOpsLine],
+            ['Session idle lock',     idleLine],
             ['Verbose progress (≥ N items)', verboseTh],
             ['PHP SAPI',              esc(data.php_sapi)],
             ['Server software',       esc(data.server_software)],
@@ -12685,6 +13156,18 @@ class FmServerInfoPopup extends FmPopup {
             text = 'Auto (try OS when exec() is available, then PHP)';
         }
         return FmPopup.escapeHtml(text);
+    }
+
+    /**
+     * @param {number|string|null|undefined} minutes
+     * @returns {string} HTML (escaped)
+     */
+    static _idleTimeoutLine(minutes) {
+        const n = parseInt(minutes, 10);
+        if (n === 15 || n === 30 || n === 60 || n === 120) {
+            return FmPopup.escapeHtml(n + ' minutes (lock after idle; long jobs keep the session alive)');
+        }
+        return FmPopup.escapeHtml('Off');
     }
 
     static _diskLine(free, total) {
@@ -21128,7 +21611,53 @@ let sidebarTree = null;
 
 const CONFIG_STORAGE_KEY = 'fm_table_config_1';
 const BOOKMARKS_STORAGE_KEY = 'fm_bookmarks_1';
+const LAST_FOLDER_STORAGE_KEY = 'fm_last_folder_1';
 const BOOKMARKS_MAX_COUNT = 12;
+
+/**
+ * Remember the last successfully opened folder (localStorage) for the next visit without a URL hash.
+ * @param {string} path
+ */
+function rememberLastFolder(path) {
+    try {
+        if (!pathLooksInsideRoot(path)) return;
+        localStorage.setItem(LAST_FOLDER_STORAGE_KEY, JSON.stringify({
+            root: norm(root_dir),
+            path: norm(path),
+        }));
+    } catch (e) {}
+}
+
+/**
+ * Last folder from localStorage for this root, or null.
+ * @returns {string|null}
+ */
+function loadLastFolder() {
+    try {
+        const raw = localStorage.getItem(LAST_FOLDER_STORAGE_KEY);
+        if (!raw) return null;
+        const data = JSON.parse(raw);
+        if (!data || typeof data.path !== 'string') return null;
+        if (norm(data.root) !== norm(root_dir)) return null;
+        if (!pathLooksInsideRoot(data.path)) return null;
+        return data.path;
+    } catch (e) {
+        return null;
+    }
+}
+
+/**
+ * Folder to open on first paint: URL hash wins; otherwise last remembered folder; else root.
+ * @returns {string}
+ */
+function getInitialFolderPath() {
+    const h = parseUrlHash();
+    if (h.action === 'open' && h.folder) {
+        return h.folder;
+    }
+    const last = loadLastFolder();
+    return last || root_dir;
+}
 
 /** @type {readonly string[]} */
 const PERMISSIONS_DISPLAY_MODES = ['octal', 'symbolic', 'both'];
@@ -21385,12 +21914,21 @@ function replaceFolderLocation(path) {
 
 // Login is handled server-side (we render only the login page when unauthenticated).
 
-function fetchAndShowFolder(path, callback) {
+function fetchAndShowFolder(path, callback, _retried) {
     mainTable.load(path, (resolved) => {
+        if (mainTable._invalidFolderMessage && !_retried && norm(path) !== norm(root_dir)) {
+            try { localStorage.removeItem(LAST_FOLDER_STORAGE_KEY); } catch (e) {}
+            replaceFolderLocation(root_dir);
+            fetchAndShowFolder(root_dir, callback, true);
+            return;
+        }
         const p = resolved || path;
         currentPath = p;
         if (typeof norm === 'function' ? norm(p) !== norm(path) : p !== path) {
             replaceFolderLocation(p);
+        }
+        if (!mainTable._invalidFolderMessage) {
+            rememberLastFolder(p);
         }
         if (sidebarTree) sidebarTree.render(currentPath);
         syncTrashSidebarButton(currentPath);
@@ -21549,17 +22087,78 @@ if (serverInfoBtn) {
 // config popup
 document.getElementById('fm-table-config-btn').addEventListener('click', () => {
     const curOps = normalizeFileOpsModeUi(typeof fm_file_ops_mode !== 'undefined' ? fm_file_ops_mode : 'auto');
+    const curIdle = (typeof fm_idle_timeout_minutes !== 'undefined' && [0, 15, 30, 60, 120].includes(parseInt(fm_idle_timeout_minutes, 10)))
+        ? parseInt(fm_idle_timeout_minutes, 10) : 0;
     const authOn = typeof enable_auth === 'undefined' ? true : !!enable_auth;
     const execOk = typeof window !== 'undefined' && window.fm_exec_available === true;
-    const fileOpsHtml =
-        '<fieldset class="fm-cfg-server-fieldset">' +
+    const idleOpts = [
+        { v: 0, t: 'Off (default)' },
+        { v: 15, t: '15 minutes' },
+        { v: 30, t: '30 minutes' },
+        { v: 60, t: '60 minutes' },
+        { v: 120, t: '120 minutes' },
+    ];
+    const idleSelect = idleOpts.map((o) =>
+        '<option value="' + o.v + '"' + (curIdle === o.v ? ' selected' : '') + '>' + o.t + '</option>'
+    ).join('');
+    const showCfgTab = (root, name) => {
+        if (!root) return;
+        root.querySelectorAll('.fm-cfg-tab').forEach((btn) => {
+            const on = btn.getAttribute('data-cfg-tab') === name;
+            btn.setAttribute('aria-selected', on ? 'true' : 'false');
+            btn.tabIndex = on ? 0 : -1;
+        });
+        root.querySelectorAll('.fm-cfg-panel').forEach((panel) => {
+            const on = panel.getAttribute('data-cfg-panel') === name;
+            if (on) panel.removeAttribute('hidden');
+            else panel.setAttribute('hidden', '');
+        });
+    };
+    const cfgHtml =
+        '<div class="fm-cfg-tabs" role="tablist" aria-label="Configuration sections">' +
+        '<button type="button" class="fm-cfg-tab" role="tab" data-cfg-tab="display" aria-selected="true" aria-controls="fm-cfg-panel-display" id="fm-cfg-tab-display">Display</button>' +
+        '<button type="button" class="fm-cfg-tab" role="tab" data-cfg-tab="server" aria-selected="false" aria-controls="fm-cfg-panel-server" id="fm-cfg-tab-server" tabindex="-1">Server</button>' +
+        '</div>' +
+        '<div class="fm-cfg-panel" role="tabpanel" data-cfg-panel="display" id="fm-cfg-panel-display" aria-labelledby="fm-cfg-tab-display">' +
+        '<fieldset class="fm-cfg-fieldset">' +
+        '<legend>File list</legend>' +
+        '<p class="fm-cfg-server-desc">Saved in this browser only.</p>' +
+        '<label class="fm-cfg-option"><input type="checkbox" name="cfg-actions" class="cfg-actions" ' + (config.showActionsColumn ? 'checked' : '') + '> Show row actions column</label>' +
+        '<label class="fm-cfg-option"><input type="checkbox" name="cfg-mtime" class="cfg-mtime" ' + (config.showLastModifiedColumn ? 'checked' : '') + '> Show last modified column</label>' +
+        '<label class="fm-cfg-option"><input type="checkbox" name="cfg-auto" class="cfg-auto" ' + (config.automaticGetFoldersSize ? 'checked' : '') + '> Automatic get folders size</label>' +
+        '<label class="fm-cfg-option"><input type="checkbox" name="cfg-imgprev" class="cfg-imgprev" ' + (config.showImagePreviews ? 'checked' : '') + '> Show image previews in list <span class="fm-cfg-perm-example">loads original file in the icon column; may be slow for large folders</span></label>' +
+        '</fieldset>' +
+        '<fieldset class="fm-cfg-fieldset">' +
+        '<legend>Permissions column</legend>' +
+        '<p class="fm-cfg-server-desc">How file/folder permissions are shown in the list. Saved in this browser only.</p>' +
+        '<label class="fm-cfg-option"><input type="radio" name="cfg-perm-display" value="octal" class="cfg-perm-display" ' + (normalizePermissionsDisplay(config.permissionsDisplay) === 'octal' ? 'checked' : '') + '> Octal <span class="fm-cfg-perm-example">e.g. 0644</span></label>' +
+        '<label class="fm-cfg-option"><input type="radio" name="cfg-perm-display" value="symbolic" class="cfg-perm-display" ' + (normalizePermissionsDisplay(config.permissionsDisplay) === 'symbolic' ? 'checked' : '') + '> Symbolic <span class="fm-cfg-perm-example">e.g. -rw-r--r-- or drwxr-xr-x</span></label>' +
+        '<label class="fm-cfg-option"><input type="radio" name="cfg-perm-display" value="both" class="cfg-perm-display" ' + (normalizePermissionsDisplay(config.permissionsDisplay) === 'both' ? 'checked' : '') + '> Both <span class="fm-cfg-perm-example">e.g. 0644 on one line, -rw-r--r-- below</span></label>' +
+        '</fieldset>' +
+        '<fieldset class="fm-cfg-fieldset">' +
+        '<legend>Keyboard</legend>' +
+        '<p class="fm-cfg-server-desc">Page Up / Page Down in the file list. Saved in this browser only.</p>' +
+        '<label class="fm-cfg-pagestep-label">Rows per Page Up / Down ' +
+        '<input type="number" name="cfg-pagestep" class="cfg-pagestep" min="1" max="500" step="1" value="' +
+        String(clampPageUpDownStep(config.pageUpDownStep)).replace(/"/g, '&quot;') + '"></label>' +
+        '</fieldset>' +
+        '</div>' +
+        '<div class="fm-cfg-panel" role="tabpanel" data-cfg-panel="server" id="fm-cfg-panel-server" aria-labelledby="fm-cfg-tab-server" hidden>' +
+        '<fieldset class="fm-cfg-fieldset">' +
         '<legend>Heavy file operations</legend>' +
         '<p class="fm-cfg-server-desc">How SoloFileManager runs compress, extract, copy/move, delete-stream, and folder-size. Saved in this PHP file when changed.</p>' +
-        '<label class="fm-cfg-fileops-option"><input type="radio" name="cfg-fileops" value="auto" class="cfg-fileops" ' + (curOps === 'auto' ? 'checked' : '') + '> Auto <span class="fm-cfg-perm-example">OS first when exec() is available, then PHP</span></label>' +
-        '<label class="fm-cfg-fileops-option"><input type="radio" name="cfg-fileops" value="php" class="cfg-fileops" ' + (curOps === 'php' ? 'checked' : '') + '> PHP only <span class="fm-cfg-perm-example">no OS shell for these actions</span></label>' +
-        '<label class="fm-cfg-fileops-option' + (execOk ? '' : ' fm-cfg-fileops-disabled') + '"><input type="radio" name="cfg-fileops" value="os" class="cfg-fileops" ' + (curOps === 'os' ? 'checked' : '') + (execOk ? '' : ' disabled') + '> OS / shell only <span class="fm-cfg-perm-example">' + (execOk ? 'no PHP fallback' : 'unavailable — exec() disabled') + '</span></label>' +
+        '<label class="fm-cfg-option"><input type="radio" name="cfg-fileops" value="auto" class="cfg-fileops" ' + (curOps === 'auto' ? 'checked' : '') + '> Auto <span class="fm-cfg-perm-example">OS first when exec() is available, then PHP</span></label>' +
+        '<label class="fm-cfg-option"><input type="radio" name="cfg-fileops" value="php" class="cfg-fileops" ' + (curOps === 'php' ? 'checked' : '') + '> PHP only <span class="fm-cfg-perm-example">no OS shell for these actions</span></label>' +
+        '<label class="fm-cfg-option' + (execOk ? '' : ' fm-cfg-fileops-disabled') + '"><input type="radio" name="cfg-fileops" value="os" class="cfg-fileops" ' + (curOps === 'os' ? 'checked' : '') + (execOk ? '' : ' disabled') + '> OS / shell only <span class="fm-cfg-perm-example">' + (execOk ? 'no PHP fallback' : 'unavailable — exec() disabled') + '</span></label>' +
+        '</fieldset>' +
+        '<fieldset class="fm-cfg-fieldset">' +
+        '<legend>Session idle lock</legend>' +
+        '<p class="fm-cfg-server-desc">After this idle time the session is locked (password to continue). Long copy/delete/upload/download keep the session alive. Saved in this PHP file when changed. Only applies when authentication is on.</p>' +
+        '<label class="fm-cfg-pagestep-label">Lock after ' +
+        '<select name="cfg-idle" class="cfg-idle">' + idleSelect + '</select></label>' +
+        '</fieldset>' +
         (authOn
-            ? '<label class="fm-cfg-fileops-pass"><span>Password <span class="fm-cfg-hint">(required only if you change the mode above)</span></span><input class="fm-input" name="cfg-fileops-password" type="password" autocomplete="current-password"></label>'
+            ? '<label class="fm-cfg-fileops-pass"><span>Password <span class="fm-cfg-hint">(required to change settings on this tab)</span></span><input class="fm-input" name="cfg-fileops-password" type="password" autocomplete="current-password"></label>'
             : '') +
         '<p class="fm-error" data-cfg-fileops-error style="display:none"></p>' +
         '<div class="fm-pwd-hash-box" data-cfg-fileops-fallback style="display:none">' +
@@ -21569,28 +22168,16 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
         '<button type="button" class="fm-btn secondary" data-cfg-fileops-copy>Copy line</button>' +
         '<button type="button" class="fm-btn" data-cfg-fileops-reload>I updated the file — reload</button>' +
         '</div></div>' +
-        '</fieldset>';
+        '</div>';
     const p = new FmPopup({
             title:'Configuration',
             maxWidth: '620px',
             submitOnEnter: true,
-            content: fileOpsHtml +
-            '<p><label><input type="checkbox" name="cfg-actions" class="cfg-actions" ' + (config.showActionsColumn ? 'checked' : '') + '> Show row actions column</label></p>' +
-            '<p><label><input type="checkbox" name="cfg-mtime" class="cfg-mtime" ' + (config.showLastModifiedColumn ? 'checked' : '') + '> Show last modified column</label></p>' +
-            '<p><label><input type="checkbox" name="cfg-auto" class="cfg-auto" ' + (config.automaticGetFoldersSize ? 'checked' : '') + '> Automatic get folders size</label></p>' +
-            '<p><label><input type="checkbox" name="cfg-imgprev" class="cfg-imgprev" ' + (config.showImagePreviews ? 'checked' : '') + '> Show image previews in list <span class="fm-cfg-hint">(loads original file in the icon column; may be slow for large folders)</span></label></p>' +
-            '<fieldset class="fm-cfg-permissions-fieldset">' +
-            '<legend>Permissions column</legend>' +
-            '<label class="fm-cfg-perm-option"><input type="radio" name="cfg-perm-display" value="octal" class="cfg-perm-display" ' + (normalizePermissionsDisplay(config.permissionsDisplay) === 'octal' ? 'checked' : '') + '> Octal <span class="fm-cfg-perm-example">e.g. 0644</span></label>' +
-            '<label class="fm-cfg-perm-option"><input type="radio" name="cfg-perm-display" value="symbolic" class="cfg-perm-display" ' + (normalizePermissionsDisplay(config.permissionsDisplay) === 'symbolic' ? 'checked' : '') + '> Symbolic <span class="fm-cfg-perm-example">e.g. -rw-r--r-- or drwxr-xr-x</span></label>' +
-            '<label class="fm-cfg-perm-option"><input type="radio" name="cfg-perm-display" value="both" class="cfg-perm-display" ' + (normalizePermissionsDisplay(config.permissionsDisplay) === 'both' ? 'checked' : '') + '> Both <span class="fm-cfg-perm-example">e.g. 0644 on one line, -rw-r--r-- below</span></label>' +
-            '</fieldset>' +
-            '<p><label class="fm-cfg-pagestep-label">Page Up / Down step (rows) ' +
-            '<input type="number" name="cfg-pagestep" class="cfg-pagestep" min="1" max="500" step="1" value="' +
-            String(clampPageUpDownStep(config.pageUpDownStep)).replace(/"/g, '&quot;') + '"></label></p>',
+            content: cfgHtml,
         buttons: [
             { label:'Cancel', close:true },
             { label:'Apply', primary:true, close:false, onClick() {
+                const root = p.el;
                 const cbA = p.querySelector('.cfg-actions');
                 const cbM = p.querySelector('.cfg-mtime');
                 const cbS = p.querySelector('.cfg-auto');
@@ -21598,11 +22185,19 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
                 const stepInp = p.querySelector('.cfg-pagestep');
                 const permRadio = p.querySelector('.cfg-perm-display:checked');
                 const opsRadio = p.querySelector('.cfg-fileops:checked');
+                const idleSel = p.querySelector('.cfg-idle');
                 const opsPass = p.querySelector('[name="cfg-fileops-password"]');
                 const opsErr = p.querySelector('[data-cfg-fileops-error]');
                 const opsFallback = p.querySelector('[data-cfg-fileops-fallback]');
                 const opsFallbackMsg = p.querySelector('[data-cfg-fileops-fallback-msg]');
                 const opsFallbackLine = p.querySelector('[data-cfg-fileops-fallback-line]');
+                const showServerErr = (msg) => {
+                    showCfgTab(root, 'server');
+                    if (opsErr) {
+                        opsErr.textContent = msg;
+                        opsErr.style.display = 'block';
+                    }
+                };
                 if (opsErr) { opsErr.style.display = 'none'; opsErr.textContent = ''; }
                 if (opsFallback) opsFallback.style.display = 'none';
                 if (cbA) config.showActionsColumn = cbA.checked;
@@ -21619,58 +22214,79 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
                 saveConfig();
 
                 const nextOps = normalizeFileOpsModeUi(opsRadio ? opsRadio.value : curOps);
-                if (nextOps === curOps) {
+                const nextIdle = idleSel ? parseInt(idleSel.value, 10) : curIdle;
+                const opsChanged = nextOps !== curOps;
+                const idleChanged = nextIdle !== curIdle;
+                if (!opsChanged && !idleChanged) {
                     p.hide();
                     fetchAndShowFolder(currentPath);
                     return;
                 }
-                if (nextOps === 'os' && !execOk) {
-                    if (opsErr) {
-                        opsErr.textContent = 'OS-only mode needs exec(). Choose Auto or PHP only.';
-                        opsErr.style.display = 'block';
-                    }
+                if (opsChanged && nextOps === 'os' && !execOk) {
+                    showServerErr('OS-only mode needs exec(). Choose Auto or PHP only.');
                     return;
                 }
                 if (authOn && (!opsPass || !(opsPass.value || '').length)) {
-                    if (opsErr) {
-                        opsErr.textContent = 'Password is required to change file ops mode.';
-                        opsErr.style.display = 'block';
-                    }
+                    showServerErr('Password is required to change server settings.');
                     return;
                 }
-                const form = new FormData();
-                form.append('action', 'set-file-ops-mode');
-                form.append('mode', nextOps);
-                form.append('password', opsPass ? (opsPass.value || '') : '');
-                return fetch(ajax_url, fmPostInit(form))
-                    .then(r => r.json())
-                    .then(data => {
-                        if (data.status !== 'success') {
-                            if (opsErr) {
-                                opsErr.textContent = data.msg || 'Could not update file ops mode';
-                                opsErr.style.display = 'block';
-                            }
-                            return;
-                        }
-                        if (data.saved) {
-                            location.reload();
-                            return;
-                        }
-                        if (opsFallback && opsFallbackMsg && opsFallbackLine) {
-                            opsFallbackMsg.textContent = data.msg || 'Edit the script manually:';
-                            opsFallbackLine.value = data.line || ('$FM_FILE_OPS_MODE = \'' + nextOps + '\';');
-                            opsFallback.style.display = 'block';
-                        }
+                const passVal = opsPass ? (opsPass.value || '') : '';
+                const showFallback = (msg, line) => {
+                    showCfgTab(root, 'server');
+                    if (opsFallback && opsFallbackMsg && opsFallbackLine) {
+                        opsFallbackMsg.textContent = msg || 'Edit the script manually:';
+                        opsFallbackLine.value = line || '';
+                        opsFallback.style.display = 'block';
+                    }
+                };
+                const runSave = (action, fields) => {
+                    const form = new FormData();
+                    form.append('action', action);
+                    form.append('password', passVal);
+                    Object.keys(fields).forEach((k) => form.append(k, fields[k]));
+                    return fetch(ajax_url, fmPostInit(form)).then((r) => r.json());
+                };
+                return Promise.resolve()
+                    .then(() => {
+                        if (!opsChanged) return { status: 'success', saved: true, skip: true };
+                        return runSave('set-file-ops-mode', { mode: nextOps });
                     })
-                    .catch(() => {
-                        if (opsErr) {
-                            opsErr.textContent = 'Could not update file ops mode';
-                            opsErr.style.display = 'block';
+                    .then((data) => {
+                        if (data.status !== 'success') {
+                            showServerErr(data.msg || 'Could not update file ops mode');
+                            return Promise.reject(new Error('ops'));
                         }
+                        if (!data.skip && !data.saved) {
+                            showFallback(data.msg, data.line || ('$FM_FILE_OPS_MODE = \'' + nextOps + '\';'));
+                            return Promise.reject(new Error('ops-fallback'));
+                        }
+                        if (!idleChanged) return { status: 'success', saved: true, skip: true };
+                        return runSave('set-idle-timeout', { minutes: String(nextIdle) });
+                    })
+                    .then((data) => {
+                        if (data.status !== 'success') {
+                            showServerErr(data.msg || 'Could not update idle timeout');
+                            return;
+                        }
+                        if (!data.skip && !data.saved) {
+                            showFallback(data.msg, data.line || ('$FM_IDLE_TIMEOUT_MINUTES = ' + nextIdle + ';'));
+                            return;
+                        }
+                        location.reload();
+                    })
+                    .catch((e) => {
+                        if (e && (e.message === 'ops' || e.message === 'ops-fallback')) return;
+                        showServerErr('Could not update server settings');
                     });
             }}
         ],
         onAfterShow() {
+            const root = p.el;
+            root.querySelectorAll('.fm-cfg-tab').forEach((btn) => {
+                btn.addEventListener('click', () => {
+                    showCfgTab(root, btn.getAttribute('data-cfg-tab') || 'display');
+                });
+            });
             const copyBtn = p.querySelector('[data-cfg-fileops-copy]');
             const reloadBtn = p.querySelector('[data-cfg-fileops-reload]');
             const lineEl = p.querySelector('[data-cfg-fileops-fallback-line]');
@@ -21884,7 +22500,8 @@ window.addEventListener('hashchange', () => {
     window.fmBookmarkApi = {
         isBookmarked: (path) => bookmarkExists(window.fmBookmarks || [], path),
     };
-    const initialPath = getCurrentPath();
+    const hashHadFolder = !!(parseUrlHash().folder);
+    const initialPath = getInitialFolderPath();
     mainTable = new FmFileManagerTable(mainTableContainer, [], {
         ajaxUrl: ajax_url,
         rootDir: root_dir,
@@ -22046,7 +22663,15 @@ window.addEventListener('hashchange', () => {
     if (sidebarTree) {
         sidebarTree.reloadFolderTree(initialPath);
     }
+    // Restore last folder into the URL when the page was opened without a hash.
+    if (!hashHadFolder && norm(initialPath) !== norm(root_dir)) {
+        replaceFolderLocation(initialPath);
+    }
     fetchAndShowFolder(initialPath);
+
+    if (typeof FmIdleLock !== 'undefined' && FmIdleLock.init) {
+        FmIdleLock.init();
+    }
 
 
     // const progressPopup = new FmPopup({

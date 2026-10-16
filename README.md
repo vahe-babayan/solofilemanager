@@ -6,7 +6,7 @@ Manage files directly from your browser — without installing WordPress, Larave
 
 ### One PHP file. No installation. No database.
 
-Current version: **1.3.3** — see [CHANGELOG.md](CHANGELOG.md)
+Current version: **1.3.4** — see [CHANGELOG.md](CHANGELOG.md)
 
 ## Why SoloFileManager?
 
@@ -108,6 +108,8 @@ Current version: **1.3.3** — see [CHANGELOG.md](CHANGELOG.md)
 
 - Folder tree (sidebar) with bookmarks and trash
 - File/folder listing with sortable columns
+- Remembers the last opened folder in the browser: reopen without a URL hash and you land there again (hash in the URL still wins)
+- Optional session idle lock (off by default): lock after 15–120 minutes of idle time; unlock with the password without losing the current folder view. Long jobs keep the session alive
 - Symlinks and Windows junctions shown as links (folder-link icon, arrow badge on file links); tooltip and Info show the target; links outside the root are dimmed and cannot be opened. Windows `.lnk` shortcuts to a folder inside the root open like a Folder link. Size, counts, PHP copy and archives do not follow links; copying a link recreates the link
 - Create folder/file, rename, bulk rename, duplicate
 - Copy / move with progress; drag and drop
@@ -131,6 +133,7 @@ Edit the config block at the top of `solofilemanager.php`:
 | `$ROOT_DIR` | Root path users may browse (default: script directory) |
 | `$ENABLE_AUTH` / `$PASSWORD_HASH` | Session login (keep auth on). Prefer changing the password in the UI (key icon); manual hash paste is the fallback |
 | `$FM_FILE_OPS_MODE` | `'auto'`, `'php'`, or `'os'` for heavy file operations. Prefer changing from **Configuration** (password to save); file edit is the fallback |
+| `$FM_IDLE_TIMEOUT_MINUTES` | Idle session lock: `0` (off) or `15` / `30` / `60` / `120`. Prefer **Configuration** (password); file edit is the fallback |
 | `$FM_VERBOSE_PROGRESS_MIN_ITEMS` | When to show detailed progress for large jobs |
 | `$FM_TRASH_BASENAME` | Hidden recycle folder under root (default `.trash`) |
 | `$FM_ENABLE_TERMINAL_HERE` | Standard terminal-here (**false** by default). Prefer Terminal settings from the terminal icon (password); or set `true` in the file on trusted hosts only |
@@ -157,7 +160,7 @@ See [SECURITY.md](SECURITY.md) for more.
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). Latest: **1.3.3** — symlink / junction icons, `.lnk` folder shortcuts, safer delete / copy / size walks that do not follow links.
+See [CHANGELOG.md](CHANGELOG.md). Latest: **1.3.4** — remember last folder, optional session idle lock, Configuration Display / Server tabs.
 
 ## License
 

@@ -2,6 +2,17 @@
 
 All notable changes to SoloFileManager are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.3.4] - 2026-10-16
+
+### Added
+
+- Remember the last opened folder across reloads: opening the file manager without a URL hash restores that folder (stored in the browser); an explicit hash still wins, and a missing folder falls back to the root
+- Optional session idle lock (`$FM_IDLE_TIMEOUT_MINUTES`, off by default; 15 / 30 / 60 / 120): after idle time the session is cleared and a lock overlay asks for the password; Configuration can change it (password). Long copy / delete / upload / download keep the session alive (busy pause + `session-touch` keepalive)
+
+### Changed
+
+- Configuration popup: Display / Server tabs (browser settings vs PHP-file settings with password); shared fieldset layout for all sections
+
 ## [1.3.3] - 2026-10-16
 
 ### Added
