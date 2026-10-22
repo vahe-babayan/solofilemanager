@@ -25,16 +25,16 @@ Current version: **1.3.5** — see [CHANGELOG.md](CHANGELOG.md)
 
 <table>
     <tr>
-        <td width="100%" colspan="3">
-            <img src="./screenshots/screenshot-1.png" alt="SoloFileManager Dashboard" width="100%">
+        <td width="100%" colspan="2">
+            <img src="./screenshots/screenshot-1.png" alt="SoloFileManager: folder tree, bookmarks, file list with folder sizes and a folder link" width="100%">
         </td>
     </tr>
     <tr>
         <td width="50%">
-            <img src="./screenshots/screenshot-2.png" alt="Keyboard shortcuts" width="100%">
+            <img src="./screenshots/screenshot-3.png" alt="Upload: a large file sent in parts, small files done" width="100%">
         </td>
         <td width="50%">
-            <img src="./screenshots/screenshot-3.png" alt="Upload files" width="100%">
+            <img src="./screenshots/screenshot-5.png" alt="Trash: deleted items with original location, Restore and Delete forever" width="100%">
         </td>
     </tr>
     <tr>
@@ -42,7 +42,23 @@ Current version: **1.3.5** — see [CHANGELOG.md](CHANGELOG.md)
             <img src="./screenshots/screenshot-4.png" alt="Copy to folder" width="100%">
         </td>
         <td width="50%">
-            <img src="./screenshots/screenshot-5.png" alt="Delete" width="100%">
+            <img src="./screenshots/screenshot-7.png" alt="Bulk rename with live preview" width="100%">
+        </td>
+    </tr>
+    <tr>
+        <td width="50%">
+            <img src="./screenshots/screenshot-10.png" alt="Extract / Unzip" width="100%">
+        </td>
+        <td width="50%">
+            <img src="./screenshots/screenshot-11.png" alt="Change permissions for folders and files" width="100%">
+        </td>
+    </tr>
+    <tr>
+        <td width="50%">
+            <img src="./screenshots/screenshot-8.png" alt="Configuration: Display tab" width="100%">
+        </td>
+        <td width="50%">
+            <img src="./screenshots/screenshot-9.png" alt="Configuration: Server tab with file operations, idle lock and IP allowlist" width="100%">
         </td>
     </tr>
     <tr>
@@ -50,20 +66,15 @@ Current version: **1.3.5** — see [CHANGELOG.md](CHANGELOG.md)
             <img src="./screenshots/screenshot-6.png" alt="Terminal" width="100%">
         </td>
         <td width="50%">
-            <img src="./screenshots/screenshot-7.png" alt="Bulk rename" width="100%">
+            <img src="./screenshots/screenshot-12.png" alt="Server info" width="100%">
         </td>
     </tr>
     <tr>
         <td width="50%">
-            <img src="./screenshots/screenshot-8.png" alt="Configuration" width="100%">
+            <img src="./screenshots/screenshot-2.png" alt="Keyboard shortcuts" width="100%">
         </td>
         <td width="50%">
-            <img src="./screenshots/screenshot-9.png" alt="Extract / Unzip" width="100%">
-        </td>
-    </tr>
-    <tr>
-        <td width="50%">
-            <img src="./screenshots/screenshot-10.png" alt="Permissions management" width="100%">
+            <img src="./screenshots/screenshot-13.png" alt="Session locked after idle time" width="100%">
         </td>
     </tr>
 </table>
