@@ -2,6 +2,20 @@
 
 All notable changes to SoloFileManager are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.3.5] - 2026-10-22
+
+### Added
+
+- Optional IP allowlist (`$FM_ALLOWED_IPS`, empty = everyone by default): single IPs and CIDR ranges, IPv4 and IPv6. Other IPs get a plain 403 before the login page and before any API action. Editable on the Configuration → Server tab (password), with an "Add my IP" button; a list that does not contain your current IP is refused so you cannot lock yourself out from the UI. Entries that are not valid IPs never match, so a typo does not silently switch the allowlist off
+- `$FM_TRUSTED_PROXIES` (file only, empty by default): reverse proxies such as Cloudflare whose `X-Forwarded-For` is used to find the real client IP; from anyone else that header is ignored
+- Server info shows the IP allowlist state and your IP
+- Chunked upload: files larger than the PHP limits (`upload_max_filesize` / `post_max_size`) are sent in parts below those limits, so the file size is no longer capped by php.ini. Parts are retried for about a minute on connection problems, a part the web server rejects as too large (HTTP 413) is halved automatically, and the progress bar covers the whole file. Unfinished parts wait in a hidden `.fm-upload-tmp` folder under the root (blocked from the web, not shown in the list, removed when empty; abandoned uploads are deleted after 24 hours). Small files are still sent in one request
+
+### Fixed
+
+- Session idle lock could lock the session in the middle of a long job: copy / move / compress / extract / delete progress streams and uploads did not pause the idle timer, and a long upload could be rejected at the end as "Unauthorized". The timer now pauses while any request to the server is running, until its whole response has arrived
+- A running copy / compress / delete stream held the PHP session lock for its whole duration, so every other request of the same session (opening a folder, Server info, keepalives) waited until it finished, and a job longer than the idle timeout could log you out right after it ended. API requests now release the session lock as soon as authentication is checked
+
 ## [1.3.4] - 2026-10-16
 
 ### Added

@@ -6,7 +6,7 @@ Manage files directly from your browser — without installing WordPress, Larave
 
 ### One PHP file. No installation. No database.
 
-Current version: **1.3.4** — see [CHANGELOG.md](CHANGELOG.md)
+Current version: **1.3.5** — see [CHANGELOG.md](CHANGELOG.md)
 
 ## Why SoloFileManager?
 
@@ -89,7 +89,7 @@ Current version: **1.3.4** — see [CHANGELOG.md](CHANGELOG.md)
 **Filesystem**
 
 - The web server user must be able to **read** `$ROOT_DIR` and **write** where you create/upload/rename/delete files
-- Upload size per file is limited by PHP **`upload_max_filesize`** and **`post_max_size`** (and the web server's request limit, e.g. nginx `client_max_body_size`). The upload dialog shows these limits and flags larger files before sending
+- Uploads larger than PHP **`upload_max_filesize`** / **`post_max_size`** are sent in parts below those limits, so php.ini does not cap the file size. Each part must still fit the web server's request limit (e.g. nginx `client_max_body_size`); a part rejected with HTTP 413 is halved automatically. Unfinished parts are kept in a hidden `.fm-upload-tmp` folder under the root, so the root must be writable and have room for the file
 - First-run self-rename needs write permission on the directory that contains `solofilemanager.php`
 - Trash uses a hidden folder under root (default `.trash`); that path must be creatable/writable. It exists only while Trash holds items (created on the first delete, removed when Trash becomes empty). Deleted items are stored in `.trash/files/`, their original location in `.trash/info/`. On Apache an `.htaccess` blocks web access to it; on nginx / IIS deny that folder yourself (see [SECURITY.md](SECURITY.md))
 - When you finish with SoloFileManager, **empty Trash** so removed files are not left on the server. The Trash button shows how many items are left, and Logout offers "Empty Trash and log out" when Trash is not empty
@@ -110,6 +110,7 @@ Current version: **1.3.4** — see [CHANGELOG.md](CHANGELOG.md)
 - File/folder listing with sortable columns
 - Remembers the last opened folder in the browser: reopen without a URL hash and you land there again (hash in the URL still wins)
 - Optional session idle lock (off by default): lock after 15–120 minutes of idle time; unlock with the password without losing the current folder view. Long jobs keep the session alive
+- Optional IP allowlist (off by default): only listed IPs / CIDR ranges (IPv4 and IPv6) can open the file manager; everyone else gets 403 before the login page
 - Symlinks and Windows junctions shown as links (folder-link icon, arrow badge on file links); tooltip and Info show the target; links outside the root are dimmed and cannot be opened. Windows `.lnk` shortcuts to a folder inside the root open like a Folder link. Size, counts, PHP copy and archives do not follow links; copying a link recreates the link
 - Create folder/file, rename, bulk rename, duplicate
 - Copy / move with progress; drag and drop
@@ -117,7 +118,7 @@ Current version: **1.3.4** — see [CHANGELOG.md](CHANGELOG.md)
 - Filter the current folder listing by name (search field in the breadcrumb bar)
 - Compress / extract archives
 - Change permissions (chmod) for folders and files, including recursive 0755 / 0644 style fixes
-- Upload, get info, copy paths
+- Upload (large files in parts, with retries on connection problems), get info, copy paths
 - Download files, or folders and multiple items as ZIP / TAR / TAR.GZ — the browser download starts immediately while the archive is built; failures show the real reason
 - Configuration popup (columns, permissions display, folder-size behavior, heavy file-ops mode)
 - Change password from the UI (updates `$PASSWORD_HASH` in the same PHP file when writable)
@@ -134,6 +135,8 @@ Edit the config block at the top of `solofilemanager.php`:
 | `$ENABLE_AUTH` / `$PASSWORD_HASH` | Session login (keep auth on). Prefer changing the password in the UI (key icon); manual hash paste is the fallback |
 | `$FM_FILE_OPS_MODE` | `'auto'`, `'php'`, or `'os'` for heavy file operations. Prefer changing from **Configuration** (password to save); file edit is the fallback |
 | `$FM_IDLE_TIMEOUT_MINUTES` | Idle session lock: `0` (off) or `15` / `30` / `60` / `120`. Prefer **Configuration** (password); file edit is the fallback |
+| `$FM_ALLOWED_IPS` | IP allowlist, e.g. `['203.0.113.5', '192.168.1.0/24']`. Empty `[]` = everyone (default). Editable in **Configuration → Server** (password); if you lock yourself out, edit this line in the PHP file |
+| `$FM_TRUSTED_PROXIES` | Reverse proxies (e.g. Cloudflare ranges) allowed to pass the real client IP in `X-Forwarded-For`. Empty = use the direct connection IP only (default). File edit only |
 | `$FM_VERBOSE_PROGRESS_MIN_ITEMS` | When to show detailed progress for large jobs |
 | `$FM_TRASH_BASENAME` | Hidden recycle folder under root (default `.trash`) |
 | `$FM_ENABLE_TERMINAL_HERE` | Standard terminal-here (**false** by default). Prefer Terminal settings from the terminal icon (password); or set `true` in the file on trusted hosts only |
@@ -153,14 +156,14 @@ SoloFileManager can create, rename, and delete files. Treat it as **high risk** 
 
 - Keep `$ENABLE_AUTH = true` and change the default `admin` password on first login
 - Do not rely on the random filename alone
-- Prefer HTTPS, IP allowlists, and/or HTTP Basic Auth at the web server
+- Prefer HTTPS, IP allowlists, and/or HTTP Basic Auth at the web server. If you cannot change the web server config (shared hosting), use the built-in `$FM_ALLOWED_IPS` allowlist
 - Built in: CSRF token on every state-changing request; session cookie is `HttpOnly` + `SameSite=Lax`
 
 See [SECURITY.md](SECURITY.md) for more.
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). Latest: **1.3.4** — remember last folder, optional session idle lock, Configuration Display / Server tabs.
+See [CHANGELOG.md](CHANGELOG.md). Latest: **1.3.5** — optional IP allowlist, chunked upload for files larger than the PHP limits, idle lock no longer interrupts long jobs.
 
 ## License
 

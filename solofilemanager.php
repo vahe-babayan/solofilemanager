@@ -8,7 +8,7 @@ declare(strict_types=1);
  */
 
 /** Product version (semver). Shown in UI / server info. */
-const SOLOFILEMANAGER_VERSION = '1.3.4';
+const SOLOFILEMANAGER_VERSION = '1.3.5';
 
 // Set max execution time to 1 day (86400 seconds)
 @set_time_limit(86400);
@@ -76,6 +76,21 @@ $FM_TRASH_BASENAME = '.trash';
 $FM_IDLE_TIMEOUT_MINUTES = 0;
 
 /**
+ * IP allowlist: only these client IPs / CIDR ranges (IPv4 or IPv6) may open SoloFileManager.
+ * Empty array = allow everyone (default). Example: ['203.0.113.5', '192.168.1.0/24', '2001:db8::/32'].
+ * Other IPs get a plain 403 before the login page. Locked out? Edit this list in the PHP file.
+ * Can also be changed from Configuration in the UI (password); your current IP must stay in the list.
+ */
+$FM_ALLOWED_IPS = [];
+
+/**
+ * Reverse proxies (IPs / CIDR) allowed to report the real client IP via X-Forwarded-For
+ * (e.g. Cloudflare or a local nginx in front of PHP). Empty = use REMOTE_ADDR only (default).
+ * Never list addresses you do not control: X-Forwarded-For from anyone else is ignored.
+ */
+$FM_TRUSTED_PROXIES = [];
+
+/**
  * Terminal-here (standard): allowlisted shell commands in a folder.
  * Toggle from Terminal settings in the UI (password) when the script file is writable; trusted hosts only.
  */
@@ -93,6 +108,8 @@ $isMacOS = (strtoupper(substr(PHP_OS, 0, 3)) === 'DAR');
 $isWindows = (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN');
 /** Linux or macOS: Unix-style shell paths for zip/tar/unzip. */
 $isUnixLikeShell = $isLinux || $isMacOS;
+
+fmIpAllowlistEnforce();
 
 $serverCapabilities = fmServerCapabilities();
 
@@ -447,6 +464,162 @@ function fmHumanBytes(int $bytes): string {
     if ($bytes >= 1048576) return round($bytes / 1048576, 1) . ' MB';
     if ($bytes >= 1024) return round($bytes / 1024, 1) . ' KB';
     return $bytes . ' B';
+}
+
+// -----------------------------------------------------------------------------
+// Chunked upload: the browser sends a large file in parts (each below the PHP upload limits).
+// Parts are appended to <root>/.fm-upload-tmp/<id>.part; <id>.json holds the destination and size.
+// The folder sits on the same volume as the targets, so finishing is a rename.
+// -----------------------------------------------------------------------------
+
+/** Hidden folder under the root for chunked uploads in progress. */
+const FM_UPLOAD_TMP_BASENAME = '.fm-upload-tmp';
+/** Unfinished chunked uploads with no new part for this long (seconds) are removed. */
+const FM_UPLOAD_TMP_MAX_AGE = 86400;
+
+function fmUploadTmpDir(string $rootDir): string {
+    return rtrim(normPath(safeRealpath($rootDir)), '/') . '/' . FM_UPLOAD_TMP_BASENAME;
+}
+
+/**
+ * Create the temp folder with web-access guards. Returns its path, or null when it cannot be created.
+ */
+function fmUploadTmpEnsure(string $rootDir): ?string {
+    $dir = fmUploadTmpDir($rootDir);
+    if (!is_dir($dir) && !@mkdir($dir, 0755, true) && !is_dir($dir)) {
+        return null;
+    }
+    if (!is_file($dir . '/.htaccess')) {
+        @file_put_contents($dir . '/.htaccess',
+            "# SoloFileManager unfinished uploads: must not be reachable from the web.\n" .
+            "<IfModule mod_authz_core.c>\n    Require all denied\n</IfModule>\n" .
+            "<IfModule !mod_authz_core.c>\n    Order deny,allow\n    Deny from all\n</IfModule>\n"
+        );
+    }
+    if (!is_file($dir . '/index.html')) {
+        @file_put_contents($dir . '/index.html', '');
+    }
+    return $dir;
+}
+
+function fmUploadIdIsValid(string $id): bool {
+    return (bool)preg_match('/^[a-f0-9]{32}$/', $id);
+}
+
+/**
+ * @return array{dest: string, size: int, part: string, meta: string}|null
+ */
+function fmUploadLoad(string $rootDir, string $id): ?array {
+    if (!fmUploadIdIsValid($id)) {
+        return null;
+    }
+    $dir = fmUploadTmpDir($rootDir);
+    $partPath = $dir . '/' . $id . '.part';
+    $metaPath = $dir . '/' . $id . '.json';
+    $raw = @file_get_contents($metaPath);
+    $meta = is_string($raw) ? json_decode($raw, true) : null;
+    if (!is_array($meta) || !isset($meta['dest'], $meta['size']) || !is_file($partPath)) {
+        return null;
+    }
+    return ['dest' => (string)$meta['dest'], 'size' => (int)$meta['size'], 'part' => $partPath, 'meta' => $metaPath];
+}
+
+/**
+ * Remove the temp folder once only its guard files are left.
+ */
+function fmUploadTmpCleanupIfEmpty(string $rootDir): void {
+    $dir = fmUploadTmpDir($rootDir);
+    $items = @scandir($dir);
+    if ($items === false) {
+        return;
+    }
+    foreach ($items as $f) {
+        if (!in_array($f, ['.', '..', '.htaccess', 'index.html'], true)) {
+            return;
+        }
+    }
+    @unlink($dir . '/.htaccess');
+    @unlink($dir . '/index.html');
+    @rmdir($dir);
+}
+
+function fmUploadDiscard(string $rootDir, string $id): void {
+    if (!fmUploadIdIsValid($id)) {
+        return;
+    }
+    $dir = fmUploadTmpDir($rootDir);
+    @unlink($dir . '/' . $id . '.part');
+    @unlink($dir . '/' . $id . '.json');
+    fmUploadTmpCleanupIfEmpty($rootDir);
+}
+
+/**
+ * Drop unfinished uploads whose last part arrived more than FM_UPLOAD_TMP_MAX_AGE ago (tab closed, connection lost).
+ */
+function fmUploadTmpPurgeStale(string $rootDir): void {
+    $dir = fmUploadTmpDir($rootDir);
+    $items = @scandir($dir);
+    if ($items === false) {
+        return;
+    }
+    $ids = [];
+    foreach ($items as $f) {
+        if (preg_match('/^([a-f0-9]{32})\.(part|json)$/', $f, $m)) {
+            $ids[$m[1]] = true;
+        }
+    }
+    $cut = time() - FM_UPLOAD_TMP_MAX_AGE;
+    foreach (array_keys($ids) as $id) {
+        $mt = @filemtime($dir . '/' . $id . '.part');
+        if ($mt === false) {
+            $mt = @filemtime($dir . '/' . $id . '.json');
+        }
+        if ($mt === false || $mt < $cut) {
+            @unlink($dir . '/' . $id . '.part');
+            @unlink($dir . '/' . $id . '.json');
+        }
+    }
+}
+
+/**
+ * Absolute destination for an upload ("in" folder + client relative path), validated like a normal upload.
+ *
+ * @return array{0: ?string, 1: string} [destination or null, error]
+ */
+function fmUploadResolveDest(string $dirIn, string $relPath, string $rootDir): array {
+    $dir = $dirIn !== '' ? $rootDir . '/' . trim($dirIn, '/') : $rootDir;
+    $dir = safeRealpath($dir);
+    if (!pathInsideRoot($dir, $rootDir) || !is_dir($dir)) {
+        return [null, 'invalid upload folder'];
+    }
+    $clean = fmSanitizeUploadRelativePath($relPath);
+    if ($clean === null) {
+        return [null, 'invalid relative path'];
+    }
+    $dest = normPath($dir . '/' . $clean);
+    if (!pathInsideRoot($dest, $rootDir)) {
+        return [null, 'outside allowed root'];
+    }
+    $t = rtrim(normPath(fmUploadTmpDir($rootDir)), '/');
+    $d = $dest;
+    if (PHP_OS_FAMILY === 'Windows') {
+        $t = strtolower($t);
+        $d = strtolower($d);
+    }
+    if ($d === $t || strpos($d, $t . '/') === 0) {
+        return [null, 'reserved folder'];
+    }
+    if (is_dir($dest)) {
+        return [null, 'path is a folder'];
+    }
+    return [$dest, ''];
+}
+
+/**
+ * True when $folder is the root folder itself (the temp upload folder is only hidden there).
+ */
+function fmIsRootFolder(string $folder, string $rootDir): bool {
+    return rtrim(normPath($folder), '/') === rtrim(normPath(safeRealpath($rootDir)), '/');
 }
 
 /**
@@ -887,6 +1060,307 @@ function fmSetIdleTimeout(
         'line'    => $line,
         'file'    => pathinfo(__FILE__, PATHINFO_BASENAME),
         'msg'     => $hint . '. Set this line near the top of the script, save, then reload:',
+    ];
+}
+
+/** Max entries accepted for the IP allowlist (UI / file). */
+const FM_ALLOWED_IPS_MAX = 100;
+
+/**
+ * IPv4-mapped IPv6 (::ffff:1.2.3.4) → 1.2.3.4; other valid IPs → canonical text; invalid → ''.
+ */
+function fmNormalizeIp(string $ip): string {
+    $bin = @inet_pton(trim($ip));
+    if ($bin === false) {
+        return '';
+    }
+    if (strlen($bin) === 16 && substr($bin, 0, 12) === str_repeat("\0", 10) . "\xff\xff") {
+        $bin = substr($bin, 12);
+    }
+    $out = @inet_ntop($bin);
+    return is_string($out) ? $out : '';
+}
+
+/**
+ * Whether $entry is a single IP or an IP/prefix range (IPv4 or IPv6).
+ */
+function fmIpEntryIsValid(string $entry): bool {
+    $entry = trim($entry);
+    if ($entry === '') {
+        return false;
+    }
+    $net = $entry;
+    $bits = null;
+    if (strpos($entry, '/') !== false) {
+        [$net, $bitsStr] = explode('/', $entry, 2);
+        if ($bitsStr === '' || !ctype_digit($bitsStr)) {
+            return false;
+        }
+        $bits = (int)$bitsStr;
+    }
+    $bin = @inet_pton($net);
+    if ($bin === false) {
+        return false;
+    }
+    return $bits === null || $bits <= strlen($bin) * 8;
+}
+
+/**
+ * Whether $ip matches a single IP or an IP/prefix range.
+ */
+function fmIpMatchesEntry(string $ip, string $entry): bool {
+    $ipBin = @inet_pton($ip);
+    if ($ipBin === false || !fmIpEntryIsValid($entry)) {
+        return false;
+    }
+    $entry = trim($entry);
+    $net = $entry;
+    $bits = strlen($ipBin) * 8;
+    if (strpos($entry, '/') !== false) {
+        [$net, $bitsStr] = explode('/', $entry, 2);
+        $bits = (int)$bitsStr;
+    }
+    $netBin = @inet_pton($net);
+    if ($netBin === false) {
+        return false;
+    }
+    // Compare IPv4 entries against IPv4-mapped IPv6 clients too.
+    if (strlen($netBin) === 4 && strlen($ipBin) === 16) {
+        $mapped = fmNormalizeIp($ip);
+        $ipBin = $mapped !== '' ? (string)@inet_pton($mapped) : $ipBin;
+    }
+    if (strlen($netBin) !== strlen($ipBin) || $bits > strlen($ipBin) * 8) {
+        return false;
+    }
+    $bytes = intdiv($bits, 8);
+    if ($bytes > 0 && substr($ipBin, 0, $bytes) !== substr($netBin, 0, $bytes)) {
+        return false;
+    }
+    $rem = $bits % 8;
+    if ($rem === 0) {
+        return true;
+    }
+    $mask = (0xFF << (8 - $rem)) & 0xFF;
+    return (ord($ipBin[$bytes]) & $mask) === (ord($netBin[$bytes]) & $mask);
+}
+
+/**
+ * @param string[] $list
+ */
+function fmIpMatchesList(string $ip, array $list): bool {
+    if ($ip === '' || @inet_pton($ip) === false) {
+        return false;
+    }
+    foreach ($list as $entry) {
+        if (is_string($entry) && fmIpMatchesEntry($ip, $entry)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Configured allowlist entries (trimmed, non-empty strings). Invalid entries are kept so they
+ * simply never match: a typo in the file must not silently turn the allowlist off.
+ *
+ * @return string[]
+ */
+function fmAllowedIps(): array {
+    global $FM_ALLOWED_IPS;
+    if (!isset($FM_ALLOWED_IPS) || !is_array($FM_ALLOWED_IPS)) {
+        return [];
+    }
+    $out = [];
+    foreach ($FM_ALLOWED_IPS as $e) {
+        $e = trim((string)$e);
+        if ($e !== '') {
+            $out[] = $e;
+        }
+    }
+    return array_values(array_unique($out));
+}
+
+/**
+ * @return string[]
+ */
+function fmTrustedProxies(): array {
+    global $FM_TRUSTED_PROXIES;
+    if (!isset($FM_TRUSTED_PROXIES) || !is_array($FM_TRUSTED_PROXIES)) {
+        return [];
+    }
+    $out = [];
+    foreach ($FM_TRUSTED_PROXIES as $e) {
+        $e = trim((string)$e);
+        if ($e !== '' && fmIpEntryIsValid($e)) {
+            $out[] = $e;
+        }
+    }
+    return $out;
+}
+
+/**
+ * Client IP: REMOTE_ADDR, or — only when REMOTE_ADDR is a trusted proxy — the right-most
+ * X-Forwarded-For hop that is not itself a trusted proxy.
+ */
+function fmClientIp(): string {
+    $remote = fmNormalizeIp((string)($_SERVER['REMOTE_ADDR'] ?? ''));
+    $proxies = fmTrustedProxies();
+    if ($remote === '' || $proxies === [] || !fmIpMatchesList($remote, $proxies)) {
+        return $remote;
+    }
+    $xff = trim((string)($_SERVER['HTTP_X_FORWARDED_FOR'] ?? ''));
+    if ($xff === '') {
+        return $remote;
+    }
+    $hops = array_reverse(explode(',', $xff));
+    foreach ($hops as $hop) {
+        $hop = fmNormalizeIp($hop);
+        if ($hop === '') {
+            return $remote;
+        }
+        if (!fmIpMatchesList($hop, $proxies)) {
+            return $hop;
+        }
+    }
+    return $remote;
+}
+
+/**
+ * Stop with a plain 403 when an allowlist is configured and the client IP is not on it.
+ * Runs before sessions, login, rename gate and every API action.
+ */
+function fmIpAllowlistEnforce(): void {
+    if (PHP_SAPI === 'cli') {
+        return;
+    }
+    $list = fmAllowedIps();
+    if ($list === [] || fmIpMatchesList(fmClientIp(), $list)) {
+        return;
+    }
+    if (!headers_sent()) {
+        http_response_code(403);
+        header('Content-Type: text/plain; charset=utf-8');
+        header('Cache-Control: no-store');
+    }
+    echo 'Forbidden';
+    exit;
+}
+
+/**
+ * Parse allowlist text from the UI (one entry per line; commas / spaces also split).
+ *
+ * @return array{list: string[], invalid: string[]}
+ */
+function fmParseIpListInput(string $raw): array {
+    $parts = preg_split('/[\s,;]+/', $raw) ?: [];
+    $list = [];
+    $invalid = [];
+    foreach ($parts as $p) {
+        $p = strtolower(trim($p));
+        if ($p === '') {
+            continue;
+        }
+        if (fmIpEntryIsValid($p)) {
+            $list[] = $p;
+        } else {
+            $invalid[] = $p;
+        }
+    }
+    return ['list' => array_values(array_unique($list)), 'invalid' => array_values(array_unique($invalid))];
+}
+
+/**
+ * PHP array literal for the allowlist (entries are validated, so no quoting issues).
+ *
+ * @param string[] $list
+ */
+function fmIpListPhpLiteral(array $list): string {
+    return '[' . implode(', ', array_map(static function (string $e): string {
+        return "'" . $e . "'";
+    }, $list)) . ']';
+}
+
+/**
+ * Write the allowlist array into this script file.
+ *
+ * @param string[] $list
+ * @return array{ok:bool, reason?:string}
+ */
+function fmWriteAllowedIpsToScript(array $list): array {
+    $literal = fmIpListPhpLiteral($list);
+    return fmEditScriptWithCallback(
+        '/(\$FM_ALLOWED_IPS\s*=\s*)\[[^\]]*\](\s*;)/',
+        static function (array $m) use ($literal): string {
+            return $m[1] . $literal . $m[2];
+        }
+    );
+}
+
+/**
+ * Save the IP allowlist after password confirmation. Refuses a list that would lock out the caller.
+ *
+ * @param string[] $current
+ * @return array{status:string,msg?:string,saved?:bool,ips?:string[],line?:string,file?:string}
+ */
+function fmSetAllowedIps(
+    string $password,
+    string $raw,
+    string $passwordHash,
+    bool $authEnabled,
+    array $current,
+    string $clientIp
+): array {
+    if ($authEnabled) {
+        if ($password === '' || !password_verify($password, $passwordHash)) {
+            usleep(200000);
+            return ['status' => 'error', 'msg' => 'Password is incorrect'];
+        }
+    }
+    $parsed = fmParseIpListInput($raw);
+    if ($parsed['invalid'] !== []) {
+        return [
+            'status' => 'error',
+            'msg'    => 'Not a valid IP or range: ' . implode(', ', array_slice($parsed['invalid'], 0, 5)),
+        ];
+    }
+    $list = $parsed['list'];
+    if (count($list) > FM_ALLOWED_IPS_MAX) {
+        return ['status' => 'error', 'msg' => 'Too many entries (max ' . FM_ALLOWED_IPS_MAX . ').'];
+    }
+    if ($list !== [] && !fmIpMatchesList($clientIp, $list)) {
+        return [
+            'status' => 'error',
+            'msg'    => 'Your current IP (' . ($clientIp !== '' ? $clientIp : 'unknown')
+                . ') is not in the list, so saving it would lock you out. Add it first.',
+        ];
+    }
+    if ($list === array_values($current)) {
+        return ['status' => 'success', 'saved' => true, 'ips' => $list, 'msg' => 'IP allowlist is unchanged.'];
+    }
+    $write = fmWriteAllowedIpsToScript($list);
+    $line = '$FM_ALLOWED_IPS = ' . fmIpListPhpLiteral($list) . ';';
+    if (!empty($write['ok'])) {
+        return [
+            'status' => 'success',
+            'saved'  => true,
+            'ips'    => $list,
+            'msg'    => 'IP allowlist saved in this PHP file. Reloading…',
+        ];
+    }
+    $reason = (string)($write['reason'] ?? 'write_failed');
+    $hint = 'Could not update this PHP file automatically';
+    if ($reason === 'not_writable' || $reason === 'replace_failed' || $reason === 'write_failed') {
+        $hint .= ' (check write permissions on the script file)';
+    } elseif ($reason === 'pattern_failed') {
+        $hint .= ' (could not find $FM_ALLOWED_IPS in the script)';
+    }
+    return [
+        'status' => 'success',
+        'saved'  => false,
+        'ips'    => $list,
+        'line'   => $line,
+        'file'   => pathinfo(__FILE__, PATHINFO_BASENAME),
+        'msg'    => $hint . '. Set this line near the top of the script, save, then reload:',
     ];
 }
 
@@ -2250,6 +2724,7 @@ function getFilesAndFoldersList(string $path, string $rootDir, array $excludeNam
         return $result;
     }
     $tb = fmTrashBasename();
+    $isRoot = fmIsRootFolder($folder, $rootDir);
     $list = @scandir($folder);
     if ($list === false) {
         return $result;
@@ -2259,6 +2734,9 @@ function getFilesAndFoldersList(string $path, string $rootDir, array $excludeNam
             continue;
         }
         if ($excludeTrashFolder && $f === $tb && !fmIsUnderTrashTree($folder, $rootDir)) {
+            continue;
+        }
+        if ($isRoot && $f === FM_UPLOAD_TMP_BASENAME) {
             continue;
         }
         $full = $folder . '/' . $f;
@@ -2319,11 +2797,15 @@ function getFolderTree(string $path, string $rootDir, int $depth = 0, int $maxDe
     }
     $list = @scandir($path);
     if ($list !== false) {
+        $isRoot = fmIsRootFolder($path, $rootDir);
         foreach ($list as $f) {
             if ($f === '.' || $f === '..') {
                 continue;
             }
             if ($f === fmTrashBasename() && !fmIsUnderTrashTree($path, $rootDir)) {
+                continue;
+            }
+            if ($isRoot && $f === FM_UPLOAD_TMP_BASENAME) {
                 continue;
             }
             $full = $path . '/' . $f;
@@ -3881,6 +4363,17 @@ if (isset($_POST['action']) && $_POST['action'] === 'set-idle-timeout') {
         fmIdleTimeoutMinutes()
     ));
 }
+if (isset($_POST['action']) && $_POST['action'] === 'set-allowed-ips') {
+    requireAuthOrExit($ENABLE_AUTH);
+    jsonOut(fmSetAllowedIps(
+        (string)($_POST['password'] ?? ''),
+        (string)($_POST['ips'] ?? ''),
+        $PASSWORD_HASH,
+        $ENABLE_AUTH,
+        fmAllowedIps(),
+        fmClientIp()
+    ));
+}
 if (isset($_POST['action']) && $_POST['action'] === 'change-password') {
     requireAuthOrExit($ENABLE_AUTH);
     jsonOut(fmChangePassword(
@@ -3940,6 +4433,12 @@ if (!$needsRename) {
             && fmPasswordIsDefault($PASSWORD_HASH)
         ) {
             jsonOut(['status' => 'error', 'msg' => 'Change the default password before continuing.']);
+        }
+        // API actions below only read the session. Release its file lock now: a long copy / compress /
+        // delete stream would otherwise block every other request of this session (keepalives included)
+        // until it ends, and the idle timer would then judge the session by the job's start time.
+        if (session_status() === PHP_SESSION_ACTIVE) {
+            session_write_close();
         }
     }
 }
@@ -4147,6 +4646,9 @@ if (isset($_GET['action']) && $_GET['action'] === 'get-server-info') {
         'terminal_advanced_enabled' => $FM_ENABLE_TERMINAL_ADVANCED,
         'file_ops_mode'             => fmFileOpsMode(),
         'idle_timeout_minutes'      => fmIdleTimeoutMinutes(),
+        'allowed_ips_count'         => count(fmAllowedIps()),
+        'trusted_proxies_count'     => count(fmTrustedProxies()),
+        'client_ip'                 => fmClientIp(),
         'verbose_progress_min_items'=> fmVerboseProgressMinItems(),
         'capabilities'              => $serverCapabilities,
     ]);
@@ -4435,6 +4937,129 @@ if (isset($_POST['action']) && $_POST['action'] === 'upload' && isset($_POST['in
         ]);
     }
     jsonOut(['status' => 'success', 'msg' => 'Upload complete', 'uploaded' => $uploaded]);
+}
+
+if (isset($_POST['action']) && $_POST['action'] === 'upload-init') {
+    $relPath = (string)($_POST['path'] ?? '');
+    [$dest, $err] = fmUploadResolveDest((string)($_POST['in'] ?? ''), $relPath, $ROOT_DIR);
+    if ($dest === null) {
+        jsonOut(['status' => 'error', 'msg' => $relPath . ': ' . $err]);
+    }
+    $size = isset($_POST['size']) && ctype_digit((string)$_POST['size']) ? (int)$_POST['size'] : -1;
+    if ($size < 0) {
+        jsonOut(['status' => 'error', 'msg' => 'Invalid file size']);
+    }
+    $free = @disk_free_space($ROOT_DIR);
+    if ($free !== false && $free < $size) {
+        jsonOut([
+            'status' => 'error',
+            'msg'    => 'Not enough free disk space on the server (needs ' . fmHumanBytes($size) . ', free ' . fmHumanBytes((int)$free) . ').',
+        ]);
+    }
+    $tmp = fmUploadTmpEnsure($ROOT_DIR);
+    if ($tmp === null) {
+        jsonOut(['status' => 'error', 'msg' => 'Could not create the temporary upload folder (check write permissions in the root folder).']);
+    }
+    fmUploadTmpPurgeStale($ROOT_DIR);
+    $id = bin2hex(random_bytes(16));
+    $meta = json_encode(['dest' => $dest, 'size' => $size, 'created' => time()], JSON_UNESCAPED_SLASHES);
+    if (@file_put_contents($tmp . '/' . $id . '.part', '') === false || @file_put_contents($tmp . '/' . $id . '.json', $meta) === false) {
+        fmUploadDiscard($ROOT_DIR, $id);
+        jsonOut(['status' => 'error', 'msg' => 'Could not start the upload (disk full or no permission).']);
+    }
+    jsonOut(['status' => 'success', 'id' => $id, 'received' => 0]);
+}
+
+if (isset($_POST['action']) && $_POST['action'] === 'upload-chunk') {
+    $id = (string)($_POST['id'] ?? '');
+    $up = fmUploadLoad($ROOT_DIR, $id);
+    if ($up === null) {
+        jsonOut(['status' => 'error', 'code' => 'gone', 'msg' => 'This upload is no longer on the server (expired or cancelled). Start it again.']);
+    }
+    $rows = fmNormalizeUploadedFiles('chunk');
+    if (count($rows) !== 1) {
+        jsonOut(['status' => 'error', 'code' => 'chunk', 'msg' => 'No upload data received']);
+    }
+    $row = $rows[0];
+    if ($row['error'] !== UPLOAD_ERR_OK) {
+        $tooBig = in_array($row['error'], [UPLOAD_ERR_INI_SIZE, UPLOAD_ERR_FORM_SIZE], true);
+        if ($tooBig) {
+            http_response_code(413);
+        }
+        jsonOut(['status' => 'error', 'code' => $tooBig ? 'too_large' : 'chunk', 'msg' => 'Part ' . fmUploadErrorMessage($row['error'])]);
+    }
+    $offset = isset($_POST['offset']) && ctype_digit((string)$_POST['offset']) ? (int)$_POST['offset'] : -1;
+    $len = (int)@filesize($row['tmp_name']);
+    $in = @fopen($row['tmp_name'], 'rb');
+    $out = @fopen($up['part'], 'ab');
+    if ($in === false || $out === false) {
+        jsonOut(['status' => 'error', 'code' => 'write', 'msg' => 'Could not write the upload part (disk full or no permission).']);
+    }
+    flock($out, LOCK_EX);
+    clearstatcache(true, $up['part']);
+    $have = (int)filesize($up['part']);
+    if ($offset !== $have) {
+        // A retried part that already arrived, or a gap: the client continues from what the server has.
+        flock($out, LOCK_UN);
+        fclose($out);
+        fclose($in);
+        jsonOut(['status' => 'error', 'code' => 'offset', 'received' => $have, 'msg' => 'Upload position mismatch']);
+    }
+    if ($have + $len > $up['size']) {
+        flock($out, LOCK_UN);
+        fclose($out);
+        fclose($in);
+        jsonOut(['status' => 'error', 'code' => 'size', 'msg' => 'More data than the announced file size']);
+    }
+    $copied = stream_copy_to_stream($in, $out);
+    fflush($out);
+    if ($copied !== $len) {
+        ftruncate($out, $have);
+    }
+    flock($out, LOCK_UN);
+    fclose($out);
+    fclose($in);
+    if ($copied !== $len) {
+        jsonOut(['status' => 'error', 'code' => 'write', 'msg' => 'Could not write the upload part (disk full?).']);
+    }
+    jsonOut(['status' => 'success', 'received' => $have + $len]);
+}
+
+if (isset($_POST['action']) && $_POST['action'] === 'upload-finish') {
+    $id = (string)($_POST['id'] ?? '');
+    $up = fmUploadLoad($ROOT_DIR, $id);
+    if ($up === null) {
+        jsonOut(['status' => 'error', 'code' => 'gone', 'msg' => 'This upload is no longer on the server (expired or cancelled). Start it again.']);
+    }
+    clearstatcache(true, $up['part']);
+    $have = (int)filesize($up['part']);
+    if ($have !== $up['size']) {
+        jsonOut(['status' => 'error', 'code' => 'incomplete', 'received' => $have, 'msg' => 'The upload is not complete yet']);
+    }
+    $dest = $up['dest'];
+    // Re-check: a link or folder may have appeared at the destination while the parts were arriving.
+    if (!pathInsideRoot($dest, $ROOT_DIR) || is_dir($dest)) {
+        fmUploadDiscard($ROOT_DIR, $id);
+        jsonOut(['status' => 'error', 'msg' => 'The destination is no longer valid']);
+    }
+    $parent = dirname($dest);
+    if (!is_dir($parent) && !@mkdir($parent, 0755, true)) {
+        fmUploadDiscard($ROOT_DIR, $id);
+        jsonOut(['status' => 'error', 'msg' => 'Could not create the parent folder']);
+    }
+    if (!@rename($up['part'], $dest)) {
+        if (!@copy($up['part'], $dest)) {
+            fmUploadDiscard($ROOT_DIR, $id);
+            jsonOut(['status' => 'error', 'msg' => 'Could not save the file']);
+        }
+    }
+    fmUploadDiscard($ROOT_DIR, $id);
+    jsonOut(['status' => 'success', 'msg' => 'Upload complete', 'uploaded' => 1]);
+}
+
+if (isset($_POST['action']) && $_POST['action'] === 'upload-cancel') {
+    fmUploadDiscard($ROOT_DIR, (string)($_POST['id'] ?? ''));
+    jsonOut(['status' => 'success']);
 }
 
 if (isset($_POST['action']) && $_POST['action'] === 'compress' && isset($_POST['in'], $_POST['names'], $_POST['archive_name'], $_POST['archive_type']) && is_array($_POST['names'])) {
@@ -8356,6 +8981,25 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     max-width: 12rem;
 }
 
+.fm-popup-content .fm-cfg-ip-mine {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin: 8px 0 0;
+    font-size: 13px;
+}
+.fm-popup-content .fm-cfg-ip-list {
+    display: block;
+    width: 100%;
+    min-height: 5.5em;
+    margin: 8px 0 0;
+    box-sizing: border-box;
+    resize: vertical;
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    font-size: 12px;
+}
+
 .fm-popup-content .fm-cfg-server-legend-hint {
     font-weight: 400;
     color: var(--muted-text, #6c757d);
@@ -9793,6 +10437,8 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
         const fm_terminal_advanced_enabled = <?php echo $FM_TERMINAL_ADVANCED_ENABLED ? 'true' : 'false'; ?>;
         const fm_file_ops_mode = <?php echo json_encode(fmFileOpsMode()); ?>;
         const fm_idle_timeout_minutes = <?php echo (int)fmIdleTimeoutMinutes(); ?>;
+        const fm_allowed_ips = <?php echo json_encode(fmAllowedIps()); ?>;
+        const fm_client_ip = <?php echo json_encode(fmClientIp()); ?>;
         const fm_verbose_progress_min_items = <?php echo (int)fmVerboseProgressMinItems(); ?>;
         const fm_trash_basename = <?php echo json_encode(fmTrashBasename()); ?>;
         const fm_php_upload_max_filesize = <?php echo json_encode((string)ini_get('upload_max_filesize')); ?>;
@@ -10239,30 +10885,25 @@ function fmShouldShowVerboseItemProgress(data, fallbackTotal) {
  * Perform a fetch to the given URL with the provided options,
  * and if the response status is 401 (unauthorized), it throws an error; otherwise, it returns the response.
  *
- * Marks the request as a "busy" idle-keepalive (long jobs pause client idle lock) and notes activity.
- *
  * For example:
  *   requireAuthFetch('/api/data', { method: 'GET' }) // returns the response
  *   requireAuthFetch('/api/data', { method: 'GET' }) // throws an error if the response status is 401
  */
 function requireAuthFetch(url, opts) {
-    if (typeof fmIdleBusyEnter === 'function') fmIdleBusyEnter();
-    if (typeof fmIdleNoteActivity === 'function') fmIdleNoteActivity();
     return fetch(url, opts).then(async (r) => {
         if (r.status === 401) {
             if (typeof fmIdleHandleUnauthorized === 'function') fmIdleHandleUnauthorized();
             throw new Error('unauthorized');
         }
         return r;
-    }).finally(() => {
-        if (typeof fmIdleBusyLeave === 'function') fmIdleBusyLeave();
     });
 }
 
 /**
  * Idle session lock: optional timeout from $FM_IDLE_TIMEOUT_MINUTES.
- * Server clears auth after idle; client shows a lock overlay. Heavy ops (in-flight
- * requireAuthFetch / explicit busy) pause the client timer and send session-touch keepalives.
+ * Server clears auth after idle; client shows a lock overlay. While any fetch / XHR to the
+ * server is in flight (until its whole response body has arrived, so progress streams count)
+ * the client timer is paused and session-touch keepalives are sent.
  */
 const FmIdleLock = (function () {
     let enabled = false;
@@ -10434,12 +11075,78 @@ const FmIdleLock = (function () {
         if (!locked) showOverlay();
     }
 
+    /**
+     * Count every fetch / XHR as busy until its response body is fully received. Most long jobs
+     * (copy / compress / delete progress streams, uploads) call fetch or XHR directly, so the
+     * tracking has to sit here rather than in requireAuthFetch.
+     */
+    function installRequestTracking() {
+        if (typeof window.fetch === 'function') {
+            const origFetch = window.fetch.bind(window);
+            window.fetch = function (input, init) {
+                busyEnter();
+                let left = false;
+                const leave = () => {
+                    if (left) return;
+                    left = true;
+                    busyLeave();
+                };
+                let p;
+                try {
+                    p = origFetch(input, init);
+                } catch (e) {
+                    leave();
+                    throw e;
+                }
+                return p.then((r) => {
+                    if (r && r.status === 401) handleUnauthorized();
+                    // A clone drains a copy of the body, so the job stays busy until the server closes the stream.
+                    if (r && r.body && typeof WritableStream !== 'undefined') {
+                        try {
+                            r.clone().body.pipeTo(new WritableStream()).then(leave, leave);
+                            return r;
+                        } catch (e) { /* fall through */ }
+                    }
+                    leave();
+                    return r;
+                }, (err) => {
+                    leave();
+                    throw err;
+                });
+            };
+        }
+        const Xhr = window.XMLHttpRequest;
+        if (Xhr && Xhr.prototype && typeof Xhr.prototype.send === 'function') {
+            const origSend = Xhr.prototype.send;
+            Xhr.prototype.send = function (...args) {
+                busyEnter();
+                let left = false;
+                const leave = () => {
+                    if (left) return;
+                    left = true;
+                    busyLeave();
+                };
+                this.addEventListener('loadend', leave);
+                this.addEventListener('load', () => {
+                    if (this.status === 401) handleUnauthorized();
+                });
+                try {
+                    return origSend.apply(this, args);
+                } catch (e) {
+                    leave();
+                    throw e;
+                }
+            };
+        }
+    }
+
     function init() {
         if (typeof enable_auth !== 'undefined' && !enable_auth) return;
         const mins = minsFromPage();
         if (mins <= 0) return;
         enabled = true;
         timeoutMs = mins * 60 * 1000;
+        installRequestTracking();
         const bump = () => noteActivity();
         ['mousedown', 'keydown', 'touchstart', 'scroll', 'mousemove'].forEach((ev) => {
             document.addEventListener(ev, bump, { passive: true, capture: true });
@@ -10460,15 +11167,6 @@ const FmIdleLock = (function () {
     };
 })();
 
-function fmIdleNoteActivity() {
-    if (FmIdleLock && typeof FmIdleLock.noteActivity === 'function') FmIdleLock.noteActivity();
-}
-function fmIdleBusyEnter() {
-    if (FmIdleLock && typeof FmIdleLock.busyEnter === 'function') FmIdleLock.busyEnter();
-}
-function fmIdleBusyLeave() {
-    if (FmIdleLock && typeof FmIdleLock.busyLeave === 'function') FmIdleLock.busyLeave();
-}
 function fmIdleHandleUnauthorized() {
     if (FmIdleLock && typeof FmIdleLock.handleUnauthorized === 'function') FmIdleLock.handleUnauthorized();
 }
@@ -13094,6 +13792,12 @@ class FmServerInfoPopup extends FmPopup {
             : esc(null);
         const fileOpsLine = FmServerInfoPopup._fileOpsModeLine(data.file_ops_mode);
         const idleLine = FmServerInfoPopup._idleTimeoutLine(data.idle_timeout_minutes);
+        const ipCount = Number(data.allowed_ips_count) || 0;
+        const proxyCount = Number(data.trusted_proxies_count) || 0;
+        const ipLine = FmPopup.escapeHtml(
+            (ipCount > 0 ? 'On (' + ipCount + (ipCount === 1 ? ' entry' : ' entries') + ')' : 'Off (everyone)') +
+            (proxyCount > 0 ? ', ' + proxyCount + ' trusted ' + (proxyCount === 1 ? 'proxy' : 'proxies') : '')
+        );
         const verboseTh = typeof data.verbose_progress_min_items === 'number'
             ? FmPopup.escapeHtml(String(data.verbose_progress_min_items))
             : esc(null);
@@ -13107,6 +13811,8 @@ class FmServerInfoPopup extends FmPopup {
             ['PHP exec()',            execLine],
             ['File ops mode',         fileOpsLine],
             ['Session idle lock',     idleLine],
+            ['IP allowlist',          ipLine],
+            ['Your IP',               esc(data.client_ip)],
             ['Verbose progress (≥ N items)', verboseTh],
             ['PHP SAPI',              esc(data.php_sapi)],
             ['Server software',       esc(data.server_software)],
@@ -15327,10 +16033,10 @@ class FmUploadPopup extends FmPopup {
             title:   'Upload files',
             content:
                 '<p class="fm-upload-into">Into: <strong>' + FmPopup.escapeHtml(destHint) + '</strong></p>' +
-                '<p class="fm-upload-hint">Drag and drop files or folders here, or use the buttons below. Folders keep their structure. Large uploads depend on PHP ' +
+                '<p class="fm-upload-hint">Drag and drop files or folders here, or use the buttons below. Folders keep their structure. Large files are sent in parts below PHP ' +
                 '<span class="fm-upload-php-ini"><code>upload_max_filesize</code><span class="fm-upload-php-val"> (' + FmPopup.escapeHtml(upIni) + ')</span></span>' +
                 ' and ' +
-                '<span class="fm-upload-php-ini"><code>post_max_size</code><span class="fm-upload-php-val"> (' + FmPopup.escapeHtml(postIni) + ')</span></span>.</p>' +
+                '<span class="fm-upload-php-ini"><code>post_max_size</code><span class="fm-upload-php-val"> (' + FmPopup.escapeHtml(postIni) + ')</span></span>, so those limits do not cap the file size.</p>' +
                 '<div class="fm-upload-dropzone" tabindex="0" role="button" aria-label="Drop files to upload">' +
                 '<span class="fm-upload-dropzone-text"><i class="bi bi-cloud-arrow-up" aria-hidden="true"></i> Drop files or folders here</span>' +
                 '</div>' +
@@ -15440,7 +16146,7 @@ class FmUploadPopup extends FmPopup {
     }
 
     /**
-     * Smallest PHP limit one uploaded file must fit in (each file is sent in its own request).
+     * Smallest PHP limit one upload request must fit in.
      * @returns {{ setting: string, raw: string, bytes: number }|null}
      */
     static uploadSizeLimit() {
@@ -15452,6 +16158,19 @@ class FmUploadPopup extends FmPopup {
             .filter((l) => l.bytes !== null);
         if (limits.length === 0) return null;
         return limits.reduce((a, b) => (b.bytes < a.bytes ? b : a));
+    }
+
+    /**
+     * Part size for chunked uploads: below the PHP limits (room for the multipart envelope), at most 8 MiB.
+     * Files larger than this are sent in parts.
+     * @returns {number}
+     */
+    static chunkSize() {
+        const max = 8 * 1048576;
+        const min = 64 * 1024;
+        const limit = FmUploadPopup.uploadSizeLimit();
+        if (!limit) return max;
+        return Math.max(min, Math.min(max, Math.floor(limit.bytes * 0.9) - 64 * 1024));
     }
 
     _fmtSize(n) {
@@ -15479,20 +16198,10 @@ class FmUploadPopup extends FmPopup {
 
     _addFiles(fileList) {
         if (!fileList || !fileList.length) return;
-        const limit = FmUploadPopup.uploadSizeLimit();
         const incoming = new Map();
         for (let i = 0; i < fileList.length; i++) {
             const f = fileList[i];
-            const k = this._queueKey(f);
-            if (limit && f.size > limit.bytes) {
-                incoming.set(k, {
-                    file: f,
-                    status: 'error',
-                    errorMsg: 'Too large for the server: the limit is ' + limit.raw + ' (' + limit.setting + ' in php.ini). Not uploaded.',
-                });
-            } else {
-                incoming.set(k, { file: f, status: 'pending' });
-            }
+            incoming.set(this._queueKey(f), { file: f, status: 'pending' });
         }
         const merged = new Map();
         incoming.forEach((v, k) => merged.set(k, v));
@@ -15594,47 +16303,46 @@ class FmUploadPopup extends FmPopup {
      * @returns {Promise<{ ok: boolean, msg: string }>}
      */
     _uploadSingleFileWithProgress(file, progressWrap, barEl, statusEl) {
-        return new Promise((resolve) => {
-            const form = new FormData();
-            form.append('action', 'upload');
-            form.append('in', this._pathIn());
-            form.append('files[]', file);
-            form.append('paths[]', file.webkitRelativePath || file.name);
+        const setPct = (pct) => {
+            if (barEl) barEl.style.width = Math.min(100, Math.max(0, pct)) + '%';
+        };
+        const run = file.size > FmUploadPopup.chunkSize()
+            ? this._uploadChunked(file, setPct, statusEl)
+            : this._uploadWholeFile(file, setPct);
+        return run.then((r) => {
+            if (barEl) barEl.style.width = '100%';
+            if (progressWrap) {
+                progressWrap.classList.toggle('fm-upload-progress--error', !r.ok);
+                progressWrap.classList.toggle('fm-upload-progress--done', r.ok);
+            }
+            if (statusEl) {
+                statusEl.textContent = r.ok ? 'Done' : (r.msg || 'Failed');
+                statusEl.classList.toggle('fm-upload-item-status--ok', r.ok);
+                statusEl.classList.toggle('fm-upload-item-status--err', !r.ok);
+            }
+            return { ok: r.ok, msg: r.msg || '' };
+        });
+    }
 
+    /**
+     * POST multipart data with upload progress.
+     * @param {FormData} form
+     * @param {(loaded: number) => void} [onProgress] - bytes of this request sent so far
+     * @returns {Promise<{ status: number, data: Object|null }>} status 0 = network error
+     */
+    _postUpload(form, onProgress) {
+        return new Promise((resolve) => {
             const xhr = new XMLHttpRequest();
             xhr.open('POST', this._ajaxUrl);
             xhr.setRequestHeader('X-CSRF-Token', fm_csrf_token);
             xhr.withCredentials = true;
-
-            xhr.upload.addEventListener('progress', (e) => {
-                if (e.lengthComputable && e.total > 0 && barEl) {
-                    const pct = Math.min(100, (e.loaded / e.total) * 100);
-                    barEl.style.width = pct + '%';
-                }
-            });
-
-            const finish = (ok, msg) => {
-                if (barEl) {
-                    barEl.style.width = '100%';
-                }
-                if (progressWrap) {
-                    progressWrap.classList.toggle('fm-upload-progress--error', !ok);
-                    progressWrap.classList.toggle('fm-upload-progress--done', ok);
-                }
-                if (statusEl) {
-                    statusEl.textContent = ok ? 'Done' : (msg || 'Failed');
-                    statusEl.classList.toggle('fm-upload-item-status--ok', ok);
-                    statusEl.classList.toggle('fm-upload-item-status--err', !ok);
-                }
-                resolve({ ok, msg: msg || '' });
-            };
-
+            if (onProgress) {
+                xhr.upload.addEventListener('progress', (e) => {
+                    if (e.lengthComputable) onProgress(e.loaded);
+                });
+            }
             xhr.onload = () => {
-                if (xhr.status === 401) {
-                    finish(false, 'Unauthorized');
-                    return;
-                }
-                const text = xhr.responseText || '{}';
+                const text = xhr.responseText || '';
                 let data = null;
                 try {
                     data = JSON.parse(text);
@@ -15647,22 +16355,145 @@ class FmUploadPopup extends FmPopup {
                         data = null;
                     }
                 }
-                if (!data || typeof data !== 'object') {
-                    finish(false, xhr.status === 413
-                        ? 'The web server rejected the file as too large (nginx client_max_body_size / Apache LimitRequestBody).'
-                        : 'Unexpected server response (HTTP ' + xhr.status + '). Check the PHP / web server error log.');
-                    return;
-                }
-                if (xhr.status === 200 && data.status === 'success' && (Number(data.uploaded) || 0) >= 1) {
-                    finish(true, '');
-                    return;
-                }
-                finish(false, (data.errors && data.errors[0]) || data.msg || ('HTTP ' + xhr.status));
+                resolve({ status: xhr.status, data: data && typeof data === 'object' ? data : null });
             };
-
-            xhr.onerror = () => finish(false, 'Network error');
+            xhr.onerror = () => resolve({ status: 0, data: null });
             xhr.send(form);
         });
+    }
+
+    /**
+     * @param {File} file
+     * @param {(pct: number) => void} setPct
+     * @returns {Promise<{ ok: boolean, msg: string }>}
+     */
+    _uploadWholeFile(file, setPct) {
+        const form = new FormData();
+        form.append('action', 'upload');
+        form.append('in', this._pathIn());
+        form.append('files[]', file);
+        form.append('paths[]', file.webkitRelativePath || file.name);
+        return this._postUpload(form, (loaded) => {
+            if (file.size > 0) setPct((loaded / file.size) * 100);
+        }).then(({ status, data }) => {
+            if (status === 0) return { ok: false, msg: 'Network error' };
+            if (status === 401) return { ok: false, msg: 'Unauthorized' };
+            if (!data) {
+                return {
+                    ok: false,
+                    msg: status === 413
+                        ? 'The web server rejected the file as too large (nginx client_max_body_size / Apache LimitRequestBody).'
+                        : 'Unexpected server response (HTTP ' + status + '). Check the PHP / web server error log.',
+                };
+            }
+            if (status === 200 && data.status === 'success' && (Number(data.uploaded) || 0) >= 1) {
+                return { ok: true, msg: '' };
+            }
+            return { ok: false, msg: (data.errors && data.errors[0]) || data.msg || ('HTTP ' + status) };
+        });
+    }
+
+    /**
+     * Send a large file in parts (upload-init → upload-chunk … → upload-finish). Each part is retried on
+     * network errors; a part the web server rejects as too large (413) is halved and sent again.
+     * @param {File} file
+     * @param {(pct: number) => void} setPct
+     * @param {HTMLElement|null} statusEl
+     * @returns {Promise<{ ok: boolean, msg: string }>}
+     */
+    async _uploadChunked(file, setPct, statusEl) {
+        const minChunk = 64 * 1024;
+        // About a minute of retries (1, 2, 4, 8, then 10 s) to ride out a Wi-Fi / mobile reconnect.
+        const maxRetries = 8;
+        const backoff = (n) => Math.min(10000, 1000 * Math.pow(2, n));
+        let chunk = FmUploadPopup.chunkSize();
+        const post = (fields) => {
+            const form = new FormData();
+            Object.keys(fields).forEach((k) => form.append(k, fields[k]));
+            return this._postUpload(form);
+        };
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+        const retryable = (res) => res.status === 0 || (res.status >= 500 && !res.data);
+        /** POST again after network errors / bare server errors (not after a JSON answer). */
+        const postRetry = async (fields) => {
+            for (let attempt = 0; ; attempt++) {
+                const res = await post(fields);
+                if (!retryable(res) || attempt >= maxRetries) return { res, attempts: attempt + 1 };
+                if (statusEl) statusEl.textContent = 'Connection problem, retrying\u2026';
+                await sleep(backoff(attempt));
+                if (statusEl) statusEl.textContent = 'Uploading\u2026';
+            }
+        };
+
+        const { res: init } = await postRetry({
+            action: 'upload-init',
+            in: this._pathIn(),
+            path: file.webkitRelativePath || file.name,
+            size: String(file.size),
+        });
+        if (init.status === 401) return { ok: false, msg: 'Unauthorized' };
+        if (!init.data || init.data.status !== 'success' || !init.data.id) {
+            return { ok: false, msg: (init.data && init.data.msg) || (init.status === 0 ? 'Network error' : 'Could not start the upload (HTTP ' + init.status + ')') };
+        }
+        const id = String(init.data.id);
+        const fail = (msg) => {
+            post({ action: 'upload-cancel', id }).catch(() => {});
+            return { ok: false, msg };
+        };
+
+        let offset = 0;
+        let retries = 0;
+        while (offset < file.size) {
+            const end = Math.min(file.size, offset + chunk);
+            const form = new FormData();
+            form.append('action', 'upload-chunk');
+            form.append('id', id);
+            form.append('offset', String(offset));
+            form.append('chunk', file.slice(offset, end), 'chunk');
+            const base = offset;
+            const { status, data } = await this._postUpload(form, (loaded) => {
+                setPct(((base + Math.min(loaded, end - base)) / file.size) * 100);
+            });
+            if (status === 401) return { ok: false, msg: 'Unauthorized' };
+            if (data && data.status === 'success') {
+                offset = Number(data.received) || end;
+                retries = 0;
+                setPct((offset / file.size) * 100);
+                continue;
+            }
+            if (data && data.code === 'offset' && typeof data.received === 'number') {
+                // The server already has more (a retried part that did arrive) or less: continue from there.
+                offset = data.received;
+                continue;
+            }
+            if (status === 413 || (data && data.code === 'too_large')) {
+                if (chunk <= minChunk) {
+                    return fail('The web server rejects even small upload parts (HTTP 413). Check nginx client_max_body_size / Apache LimitRequestBody.');
+                }
+                chunk = Math.max(minChunk, Math.floor(chunk / 2));
+                continue;
+            }
+            if (data && data.code === 'gone') return { ok: false, msg: data.msg || 'Upload expired on the server' };
+            if (data && data.status === 'error' && data.code !== 'write' && data.code !== 'chunk') {
+                return fail(data.msg || 'Upload failed');
+            }
+            // Network error, server hiccup, interrupted part or a failed write: wait and try the same part again.
+            if (++retries > maxRetries) {
+                return fail((data && data.msg) || (status === 0 ? 'Network error (gave up after several retries)' : 'Upload failed (HTTP ' + status + ')'));
+            }
+            if (statusEl) statusEl.textContent = 'Connection problem, retrying\u2026';
+            await sleep(backoff(retries - 1));
+            if (statusEl) statusEl.textContent = 'Uploading\u2026';
+        }
+
+        const { res: fin, attempts } = await postRetry({ action: 'upload-finish', id });
+        if (fin.status === 401) return { ok: false, msg: 'Unauthorized' };
+        if (fin.data && fin.data.status === 'success') return { ok: true, msg: '' };
+        if (attempts > 1 && fin.data && fin.data.code === 'gone') {
+            // An earlier finish reached the server but its reply was lost; the server has handled the upload.
+            return { ok: false, msg: 'The server reply was lost while finishing. Refresh the folder to check whether the file arrived.' };
+        }
+        return fail((fin.data && fin.data.msg) || 'Could not finish the upload (HTTP ' + fin.status + ')');
     }
 
     _bindUploadUi() {
@@ -22101,6 +22932,14 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
     const idleSelect = idleOpts.map((o) =>
         '<option value="' + o.v + '"' + (curIdle === o.v ? ' selected' : '') + '>' + o.t + '</option>'
     ).join('');
+    const curIps = Array.isArray(typeof fm_allowed_ips !== 'undefined' ? fm_allowed_ips : null)
+        ? fm_allowed_ips.map((s) => String(s)) : [];
+    const clientIp = typeof fm_client_ip === 'string' ? fm_client_ip : '';
+    const parseIpText = (text) => {
+        const seen = new Set();
+        return String(text || '').split(/[\s,;]+/).map((s) => s.trim().toLowerCase())
+            .filter((s) => s !== '' && !seen.has(s) && seen.add(s));
+    };
     const showCfgTab = (root, name) => {
         if (!root) return;
         root.querySelectorAll('.fm-cfg-tab').forEach((btn) => {
@@ -22157,6 +22996,15 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
         '<label class="fm-cfg-pagestep-label">Lock after ' +
         '<select name="cfg-idle" class="cfg-idle">' + idleSelect + '</select></label>' +
         '</fieldset>' +
+        '<fieldset class="fm-cfg-fieldset">' +
+        '<legend>IP allowlist</legend>' +
+        '<p class="fm-cfg-server-desc">Only these IPs / ranges can open SoloFileManager; everyone else gets 403 before the login page. One per line: IPv4, IPv6 or CIDR (e.g. 203.0.113.0/24). Empty = everyone. Your current IP must stay in the list. Locked out? Edit <code>$FM_ALLOWED_IPS</code> in the PHP file.</p>' +
+        '<p class="fm-cfg-ip-mine">Your IP: <code>' + FmPopup.escapeHtml(clientIp || 'unknown') + '</code>' +
+        (clientIp ? ' <button type="button" class="fm-btn secondary" data-cfg-ip-add-mine>Add my IP</button>' : '') +
+        '</p>' +
+        '<textarea class="fm-input fm-cfg-ip-list cfg-ips" name="cfg-ips" rows="4" spellcheck="false" autocomplete="off" placeholder="Empty = allow everyone">' +
+        FmPopup.escapeHtml(curIps.join('\n')) + '</textarea>' +
+        '</fieldset>' +
         (authOn
             ? '<label class="fm-cfg-fileops-pass"><span>Password <span class="fm-cfg-hint">(required to change settings on this tab)</span></span><input class="fm-input" name="cfg-fileops-password" type="password" autocomplete="current-password"></label>'
             : '') +
@@ -22186,6 +23034,7 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
                 const permRadio = p.querySelector('.cfg-perm-display:checked');
                 const opsRadio = p.querySelector('.cfg-fileops:checked');
                 const idleSel = p.querySelector('.cfg-idle');
+                const ipsInp = p.querySelector('.cfg-ips');
                 const opsPass = p.querySelector('[name="cfg-fileops-password"]');
                 const opsErr = p.querySelector('[data-cfg-fileops-error]');
                 const opsFallback = p.querySelector('[data-cfg-fileops-fallback]');
@@ -22215,9 +23064,11 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
 
                 const nextOps = normalizeFileOpsModeUi(opsRadio ? opsRadio.value : curOps);
                 const nextIdle = idleSel ? parseInt(idleSel.value, 10) : curIdle;
+                const nextIps = ipsInp ? parseIpText(ipsInp.value) : curIps;
                 const opsChanged = nextOps !== curOps;
                 const idleChanged = nextIdle !== curIdle;
-                if (!opsChanged && !idleChanged) {
+                const ipsChanged = nextIps.join('\n') !== curIps.join('\n');
+                if (!opsChanged && !idleChanged && !ipsChanged) {
                     p.hide();
                     fetchAndShowFolder(currentPath);
                     return;
@@ -22246,38 +23097,52 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
                     Object.keys(fields).forEach((k) => form.append(k, fields[k]));
                     return fetch(ajax_url, fmPostInit(form)).then((r) => r.json());
                 };
-                return Promise.resolve()
-                    .then(() => {
-                        if (!opsChanged) return { status: 'success', saved: true, skip: true };
-                        return runSave('set-file-ops-mode', { mode: nextOps });
-                    })
-                    .then((data) => {
-                        if (data.status !== 'success') {
-                            showServerErr(data.msg || 'Could not update file ops mode');
-                            return Promise.reject(new Error('ops'));
-                        }
-                        if (!data.skip && !data.saved) {
-                            showFallback(data.msg, data.line || ('$FM_FILE_OPS_MODE = \'' + nextOps + '\';'));
-                            return Promise.reject(new Error('ops-fallback'));
-                        }
-                        if (!idleChanged) return { status: 'success', saved: true, skip: true };
-                        return runSave('set-idle-timeout', { minutes: String(nextIdle) });
-                    })
-                    .then((data) => {
-                        if (data.status !== 'success') {
-                            showServerErr(data.msg || 'Could not update idle timeout');
-                            return;
-                        }
-                        if (!data.skip && !data.saved) {
-                            showFallback(data.msg, data.line || ('$FM_IDLE_TIMEOUT_MINUTES = ' + nextIdle + ';'));
-                            return;
-                        }
-                        location.reload();
-                    })
-                    .catch((e) => {
-                        if (e && (e.message === 'ops' || e.message === 'ops-fallback')) return;
-                        showServerErr('Could not update server settings');
+                const steps = [];
+                if (opsChanged) {
+                    steps.push({
+                        action: 'set-file-ops-mode',
+                        fields: { mode: nextOps },
+                        errMsg: 'Could not update file ops mode',
+                        line: '$FM_FILE_OPS_MODE = \'' + nextOps + '\';',
                     });
+                }
+                if (idleChanged) {
+                    steps.push({
+                        action: 'set-idle-timeout',
+                        fields: { minutes: String(nextIdle) },
+                        errMsg: 'Could not update idle timeout',
+                        line: '$FM_IDLE_TIMEOUT_MINUTES = ' + nextIdle + ';',
+                    });
+                }
+                if (ipsChanged) {
+                    steps.push({
+                        action: 'set-allowed-ips',
+                        fields: { ips: nextIps.join('\n') },
+                        errMsg: 'Could not update IP allowlist',
+                        line: '$FM_ALLOWED_IPS = [' + nextIps.map((s) => '\'' + s + '\'').join(', ') + '];',
+                    });
+                }
+                // Each step rewrites the PHP file, so they run one after another and stop at the first problem.
+                let chain = Promise.resolve(true);
+                steps.forEach((step) => {
+                    chain = chain.then((ok) => {
+                        if (!ok) return false;
+                        return runSave(step.action, step.fields).then((data) => {
+                            if (!data || data.status !== 'success') {
+                                showServerErr((data && data.msg) || step.errMsg);
+                                return false;
+                            }
+                            if (!data.saved) {
+                                showFallback(data.msg, data.line || step.line);
+                                return false;
+                            }
+                            return true;
+                        });
+                    });
+                });
+                return chain
+                    .then((ok) => { if (ok) location.reload(); })
+                    .catch(() => showServerErr('Could not update server settings'));
             }}
         ],
         onAfterShow() {
@@ -22287,6 +23152,16 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
                     showCfgTab(root, btn.getAttribute('data-cfg-tab') || 'display');
                 });
             });
+            const addMineBtn = root.querySelector('[data-cfg-ip-add-mine]');
+            const ipsEl = root.querySelector('.cfg-ips');
+            if (addMineBtn && ipsEl && clientIp) {
+                addMineBtn.addEventListener('click', () => {
+                    const list = parseIpText(ipsEl.value);
+                    if (!list.includes(clientIp.toLowerCase())) list.push(clientIp.toLowerCase());
+                    ipsEl.value = list.join('\n');
+                    ipsEl.focus();
+                });
+            }
             const copyBtn = p.querySelector('[data-cfg-fileops-copy]');
             const reloadBtn = p.querySelector('[data-cfg-fileops-reload]');
             const lineEl = p.querySelector('[data-cfg-fileops-fallback-line]');
