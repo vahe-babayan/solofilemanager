@@ -8,7 +8,7 @@ declare(strict_types=1);
  */
 
 /** Product version (semver). Shown in UI / server info. */
-const SOLOFILEMANAGER_VERSION = '1.3.5';
+const SOLOFILEMANAGER_VERSION = '1.3.6';
 
 // Set max execution time to 1 day (86400 seconds)
 @set_time_limit(86400);
@@ -914,6 +914,38 @@ function detectCms(string $rootDir): string {
 }
 
 /**
+ * Session cookie name of this installation. Copies on the same domain (and other PHP apps using
+ * PHPSESSID) must not share a session, or a login to one copy would open the others.
+ */
+function fmSessionName(): string {
+    return 'SOLOFM_' . fmInstanceId();
+}
+
+/**
+ * Short id of this installation (hash of the script path): session cookie name and browser storage keys.
+ */
+function fmInstanceId(): string {
+    $self = realpath(__FILE__);
+    return substr(hash('sha256', normPath($self !== false ? $self : __FILE__)), 0, 16);
+}
+
+/**
+ * Fingerprint of the configured password hash; a login stays valid only while it matches.
+ */
+function fmPasswordFingerprint(string $passwordHash): string {
+    return hash('sha256', 'solofm-login|' . $passwordHash);
+}
+
+/**
+ * Mark this session as logged in for the given password hash.
+ */
+function fmBindSessionToPassword(string $passwordHash): void {
+    ensureSession();
+    $_SESSION['fm_auth'] = true;
+    $_SESSION['fm_pw'] = fmPasswordFingerprint($passwordHash);
+}
+
+/**
  * Ensure session is active
  * 
  * @return void
@@ -921,6 +953,7 @@ function detectCms(string $rootDir): string {
  */
 function ensureSession(): void {
     if (session_status() !== PHP_SESSION_ACTIVE) {
+        session_name(fmSessionName());
         if (PHP_VERSION_ID >= 70300 && !headers_sent()) {
             $https = !empty($_SERVER['HTTPS']) && strtolower((string)$_SERVER['HTTPS']) !== 'off';
             session_set_cookie_params(['httponly' => true, 'samesite' => 'Lax', 'secure' => $https] + session_get_cookie_params());
@@ -990,7 +1023,7 @@ function fmTouchSessionActivity(): void {
 function fmClearAuthSession(): void {
     ensureSession();
     $_SESSION['fm_auth'] = false;
-    unset($_SESSION['fm_last_activity']);
+    unset($_SESSION['fm_last_activity'], $_SESSION['fm_pw']);
 }
 
 /**
@@ -1371,9 +1404,16 @@ function fmSetAllowedIps(
  * @return bool
  */
 function isAuthed(bool $enableAuth): bool {
+    global $PASSWORD_HASH;
     if (!$enableAuth) return true;
     ensureSession();
     if (empty($_SESSION['fm_auth']) || $_SESSION['fm_auth'] !== true) {
+        return false;
+    }
+    // The password changed since this login (or the session predates the fingerprint): log in again.
+    $fp = $_SESSION['fm_pw'] ?? '';
+    if (!is_string($fp) || !hash_equals(fmPasswordFingerprint((string)$PASSWORD_HASH), $fp)) {
+        fmClearAuthSession();
         return false;
     }
     $mins = fmIdleTimeoutMinutes();
@@ -1728,6 +1768,8 @@ function fmChangePassword(string $currentPass, string $newPass, string $confirmP
     }
     $write = fmWritePasswordHashToScript($newHash);
     if (!empty($write['ok'])) {
+        // Keep this session logged in; other sessions still carry the old fingerprint and must log in again.
+        fmBindSessionToPassword($newHash);
         return [
             'status' => 'success',
             'saved'  => true,
@@ -4338,7 +4380,9 @@ if (isset($_POST['action']) && $_POST['action'] === 'login') {
     ensureSession();
     $pass = (string)($_POST['password'] ?? '');
     if ($pass !== '' && password_verify($pass, $PASSWORD_HASH)) {
-        $_SESSION['fm_auth'] = true;
+        // New session id on login (session fixation); the CSRF token is kept, so the open page keeps working.
+        session_regenerate_id(true);
+        fmBindSessionToPassword($PASSWORD_HASH);
         if (fmIdleTimeoutMinutes() > 0) {
             $_SESSION['fm_last_activity'] = time();
         }
@@ -10452,6 +10496,16 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
         function fmPostInit(body) {
             return { method: 'POST', body, headers: { 'X-CSRF-Token': fm_csrf_token } };
         }
+        const fm_instance_id = <?php echo json_encode(fmInstanceId()); ?>;
+        /**
+         * localStorage key for data tied to this installation's paths (bookmarks, last folder, Copy/Move,
+         * terminal). localStorage is shared by every copy on the domain; display settings keep plain keys.
+         * @param {string} base
+         * @returns {string}
+         */
+        function fmScopedKey(base) {
+            return base + '@' + fm_instance_id;
+        }
         // Mirror critical runtime flags on window for explicit global access.
         window.fm_exec_available = fm_exec_available;
         window.fm_terminal_here_enabled = fm_terminal_here_enabled;
@@ -13898,7 +13952,7 @@ class FmServerInfoPopup extends FmPopup {
  * Run a small allowlist of shell commands in one folder.
  */
 class FmTerminalHerePopup extends FmPopup {
-    static STORAGE_KEY = 'fm_terminal_popup_state_1';
+    static STORAGE_KEY = fmScopedKey('fm_terminal_popup_state_1');
     /**
      * @param {Object} options
      * @param {string} options.currentPath
@@ -14515,7 +14569,7 @@ class FmTerminalHerePopup extends FmPopup {
  * FmCopyMovePopup – destination folder tree + Auto / OS / PHP + NDJSON progress.
  */
 class FmCopyMovePopup extends FmPopup {
-    static STORAGE_KEY = 'fm_copy_move_popup_state_1';
+    static STORAGE_KEY = fmScopedKey('fm_copy_move_popup_state_1');
     /**
      * @param {Object}   options
      * @param {'copy'|'move'} options.operation
@@ -20246,7 +20300,8 @@ class FmFileManagerTable extends FmTable {
                         FmFileManagerTable.getFileIcon(row.ext, dispName) +
                         '<i class="bi bi-arrow-up-right-circle-fill fm-link-badge"></i></span>';
                 }
-                if (this.options.showImagePreviews && FmFileManagerTable.isImagePreviewExt(row.ext, dispName)) {
+                // Trash stores items without their extension, so file-view cannot serve a preview there.
+                if (this.options.showImagePreviews && !this._inTrashView() && FmFileManagerTable.isImagePreviewExt(row.ext, dispName)) {
                     const fp = this._fileRowAbsolutePath(row);
                     if (fp) {
                         const src = this.escapeAttr(this._fileViewUrl(fp));
@@ -22441,8 +22496,10 @@ let sidebarTree = null;
 
 
 const CONFIG_STORAGE_KEY = 'fm_table_config_1';
-const BOOKMARKS_STORAGE_KEY = 'fm_bookmarks_1';
-const LAST_FOLDER_STORAGE_KEY = 'fm_last_folder_1';
+const BOOKMARKS_STORAGE_KEY = fmScopedKey('fm_bookmarks_1');
+/** Bookmarks key before 1.3.6 (shared by every copy on the domain); read once to migrate. */
+const LEGACY_BOOKMARKS_STORAGE_KEY = 'fm_bookmarks_1';
+const LAST_FOLDER_STORAGE_KEY = fmScopedKey('fm_last_folder_1');
 const BOOKMARKS_MAX_COUNT = 12;
 
 /**
@@ -22578,7 +22635,10 @@ function bookmarkLabelFromPath(path) {
 
 function loadBookmarks() {
     try {
-        const raw = localStorage.getItem(BOOKMARKS_STORAGE_KEY);
+        let raw = localStorage.getItem(BOOKMARKS_STORAGE_KEY);
+        // First run after the update: take over the shared pre-1.3.6 list, keeping only this root's folders.
+        const migrate = raw === null;
+        if (migrate) raw = localStorage.getItem(LEGACY_BOOKMARKS_STORAGE_KEY);
         if (!raw) return [];
         const parsed = JSON.parse(raw);
         if (!Array.isArray(parsed)) return [];
@@ -22588,13 +22648,14 @@ function loadBookmarks() {
             const it = parsed[i];
             if (!it || typeof it.path !== 'string') continue;
             const p = norm(it.path);
-            if (!p || seen.has(p)) continue;
+            if (!p || seen.has(p) || !pathLooksInsideRoot(p)) continue;
             seen.add(p);
             out.push({
                 path: p,
                 label: (typeof it.label === 'string' && it.label.trim()) ? it.label.trim() : bookmarkLabelFromPath(p),
             });
         }
+        if (migrate && out.length) saveBookmarks(out);
         return out;
     } catch (e) {
         return [];

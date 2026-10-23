@@ -2,6 +2,19 @@
 
 All notable changes to SoloFileManager are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.3.6] - 2026-10-22
+
+### Security
+
+- Separate login per installation: all copies of SoloFileManager on the same domain shared PHP's default session cookie (`PHPSESSID`), so logging in to one copy also opened every other copy, even with a different password. Each installation now uses its own session cookie (`SOLOFM_` + a hash of the script path) and no longer shares session data with other PHP apps on the domain
+- A login is now tied to the current password: after a password change every other open session has to log in again (the session that made the change stays logged in), and the session id is renewed on login
+- After updating you need to log in once more (new cookie name)
+
+### Fixed
+
+- Trash: with image previews on, deleted images showed an empty icon; they now show the image type icon
+- Copies on the same domain shared bookmarks, the last opened folder and the Copy/Move and terminal state (browser storage is per domain). These are now kept per installation; existing bookmarks are moved over once, keeping only the folders inside this copy's root. Display settings (columns, permissions view, sidebar width) stay shared
+
 ## [1.3.5] - 2026-10-22
 
 ### Added

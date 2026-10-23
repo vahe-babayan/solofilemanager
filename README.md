@@ -6,7 +6,7 @@ Manage files directly from your browser — without installing WordPress, Larave
 
 ### One PHP file. No installation. No database.
 
-Current version: **1.3.5** — see [CHANGELOG.md](CHANGELOG.md)
+Current version: **1.3.6** — see [CHANGELOG.md](CHANGELOG.md)
 
 ## Why SoloFileManager?
 
@@ -168,13 +168,13 @@ SoloFileManager can create, rename, and delete files. Treat it as **high risk** 
 - Keep `$ENABLE_AUTH = true` and change the default `admin` password on first login
 - Do not rely on the random filename alone
 - Prefer HTTPS, IP allowlists, and/or HTTP Basic Auth at the web server. If you cannot change the web server config (shared hosting), use the built-in `$FM_ALLOWED_IPS` allowlist
-- Built in: CSRF token on every state-changing request; session cookie is `HttpOnly` + `SameSite=Lax`
+- Built in: CSRF token on every state-changing request; session cookie is `HttpOnly` + `SameSite=Lax` and separate for each installation; changing the password logs out other sessions
 
 See [SECURITY.md](SECURITY.md) for more.
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). Latest: **1.3.5** — optional IP allowlist, chunked upload for files larger than the PHP limits, idle lock no longer interrupts long jobs.
+See [CHANGELOG.md](CHANGELOG.md). Latest: **1.3.6** — security fix: each installation has its own login (copies on one domain no longer share it); a password change logs out other sessions. Update recommended.
 
 ## License
 
