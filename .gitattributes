@@ -1,0 +1,2 @@
+# Development-only files: kept in the repository, left out of GitHub "Download ZIP" and release archives.
+/tests export-ignore

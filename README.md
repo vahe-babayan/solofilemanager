@@ -6,7 +6,7 @@ Manage files directly from your browser — without installing WordPress, Larave
 
 ### One PHP file. No installation. No database.
 
-Current version: **1.3.6** — see [CHANGELOG.md](CHANGELOG.md)
+Current version: **1.4.0** — see [CHANGELOG.md](CHANGELOG.md)
 
 ## Why SoloFileManager?
 
@@ -123,13 +123,13 @@ Current version: **1.3.6** — see [CHANGELOG.md](CHANGELOG.md)
 - Optional session idle lock (off by default): lock after 15–120 minutes of idle time; unlock with the password without losing the current folder view. Long jobs keep the session alive
 - Optional IP allowlist (off by default): only listed IPs / CIDR ranges (IPv4 and IPv6) can open the file manager; everyone else gets 403 before the login page
 - Symlinks and Windows junctions shown as links (folder-link icon, arrow badge on file links); tooltip and Info show the target; links outside the root are dimmed and cannot be opened. Windows `.lnk` shortcuts to a folder inside the root open like a Folder link. Size, counts, PHP copy and archives do not follow links; copying a link recreates the link
-- Create folder/file, rename, bulk rename, duplicate
+- Create folder/file, rename, bulk rename (find / replace with optional regular expressions, numbering, case), duplicate
 - Copy / move with progress; drag and drop
 - Delete to Trash or delete forever. Trash works like the Windows Recycle Bin: a flat list showing each item's original name, the folder it came from, deletion date and size, with Restore (back to where it was, renamed to "name (restored)" if that name is taken) and Delete forever; Empty Trash (with confirm); item count on the Trash button, a reminder on Logout, and Server info shows how many items / how much space Trash holds; the `.trash` folder is removed as soon as it is empty
 - Filter the current folder listing by name (search field in the breadcrumb bar)
-- Compress / extract archives
+- Compress / extract archives; entries that would land outside the root folder (links, `..`, absolute paths) are skipped and listed
 - Change permissions (chmod) for folders and files, including recursive 0755 / 0644 style fixes
-- Upload (large files in parts, with retries on connection problems), get info, copy paths
+- Upload (large files in parts, with retries on connection problems; asks Replace / Skip / Keep both when names already exist), get info, copy paths
 - Download files, or folders and multiple items as ZIP / TAR / TAR.GZ — the browser download starts immediately while the archive is built; failures show the real reason
 - Configuration popup (columns, permissions display, folder-size behavior, heavy file-ops mode)
 - Change password from the UI (updates `$PASSWORD_HASH` in the same PHP file when writable)
@@ -149,7 +149,7 @@ Edit the config block at the top of `solofilemanager.php`:
 | `$FM_ALLOWED_IPS` | IP allowlist, e.g. `['203.0.113.5', '192.168.1.0/24']`. Empty `[]` = everyone (default). Editable in **Configuration → Server** (password); if you lock yourself out, edit this line in the PHP file |
 | `$FM_TRUSTED_PROXIES` | Reverse proxies (e.g. Cloudflare ranges) allowed to pass the real client IP in `X-Forwarded-For`. Empty = use the direct connection IP only (default). File edit only |
 | `$FM_VERBOSE_PROGRESS_MIN_ITEMS` | When to show detailed progress for large jobs |
-| `$FM_TRASH_BASENAME` | Hidden recycle folder under root (default `.trash`) |
+| `$FM_TRASH_BASENAME` | Hidden recycle folder under root (default `.trash`). **Configuration → Server** (password) can switch to a random `.trash-…` name and renames the folder with it |
 | `$FM_ENABLE_TERMINAL_HERE` | Standard terminal-here (**false** by default). Prefer Terminal settings from the terminal icon (password); or set `true` in the file on trusted hosts only |
 | `$FM_ENABLE_TERMINAL_MANUAL` / `$FM_ENABLE_TERMINAL_ADVANCED` | Manual / advanced modes (**false** by default). Same Terminal settings UI (gear in the terminal popup), or edit the file |
 
@@ -172,9 +172,13 @@ SoloFileManager can create, rename, and delete files. Treat it as **high risk** 
 
 See [SECURITY.md](SECURITY.md) for more.
 
+## Tests (development)
+
+The `tests/` folder is for development only (it is not included in release archives). Run `php tests/run.php`; see [tests/README.md](tests/README.md) for details and for building a copy to test in a browser.
+
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). Latest: **1.3.6** — security fix: each installation has its own login (copies on one domain no longer share it); a password change logs out other sessions. Update recommended.
+See [CHANGELOG.md](CHANGELOG.md). Latest: **1.4.0** — security fix: extracting an archive can no longer write outside the root folder through links; plus upload Replace / Skip / Keep both, regular expressions in bulk rename and an optional random trash folder name. Update recommended.
 
 ## License
 

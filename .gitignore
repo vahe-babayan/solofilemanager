@@ -11,6 +11,13 @@ Thumbs.db
 /.phpunit.result.cache
 /vendor/
 
+# Test scratch files (tests/run.php)
+/tests/.tmp/
+
+# Browser test sandbox and its helper scripts (delete /ai-test/ before committing)
+/ai-test/
+/.ai-tools/
+
 # Todo (local backlog; not part of the release)
 todo.md
 todo-done.md

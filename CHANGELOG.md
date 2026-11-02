@@ -2,6 +2,24 @@
 
 All notable changes to SoloFileManager are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.4.0] - 2026-11-02
+
+### Security
+
+- Extract: an archive entry could be written outside the root folder through a symlink or junction that already existed in the destination (e.g. `jx/file.txt` when `jx` links elsewhere). Every entry is now checked before extraction: links, special files, `..`, absolute paths, drive letters and targets that resolve outside the root are skipped, the rest is extracted, and the skipped names are shown afterwards. In OS-only file ops mode such an archive is refused instead
+- Extract: symlinks stored in ZIP and TAR archives are no longer created
+
+### Added
+
+- Upload no longer overwrites silently: when files with the same names already exist, a dialog offers Replace, Skip or Keep both ("name (1).ext"), for normal and chunked uploads
+- Bulk rename: Find can be a regular expression (`$1`, `$2` for groups, `$&` for the match) and can ignore case; an invalid expression is shown in the preview and blocks Apply
+- Optional random trash folder name (Configuration → Server, password): `.trash-` + 12 random hex characters instead of `.trash`, harder to guess on servers that ignore `.htaccess`. The existing trash folder is renamed with the setting, and you can switch back to `.trash`
+- Automated tests in `tests/` (PHP command line: unit checks of the security helpers and HTTP checks against temporary copies), with `tests/make-instance.php` to build a copy for manual testing; see `tests/README.md`. Development only: the folder is left out of release archives (`.gitattributes` `export-ignore`)
+
+### Fixed
+
+- PHP TAR / TAR.GZ extraction (PHP file ops mode or when OS `tar` is unavailable) failed on PHP 8, and long names stored in PAX headers were lost. TAR files are now read by a built-in streaming reader
+
 ## [1.3.6] - 2026-10-22
 
 ### Security

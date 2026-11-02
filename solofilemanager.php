@@ -8,7 +8,7 @@ declare(strict_types=1);
  */
 
 /** Product version (semver). Shown in UI / server info. */
-const SOLOFILEMANAGER_VERSION = '1.3.6';
+const SOLOFILEMANAGER_VERSION = '1.4.0';
 
 // Set max execution time to 1 day (86400 seconds)
 @set_time_limit(86400);
@@ -64,7 +64,10 @@ $FM_FILE_OPS_MODE = 'auto';
  */
 $FM_VERBOSE_PROGRESS_MIN_ITEMS = 800;
 
-/** Hidden trash folder under root (mirror layout: ROOT/rel -> ROOT/.trash/rel). */
+/**
+ * Hidden trash folder under root. Default '.trash'; Configuration can switch to a random name such as
+ * '.trash-3f9a1c2b7d4e' (harder to guess on servers that ignore .htaccess) and renames the folder with it.
+ */
 $FM_TRASH_BASENAME = '.trash';
 
 /**
@@ -613,6 +616,31 @@ function fmUploadResolveDest(string $dirIn, string $relPath, string $rootDir): a
         return [null, 'path is a folder'];
     }
     return [$dest, ''];
+}
+
+/**
+ * What to do when an uploaded file's destination already exists: replace (default), skip or rename.
+ */
+function fmUploadConflictMode(): string {
+    $m = (string)($_POST['on_conflict'] ?? 'replace');
+    return in_array($m, ['replace', 'skip', 'rename'], true) ? $m : 'replace';
+}
+
+/**
+ * Apply the conflict choice at write time (a file may have appeared while the upload was running).
+ *
+ * @return array{0: ?string, 1: string} [final destination or null when skipped, new basename when renamed]
+ */
+function fmUploadApplyConflict(string $dest, string $mode): array {
+    if (!file_exists($dest) || $mode === 'replace') {
+        return [$dest, ''];
+    }
+    if ($mode === 'skip') {
+        return [null, ''];
+    }
+    $taken = [];
+    $new = fmNextDuplicateBasename(dirname($dest), basename($dest), $taken);
+    return [dirname($dest) . '/' . $new, $new];
 }
 
 /**
@@ -1813,6 +1841,65 @@ function fmTrashBasename(): string {
     $b = isset($FM_TRASH_BASENAME) ? (string)$FM_TRASH_BASENAME : '.trash';
     $b = trim($b, '/');
     return $b !== '' ? basename($b) : '.trash';
+}
+
+/**
+ * Write the trash folder name into this script file.
+ *
+ * @return array{ok:bool, reason?:string}
+ */
+function fmWriteTrashBasenameToScript(string $name): array {
+    return fmEditScriptWithCallback(
+        '/(\$FM_TRASH_BASENAME\s*=\s*)([\'"])([^\'"]*)\2(\s*;)/',
+        static function (array $m) use ($name): string {
+            return $m[1] . '\'' . $name . '\'' . $m[4];
+        }
+    );
+}
+
+/**
+ * Switch the trash folder between '.trash' and a random '.trash-<hex>' name (password-confirmed).
+ * An existing trash folder is renamed along with the setting so no deleted item is lost.
+ *
+ * @return array{status:string,msg?:string,saved?:bool,name?:string,line?:string,file?:string}
+ */
+function fmSetTrashBasename(string $password, string $mode, string $passwordHash, bool $authEnabled, string $rootDir): array {
+    if ($authEnabled && ($password === '' || !password_verify($password, $passwordHash))) {
+        usleep(200000);
+        return ['status' => 'error', 'msg' => 'Password is incorrect'];
+    }
+    $current = fmTrashBasename();
+    $isRandom = (bool)preg_match('/^\.trash-[0-9a-f]{12}$/', $current);
+    if ($mode !== 'random' && $mode !== 'default') {
+        return ['status' => 'error', 'msg' => 'Invalid trash name mode'];
+    }
+    if (($mode === 'default' && $current === '.trash') || ($mode === 'random' && $isRandom)) {
+        return ['status' => 'success', 'saved' => true, 'name' => $current, 'msg' => 'Trash folder name is unchanged.'];
+    }
+    $new = $mode === 'default' ? '.trash' : '.trash-' . bin2hex(random_bytes(6));
+    $base = rtrim(normPath(safeRealpath($rootDir)), '/');
+    $oldDir = $base . '/' . $current;
+    $newDir = $base . '/' . $new;
+    if (file_exists($newDir)) {
+        return ['status' => 'error', 'msg' => 'A folder named ' . $new . ' already exists in the root folder.'];
+    }
+    $write = fmWriteTrashBasenameToScript($new);
+    if (empty($write['ok'])) {
+        $note = is_dir($oldDir) ? ' Also rename the folder ' . $current . ' to ' . $new . ' in the root folder.' : '';
+        return [
+            'status' => 'success',
+            'saved'  => false,
+            'name'   => $new,
+            'line'   => '$FM_TRASH_BASENAME = \'' . $new . '\';',
+            'file'   => pathinfo(__FILE__, PATHINFO_BASENAME),
+            'msg'    => 'Could not update this PHP file automatically. Set this line near the top of the script, save, then reload.' . $note,
+        ];
+    }
+    if (is_dir($oldDir) && !@rename($oldDir, $newDir)) {
+        fmWriteTrashBasenameToScript($current);
+        return ['status' => 'error', 'msg' => 'Could not rename the trash folder ' . $current . ' (check permissions); the setting was not changed.'];
+    }
+    return ['status' => 'success', 'saved' => true, 'name' => $new, 'msg' => 'Trash folder renamed to ' . $new . '. Reloading…'];
 }
 
 /**
@@ -3531,6 +3618,274 @@ function fmArchiveInternalPathAllowed(string $entry): bool {
     return true;
 }
 
+/** Refuse to check (and extract) archives with more entries than this. */
+const FM_ARCHIVE_MAX_ENTRIES = 200000;
+
+/**
+ * Entries of a ZIP / TAR / TAR.GZ archive with their kind, read in PHP so the check does not depend on
+ * the OS tool that extracts later. Null when the archive cannot be read.
+ *
+ * @return list<array{name: string, raw: string, kind: string}>|null kind: file | dir | link | other
+ */
+function fmArchiveListEntries(string $path, string $type): ?array {
+    if ($type === 'zip') {
+        if (!class_exists('ZipArchive')) {
+            return null;
+        }
+        $zip = new ZipArchive();
+        if ($zip->open($path) !== true) {
+            return null;
+        }
+        $out = [];
+        $n = min($zip->numFiles, FM_ARCHIVE_MAX_ENTRIES + 1);
+        for ($i = 0; $i < $n; $i++) {
+            $stat = $zip->statIndex($i);
+            if ($stat === false) {
+                continue;
+            }
+            $raw = (string)$stat['name'];
+            $kind = substr(str_replace('\\', '/', $raw), -1) === '/' ? 'dir' : 'file';
+            $opsys = 0;
+            $attr = 0;
+            if ($zip->getExternalAttributesIndex($i, $opsys, $attr) && $opsys === ZipArchive::OPSYS_UNIX) {
+                $fmt = ($attr >> 16) & 0170000;
+                if ($fmt === 0120000) {
+                    $kind = 'link';
+                } elseif ($fmt !== 0 && $fmt !== 0100000 && $fmt !== 0040000) {
+                    $kind = 'other';
+                }
+            }
+            $out[] = ['name' => $raw, 'raw' => $raw, 'kind' => $kind];
+        }
+        $zip->close();
+        return $out;
+    }
+
+    $out = [];
+    $ok = fmTarWalk($path, $type === 'tgz', static function (string $name, string $kind) use (&$out): bool {
+        $out[] = ['name' => $name, 'raw' => $name, 'kind' => $kind];
+        return count($out) <= FM_ARCHIVE_MAX_ENTRIES;
+    });
+    return $ok ? $out : null;
+}
+
+/**
+ * Walk a TAR / TAR.GZ archive (ustar, GNU long names, PAX path) entry by entry without loading entry data
+ * into memory. $onEntry(name, kind, size, $readData) may consume the data with $readData(maxBytes) ('' at the
+ * end); unread data is skipped. Returning false from $onEntry stops the walk.
+ *
+ * @param callable(string, string, int, callable(int): string): bool $onEntry
+ * @return bool false when the archive cannot be read or is malformed
+ */
+function fmTarWalk(string $path, bool $gz, callable $onEntry): bool {
+    if ($gz && !function_exists('gzopen')) {
+        return false;
+    }
+    $h = $gz ? @gzopen($path, 'rb') : @fopen($path, 'rb');
+    if (!$h) {
+        return false;
+    }
+    $read = static function (int $len) use ($h, $gz): string {
+        $buf = '';
+        while (strlen($buf) < $len) {
+            $chunk = $gz ? gzread($h, $len - strlen($buf)) : fread($h, $len - strlen($buf));
+            if ($chunk === false || $chunk === '') {
+                break;
+            }
+            $buf .= $chunk;
+        }
+        return $buf;
+    };
+    /** Read and drop $len bytes in chunks; false when the archive ends early. */
+    $skip = static function (int $len) use ($read): bool {
+        while ($len > 0) {
+            $n = min($len, 1048576);
+            if (strlen($read($n)) < $n) {
+                return false;
+            }
+            $len -= $n;
+        }
+        return true;
+    };
+    $ok = true;
+    $longName = null;
+    while (true) {
+        $hdr = $read(512);
+        if (strlen($hdr) < 512 || trim($hdr, "\0") === '') {
+            break;
+        }
+        $name = rtrim(substr($hdr, 0, 100), "\0");
+        $sizeField = trim(substr($hdr, 124, 12), "\0 ");
+        if ($sizeField !== '' && !preg_match('/^[0-7]+$/', $sizeField)) {
+            $ok = false;
+            break;
+        }
+        $size = $sizeField === '' ? 0 : (int)octdec($sizeField);
+        $flag = substr($hdr, 156, 1);
+        if (substr($hdr, 257, 5) === 'ustar') {
+            $prefix = rtrim(substr($hdr, 345, 155), "\0");
+            if ($prefix !== '') {
+                $name = $prefix . '/' . $name;
+            }
+        }
+        $padded = (int)(ceil($size / 512) * 512);
+        if ($flag === 'L' || $flag === 'x') {
+            // GNU long name / PAX header: the real name of the next entry is in this entry's data.
+            if ($size > 1048576) {
+                $ok = false;
+                break;
+            }
+            $data = substr($read($padded), 0, $size);
+            if ($flag === 'L') {
+                $longName = rtrim($data, "\0");
+            } elseif (preg_match('/(?:^|\n)\d+ path=([^\n]*)\n/', $data, $m)) {
+                $longName = $m[1];
+            }
+            continue;
+        }
+        if ($flag === 'K' || $flag === 'g') {
+            if (!$skip($padded)) {
+                $ok = false;
+                break;
+            }
+            continue;
+        }
+        if ($longName !== null) {
+            $name = $longName;
+            $longName = null;
+        }
+        if ($flag === '0' || $flag === "\0" || $flag === '7') {
+            $kind = 'file';
+        } elseif ($flag === '5') {
+            $kind = 'dir';
+        } elseif ($flag === '1' || $flag === '2') {
+            $kind = 'link';
+        } else {
+            $kind = 'other';
+        }
+        $left = $kind === 'file' ? $size : 0;
+        $readData = static function (int $max) use (&$left, $read): string {
+            if ($left <= 0) {
+                return '';
+            }
+            $chunk = $read(min($max, $left));
+            $left -= strlen($chunk);
+            if ($chunk === '') {
+                $left = 0;
+            }
+            return $chunk;
+        };
+        $continue = $onEntry($name, $kind, $size, $readData);
+        $consumed = $kind === 'file' ? $size - $left : 0;
+        if (!$skip($padded - $consumed)) {
+            $ok = false;
+            break;
+        }
+        if (!$continue) {
+            break;
+        }
+    }
+    $gz ? gzclose($h) : fclose($h);
+    return $ok;
+}
+
+/**
+ * Extract a TAR / TAR.GZ in PHP. Only regular files and folders are written; each target is checked against
+ * the root right before writing. $only (normalized names) limits the entries; null extracts every safe entry.
+ *
+ * @param array<string, true>|null $only
+ * @return string '' on success, otherwise an error message
+ */
+function fmTarExtract(string $path, bool $gz, string $destReal, string $rootDir, ?array $only): string {
+    $dest = rtrim(normPath($destReal), '/');
+    $error = '';
+    $ok = fmTarWalk($path, $gz, static function (string $name, string $kind, int $size, callable $readData) use ($dest, $rootDir, $only, &$error): bool {
+        $rel = str_replace('\\', '/', $name);
+        while (strpos($rel, './') === 0) {
+            $rel = substr($rel, 2);
+        }
+        $rel = rtrim($rel, '/');
+        if ($rel === '' || ($kind !== 'file' && $kind !== 'dir')) {
+            return true;
+        }
+        if ($only !== null && !isset($only[$rel])) {
+            return true;
+        }
+        $target = $dest . '/' . $rel;
+        if (!fmArchiveInternalPathAllowed($rel) || !pathInsideRoot($target, $rootDir)) {
+            return true;
+        }
+        if ($kind === 'dir') {
+            if (!is_dir($target) && !@mkdir($target, 0775, true) && !is_dir($target)) {
+                $error = 'Could not create folder ' . $rel;
+                return false;
+            }
+            return true;
+        }
+        $parent = dirname($target);
+        if (!is_dir($parent) && !@mkdir($parent, 0775, true) && !is_dir($parent)) {
+            $error = 'Could not create folder for ' . $rel;
+            return false;
+        }
+        if (is_dir($target)) {
+            $error = 'A folder is in the way of ' . $rel;
+            return false;
+        }
+        $fh = @fopen($target, 'wb');
+        if ($fh === false) {
+            $error = 'Could not write ' . $rel;
+            return false;
+        }
+        while (($chunk = $readData(1048576)) !== '') {
+            if (fwrite($fh, $chunk) === false) {
+                fclose($fh);
+                $error = 'Could not write ' . $rel . ' (disk full?)';
+                return false;
+            }
+        }
+        fclose($fh);
+        return true;
+    });
+    if ($error !== '') {
+        return $error;
+    }
+    return $ok ? '' : 'The archive is damaged or not a TAR file';
+}
+
+/**
+ * Split archive entries into the ones that may be extracted into $destDir and the ones that must not:
+ * unsafe names (.., absolute, drive letters), links and special files, and entries whose target would end
+ * up outside the root, for example through a symlink or junction that already exists in the destination.
+ *
+ * @param list<array{name: string, raw: string, kind: string}> $entries
+ * @return array{safe: list<array{name: string, raw: string, kind: string}>, unsafe: list<string>}
+ */
+function fmArchiveSplitEntries(array $entries, string $destDir, string $rootDir): array {
+    $safe = [];
+    $unsafe = [];
+    $dest = rtrim(normPath($destDir), '/');
+    foreach ($entries as $e) {
+        $name = str_replace('\\', '/', $e['name']);
+        while (strpos($name, './') === 0) {
+            $name = substr($name, 2);
+        }
+        $rel = rtrim($name, '/');
+        if ($rel === '') {
+            continue;
+        }
+        $bad = $e['kind'] === 'link' || $e['kind'] === 'other'
+            || !fmArchiveInternalPathAllowed($rel)
+            || (PHP_OS_FAMILY === 'Windows' && strpos($rel, ':') !== false)
+            || !pathInsideRoot($dest . '/' . $rel, $rootDir);
+        if ($bad) {
+            $unsafe[] = $e['name'];
+        } else {
+            $safe[] = ['name' => $rel, 'raw' => $e['raw'], 'kind' => $e['kind']];
+        }
+    }
+    return ['safe' => $safe, 'unsafe' => $unsafe];
+}
+
 /**
  * Forward slashes for ZipArchive / Phar paths (avoids Windows extractTo failures).
  * 
@@ -3603,19 +3958,12 @@ function fmCountArchiveEntries(string $path, string $type): int {
         $z->close();
         return $n;
     }
-    $phar = fmOpenPharDataForRead($path, $type);
-    if ($phar === null) {
-        return 0;
-    }
-    try {
-        $count = 0;
-        foreach (new RecursiveIteratorIterator($phar, RecursiveIteratorIterator::SELF_FIRST) as $_) {
-            $count++;
-        }
-        return $count;
-    } catch (Throwable $e) {
-        return 0;
-    }
+    $count = 0;
+    $ok = fmTarWalk($path, $type === 'tgz', static function () use (&$count): bool {
+        $count++;
+        return $count <= FM_ARCHIVE_MAX_ENTRIES;
+    });
+    return $ok ? $count : 0;
 }
 
 /**
@@ -4313,6 +4661,11 @@ function fmDownloadArchiveHandlePost(string $rootDir, bool $isUnixLikeShell, boo
     exit;
 }
 
+// tests/ include this file from the command line to call its helpers; stop before handling a request.
+if (PHP_SAPI === 'cli' && getenv('SOLOFM_TEST_INCLUDE') === '1') {
+    return;
+}
+
 // =========================
 // Setup (rename) + Auth routing
 // =========================
@@ -4416,6 +4769,16 @@ if (isset($_POST['action']) && $_POST['action'] === 'set-allowed-ips') {
         $ENABLE_AUTH,
         fmAllowedIps(),
         fmClientIp()
+    ));
+}
+if (isset($_POST['action']) && $_POST['action'] === 'set-trash-name') {
+    requireAuthOrExit($ENABLE_AUTH);
+    jsonOut(fmSetTrashBasename(
+        (string)($_POST['password'] ?? ''),
+        (string)($_POST['mode'] ?? ''),
+        $PASSWORD_HASH,
+        $ENABLE_AUTH,
+        $ROOT_DIR
     ));
 }
 if (isset($_POST['action']) && $_POST['action'] === 'change-password') {
@@ -4934,8 +5297,11 @@ if (isset($_POST['action']) && $_POST['action'] === 'upload' && isset($_POST['in
     }
 
     $paths = isset($_POST['paths']) ? (array)$_POST['paths'] : [];
+    $conflict = fmUploadConflictMode();
     $uploaded = 0;
     $errors = [];
+    $skipped = [];
+    $renamed = [];
 
     foreach ($fileRows as $i => $row) {
         if ($row['error'] !== UPLOAD_ERR_OK) {
@@ -4962,14 +5328,22 @@ if (isset($_POST['action']) && $_POST['action'] === 'upload' && isset($_POST['in
             $errors[] = $clean . ': path is a folder';
             continue;
         }
-        if (!@move_uploaded_file($row['tmp_name'], $dest)) {
+        [$final, $newName] = fmUploadApplyConflict($dest, $conflict);
+        if ($final === null) {
+            $skipped[] = $clean;
+            continue;
+        }
+        if (!@move_uploaded_file($row['tmp_name'], $final)) {
             $errors[] = $clean . ': could not save file';
             continue;
+        }
+        if ($newName !== '') {
+            $renamed[] = ['from' => $clean, 'to' => $newName];
         }
         $uploaded++;
     }
 
-    if ($uploaded === 0) {
+    if ($uploaded === 0 && $skipped === []) {
         jsonOut(['status' => 'error', 'msg' => 'Nothing uploaded', 'errors' => $errors]);
     }
     if ($errors !== []) {
@@ -4977,10 +5351,33 @@ if (isset($_POST['action']) && $_POST['action'] === 'upload' && isset($_POST['in
             'status'   => 'partial',
             'msg'      => 'Some files failed',
             'uploaded' => $uploaded,
+            'skipped'  => $skipped,
+            'renamed'  => $renamed,
             'errors'   => $errors,
         ]);
     }
-    jsonOut(['status' => 'success', 'msg' => 'Upload complete', 'uploaded' => $uploaded]);
+    jsonOut(['status' => 'success', 'msg' => 'Upload complete', 'uploaded' => $uploaded, 'skipped' => $skipped, 'renamed' => $renamed]);
+}
+
+// Which of the files about to be uploaded already exist (the client asks replace / skip / keep both once).
+if (isset($_POST['action']) && $_POST['action'] === 'upload-check') {
+    $in = (string)($_POST['in'] ?? '');
+    $paths = array_slice(array_map('strval', (array)($_POST['paths'] ?? [])), 0, 10000);
+    $existing = [];
+    $folders = [];
+    foreach ($paths as $p) {
+        [$dest, $err] = fmUploadResolveDest($in, $p, $ROOT_DIR);
+        if ($dest === null) {
+            if ($err === 'path is a folder') {
+                $folders[] = $p;
+            }
+            continue;
+        }
+        if (is_file($dest)) {
+            $existing[] = $p;
+        }
+    }
+    jsonOut(['status' => 'success', 'existing' => $existing, 'folders' => $folders]);
 }
 
 if (isset($_POST['action']) && $_POST['action'] === 'upload-init') {
@@ -5091,14 +5488,25 @@ if (isset($_POST['action']) && $_POST['action'] === 'upload-finish') {
         fmUploadDiscard($ROOT_DIR, $id);
         jsonOut(['status' => 'error', 'msg' => 'Could not create the parent folder']);
     }
-    if (!@rename($up['part'], $dest)) {
-        if (!@copy($up['part'], $dest)) {
+    [$final, $newName] = fmUploadApplyConflict($dest, fmUploadConflictMode());
+    if ($final === null) {
+        fmUploadDiscard($ROOT_DIR, $id);
+        jsonOut(['status' => 'success', 'msg' => 'Skipped: the file already exists', 'uploaded' => 0, 'skipped' => [basename($dest)], 'renamed' => []]);
+    }
+    if (!@rename($up['part'], $final)) {
+        if (!@copy($up['part'], $final)) {
             fmUploadDiscard($ROOT_DIR, $id);
             jsonOut(['status' => 'error', 'msg' => 'Could not save the file']);
         }
     }
     fmUploadDiscard($ROOT_DIR, $id);
-    jsonOut(['status' => 'success', 'msg' => 'Upload complete', 'uploaded' => 1]);
+    jsonOut([
+        'status'   => 'success',
+        'msg'      => 'Upload complete',
+        'uploaded' => 1,
+        'skipped'  => [],
+        'renamed'  => $newName !== '' ? [['from' => basename($dest), 'to' => $newName]] : [],
+    ]);
 }
 
 if (isset($_POST['action']) && $_POST['action'] === 'upload-cancel') {
@@ -5605,7 +6013,8 @@ if (isset($_POST['action']) && $_POST['action'] === 'extract' && isset($_POST['i
         }
     };
 
-    $phpExtractOne = function (string $archivePath, string $destDir, string $type, int $entryCount) use (&$processed, $sendProgress, $sendError, $ROOT_DIR, $serverCapabilities): void {
+    /** @param list<array{name: string, raw: string, kind: string}>|null $only extract just these entries (null = all) */
+    $phpExtractOne = function (string $archivePath, string $destDir, string $type, int $entryCount, ?array $only = null) use (&$processed, $sendProgress, $sendError, $ROOT_DIR, $serverCapabilities): void {
         if (!is_dir($destDir)) {
             if (!@mkdir($destDir, 0775, true)) {
                 $sendError('Could not create folder: ' . basename($destDir));
@@ -5627,20 +6036,26 @@ if (isset($_POST['action']) && $_POST['action'] === 'extract' && isset($_POST['i
                 $sendError('Could not open ZIP archive');
             }
             $entries = [];
-            for ($i = 0; $i < $zip->numFiles; $i++) {
-                $stat = $zip->statIndex($i);
-                if ($stat === false) {
-                    continue;
+            if ($only !== null) {
+                foreach ($only as $e) {
+                    $entries[] = $e['raw'];
                 }
-                $raw = $stat['name'];
-                $entry = ltrim(str_replace('\\', '/', $raw), '/');
-                if ($entry === '' && substr(str_replace('\\', '/', $raw), -1) !== '/') {
-                    continue;
+            } else {
+                for ($i = 0; $i < $zip->numFiles; $i++) {
+                    $stat = $zip->statIndex($i);
+                    if ($stat === false) {
+                        continue;
+                    }
+                    $raw = $stat['name'];
+                    $entry = ltrim(str_replace('\\', '/', $raw), '/');
+                    if ($entry === '' && substr(str_replace('\\', '/', $raw), -1) !== '/') {
+                        continue;
+                    }
+                    if (!fmArchiveInternalPathAllowed($entry)) {
+                        continue;
+                    }
+                    $entries[] = $raw;
                 }
-                if (!fmArchiveInternalPathAllowed($entry)) {
-                    continue;
-                }
-                $entries[] = $raw;
             }
             if (count($entries) === 0) {
                 $zip->close();
@@ -5656,19 +6071,20 @@ if (isset($_POST['action']) && $_POST['action'] === 'extract' && isset($_POST['i
             return;
         }
 
-        $phar = fmOpenPharDataForRead($archivePath, $type);
-        if ($phar === null) {
-            $sendError('Could not open TAR archive (enable Phar extension or check file format)');
-        }
-        try {
-            if (!$phar->extractTo($destApi, null, true, true)) {
-                $sendError('TAR extraction failed');
+        // Own TAR reader instead of PharData: it handles GNU / PAX long names and checks every target before writing.
+        $onlySet = null;
+        if ($only !== null) {
+            $onlySet = [];
+            foreach ($only as $e) {
+                $onlySet[$e['name']] = true;
             }
-            $processed += $entryCount;
-            $sendProgress();
-        } catch (Throwable $e) {
-            $sendError('Could not extract archive: ' . $e->getMessage());
         }
+        $err = fmTarExtract($archivePath, $type === 'tgz', $destReal, $ROOT_DIR, $onlySet);
+        if ($err !== '') {
+            $sendError('Could not extract ' . basename($archivePath) . ': ' . $err);
+        }
+        $processed += $entryCount;
+        $sendProgress();
     };
 
     $shellExtractOne = function (string $archivePath, string $destDir, string $type) use ($isUnixLikeShell, $isWindows): bool {
@@ -5694,6 +6110,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'extract' && isset($_POST['i
 
     try {
         $highlightNames = [];
+        $skipped = [];
         foreach ($archives as $a) {
             $base = $a['name'];
             $apath = $a['path'];
@@ -5722,6 +6139,35 @@ if (isset($_POST['action']) && $_POST['action'] === 'extract' && isset($_POST['i
             }
 
             $entryCount = $a['entryCount'];
+
+            // Check every entry in PHP before any tool writes: no links, no unsafe names, and no target
+            // outside the root (an existing symlink / junction in the destination would redirect writes).
+            $listed = fmArchiveListEntries($apath, $atype);
+            if ($listed === null) {
+                $sendError('Could not read the contents of ' . $base . ' to check them before extracting.');
+            }
+            if (count($listed) > FM_ARCHIVE_MAX_ENTRIES) {
+                $sendError($base . ' has more than ' . FM_ARCHIVE_MAX_ENTRIES . ' entries; refusing to extract.');
+            }
+            $split = fmArchiveSplitEntries($listed, $destDir, $ROOT_DIR);
+            if ($split['unsafe'] !== []) {
+                if ($split['safe'] === []) {
+                    $sendError('Nothing extracted from ' . $base . ': all entries are links or would be written outside this folder.');
+                }
+                if (!$allowPhpFallback) {
+                    $sendError($base . ' contains links or entries that would be written outside this folder. Skipping them needs PHP extraction (file ops mode is OS only).');
+                }
+                foreach ($split['unsafe'] as $u) {
+                    $skipped[] = $base . ': ' . $u;
+                }
+                $send(array_merge(
+                    ['n' => $processed, 'total' => $grandTotal, 'phase' => 'php', 'msg' => 'Extracting via PHP without unsafe entries: ' . $base],
+                    fmStreamProgressMeta($grandTotal, true)
+                ));
+                $phpExtractOne($apath, $destDir, $atype, $entryCount, $split['safe']);
+                continue;
+            }
+
             $shellOk = false;
             if ($tryShell) {
                 $shellOk = $shellExtractOne($apath, $destDir, $atype);
@@ -5751,7 +6197,12 @@ if (isset($_POST['action']) && $_POST['action'] === 'extract' && isset($_POST['i
         }
 
         $send(['n' => $processed, 'total' => $grandTotal]);
-        $send(['done' => true, 'highlight' => array_values(array_unique($highlightNames))]);
+        $send([
+            'done'          => true,
+            'highlight'     => array_values(array_unique($highlightNames)),
+            'skipped'       => array_slice($skipped, 0, 20),
+            'skipped_count' => count($skipped),
+        ]);
     } catch (Throwable $e) {
         $sendError($e->getMessage());
     }
@@ -8741,6 +9192,38 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     font-size: 0.8125rem;
     cursor: pointer;
     margin: 0.15rem 0;
+}
+
+.fm-bulk-rename-popup .fm-br-find-opts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0 1rem;
+}
+
+.fm-bulk-rename-popup .fm-br-opt-hint {
+    color: var(--muted-text, #6c757d);
+    font-size: 0.75rem;
+}
+
+.fm-bulk-rename-popup .fm-br-regex-err {
+    margin: 0.2rem 0;
+    font-size: 0.8125rem;
+}
+
+.fm-bulk-rename-popup .fm-br-find-opts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0 1rem;
+}
+
+.fm-bulk-rename-popup .fm-br-opt-hint {
+    color: var(--muted-text, #6c757d);
+    font-size: 0.75rem;
+}
+
+.fm-bulk-rename-popup .fm-br-regex-err {
+    margin: 0.2rem 0;
+    font-size: 0.8125rem;
 }
 
 .fm-bulk-rename-popup .fm-br-counter-row {
@@ -13347,7 +13830,7 @@ class FmExtractPopup extends FmPopup {
         const extractIntro =
             '<p class="fm-hint fm-extract-option-hint">' +
             (execOk
-                ? 'The server tries OS extract tools first when possible, then PHP (ZipArchive / Phar).'
+                ? 'The server tries OS extract tools first when possible, then PHP (ZipArchive / built-in TAR reader).'
                 : 'PHP <code>exec()</code> is disabled; extraction uses PHP only.') +
             '</p>';
 
@@ -13466,6 +13949,17 @@ class FmExtractPopup extends FmPopup {
                         finished = true;
                         waitPopup.hideAndDestroy();
                         if (onSuccessCb) onSuccessCb();
+                        const skippedCount = Number(data.skipped_count) || 0;
+                        if (skippedCount > 0) {
+                            const list = (Array.isArray(data.skipped) ? data.skipped : []).join('\n');
+                            fmUserNotice({
+                                variant: 'warning',
+                                title: 'Extract',
+                                message: 'Extracted, but ' + skippedCount + (skippedCount === 1 ? ' entry was' : ' entries were') +
+                                    ' skipped for safety (links, or paths that would be written outside this folder):\n' + list +
+                                    (skippedCount > 20 ? '\n\u2026' : ''),
+                            });
+                        }
                     }
                 };
 
@@ -16329,7 +16823,7 @@ class FmUploadPopup extends FmPopup {
             } else if (st === 'uploading') {
                 itemStatus.textContent = 'Uploading\u2026';
             } else if (st === 'done') {
-                itemStatus.textContent = 'Done';
+                itemStatus.textContent = entry.note || 'Done';
                 itemStatus.classList.add('fm-upload-item-status--ok');
                 bar.style.width = '100%';
                 progWrap.classList.add('fm-upload-progress--done');
@@ -16370,12 +16864,25 @@ class FmUploadPopup extends FmPopup {
                 progressWrap.classList.toggle('fm-upload-progress--done', r.ok);
             }
             if (statusEl) {
-                statusEl.textContent = r.ok ? 'Done' : (r.msg || 'Failed');
+                statusEl.textContent = r.ok ? (r.note || 'Done') : (r.msg || 'Failed');
                 statusEl.classList.toggle('fm-upload-item-status--ok', r.ok);
                 statusEl.classList.toggle('fm-upload-item-status--err', !r.ok);
             }
-            return { ok: r.ok, msg: r.msg || '' };
+            return { ok: r.ok, msg: r.msg || '', note: r.note || '' };
         });
+    }
+
+    /**
+     * Success result of an upload request, with a note when the file was skipped or saved under a new name.
+     * @param {Object} data - server JSON
+     * @returns {{ ok: boolean, msg: string, note: string }}
+     */
+    static _uploadOkResult(data) {
+        const skipped = Array.isArray(data.skipped) ? data.skipped : [];
+        const renamed = Array.isArray(data.renamed) ? data.renamed : [];
+        if (skipped.length) return { ok: true, msg: '', note: 'Skipped \u2014 already exists' };
+        if (renamed.length && renamed[0] && renamed[0].to) return { ok: true, msg: '', note: 'Saved as ' + renamed[0].to };
+        return { ok: true, msg: '', note: '' };
     }
 
     /**
@@ -16427,6 +16934,7 @@ class FmUploadPopup extends FmPopup {
         form.append('in', this._pathIn());
         form.append('files[]', file);
         form.append('paths[]', file.webkitRelativePath || file.name);
+        form.append('on_conflict', this._conflictMode || 'replace');
         return this._postUpload(form, (loaded) => {
             if (file.size > 0) setPct((loaded / file.size) * 100);
         }).then(({ status, data }) => {
@@ -16440,8 +16948,9 @@ class FmUploadPopup extends FmPopup {
                         : 'Unexpected server response (HTTP ' + status + '). Check the PHP / web server error log.',
                 };
             }
-            if (status === 200 && data.status === 'success' && (Number(data.uploaded) || 0) >= 1) {
-                return { ok: true, msg: '' };
+            const skippedHere = Array.isArray(data.skipped) && data.skipped.length > 0;
+            if (status === 200 && data.status === 'success' && ((Number(data.uploaded) || 0) >= 1 || skippedHere)) {
+                return FmUploadPopup._uploadOkResult(data);
             }
             return { ok: false, msg: (data.errors && data.errors[0]) || data.msg || ('HTTP ' + status) };
         });
@@ -16540,9 +17049,9 @@ class FmUploadPopup extends FmPopup {
             if (statusEl) statusEl.textContent = 'Uploading\u2026';
         }
 
-        const { res: fin, attempts } = await postRetry({ action: 'upload-finish', id });
+        const { res: fin, attempts } = await postRetry({ action: 'upload-finish', id, on_conflict: this._conflictMode || 'replace' });
         if (fin.status === 401) return { ok: false, msg: 'Unauthorized' };
-        if (fin.data && fin.data.status === 'success') return { ok: true, msg: '' };
+        if (fin.data && fin.data.status === 'success') return FmUploadPopup._uploadOkResult(fin.data);
         if (attempts > 1 && fin.data && fin.data.code === 'gone') {
             // An earlier finish reached the server but its reply was lost; the server has handled the upload.
             return { ok: false, msg: 'The server reply was lost while finishing. Refresh the folder to check whether the file arrived.' };
@@ -16609,6 +17118,7 @@ class FmUploadPopup extends FmPopup {
     }
 
     _submitUpload() {
+        if (this._uploadInProgress || this._conflictCheckRunning) return;
         if (this._queue.size === 0) {
             fmUserNotice({ variant: 'warning', title: 'Upload', message: 'Add at least one file to upload.' });
             return;
@@ -16625,6 +17135,85 @@ class FmUploadPopup extends FmPopup {
             return;
         }
 
+        // Ask once what to do with files that already exist, before anything is sent.
+        this._conflictCheckRunning = true;
+        const pathOf = (entry) => entry.file.webkitRelativePath || entry.file.name;
+        const form = new FormData();
+        form.append('action', 'upload-check');
+        form.append('in', this._pathIn());
+        pendingTuples.forEach(([, v]) => form.append('paths[]', pathOf(v)));
+        fetch(this._ajaxUrl, fmPostInit(form))
+            .then((r) => r.json())
+            .catch(() => null)
+            .then((data) => {
+                this._conflictCheckRunning = false;
+                const existing = new Set(data && Array.isArray(data.existing) ? data.existing : []);
+                const clashes = pendingTuples.filter(([, v]) => existing.has(pathOf(v)));
+                if (!clashes.length) {
+                    this._conflictMode = 'replace';
+                    this._startUpload(ordered, pendingTuples);
+                    return;
+                }
+                this._askUploadConflict(clashes.map(([, v]) => pathOf(v)), (mode) => {
+                    if (!mode) return;
+                    this._conflictMode = mode;
+                    let toUpload = pendingTuples;
+                    if (mode === 'skip') {
+                        clashes.forEach(([key]) => {
+                            const e = this._queue.get(key);
+                            if (e) { e.status = 'done'; e.errorMsg = ''; e.note = 'Skipped \u2014 already exists'; }
+                        });
+                        toUpload = pendingTuples.filter(([key]) => !clashes.some(([k]) => k === key));
+                        this._renderQueue();
+                        if (!toUpload.length) return;
+                    }
+                    this._startUpload([...this._queue.entries()], toUpload);
+                });
+            });
+    }
+
+    /**
+     * Ask what to do with uploads whose names already exist in the destination.
+     * @param {string[]} names
+     * @param {(mode: 'replace'|'skip'|'rename'|null) => void} done - null when cancelled
+     */
+    _askUploadConflict(names, done) {
+        const shown = names.slice(0, 8).map((n) => '<li><code>' + FmPopup.escapeHtml(n) + '</code></li>').join('');
+        const more = names.length > 8 ? '<p class="fm-hint">\u2026and ' + (names.length - 8) + ' more</p>' : '';
+        let answered = false;
+        const pick = (mode) => {
+            answered = true;
+            popup.hideAndDestroy();
+            done(mode);
+        };
+        const popup = new FmPopup({
+            title: names.length === 1 ? 'File already exists' : names.length + ' files already exist',
+            maxWidth: '520px',
+            content:
+                '<p class="mt-0">' + (names.length === 1 ? 'This file is' : 'These files are') + ' already in the destination folder:</p>' +
+                '<ul class="fm-upload-conflict-list">' + shown + '</ul>' + more +
+                '<p class="mb-0"><strong>Keep both</strong> saves the upload as "name (1).ext". <strong>Replace</strong> overwrites the existing file.</p>',
+            buttons: [
+                { label: 'Cancel', close: false, onClick: () => pick(null) },
+                { label: 'Skip', close: false, onClick: () => pick('skip') },
+                { label: 'Replace', close: false, onClick: () => pick('replace') },
+                { label: 'Keep both', primary: true, close: false, onClick: () => pick('rename') },
+            ],
+            onBeforeHide: () => {
+                if (!answered) {
+                    answered = true;
+                    done(null);
+                }
+            },
+        });
+        popup.show();
+    }
+
+    /**
+     * @param {Array<[string, Object]>} ordered - all queue entries in display order
+     * @param {Array<[string, Object]>} pendingTuples - entries to upload now
+     */
+    _startUpload(ordered, pendingTuples) {
         this._renderQueue();
 
         const wrap      = this.querySelector('.fm-upload-queue');
@@ -16698,6 +17287,7 @@ class FmUploadPopup extends FmPopup {
                     if (e) {
                         e.status = r.ok ? 'done' : 'error';
                         e.errorMsg = r.ok ? '' : (r.msg || 'Failed');
+                        e.note = r.ok ? (r.note || '') : '';
                     }
                     this._updateUploadQueueCount();
                     return r;
@@ -17092,6 +17682,12 @@ class FmBulkRenamePopup extends FmPopup {
             '<input type="text" class="fm-input fm-br-find" autocomplete="off" placeholder="Text to find in each name"></div>' +
             '<div class="fm-br-row"><label class="fm-br-label">Replace with</label>' +
             '<input type="text" class="fm-input fm-br-replace" autocomplete="off" placeholder="Replacement (may be empty)"></div>' +
+            '<div class="fm-br-find-opts">' +
+            '<label class="fm-br-check"><input type="checkbox" class="fm-br-regex"> Regular expression ' +
+            '<span class="fm-br-opt-hint">use $1, $2 for groups, $&amp; for the match</span></label>' +
+            '<label class="fm-br-check"><input type="checkbox" class="fm-br-icase"> Ignore case</label>' +
+            '</div>' +
+            '<p class="fm-error fm-br-regex-err" style="display:none"></p>' +
             '<div class="fm-br-row"><label class="fm-br-label">Prefix</label>' +
             '<input type="text" class="fm-input fm-br-prefix" autocomplete="off"></div>' +
             '<div class="fm-br-row"><label class="fm-br-label">Suffix</label>' +
@@ -17148,7 +17744,14 @@ class FmBulkRenamePopup extends FmPopup {
     static _computeNewName(oldName, isFolder, index, o) {
         const find = o.find != null ? String(o.find) : '';
         const replace = o.replace != null ? String(o.replace) : '';
-        let s = find === '' ? oldName : oldName.split(find).join(replace);
+        let s;
+        if (find === '') {
+            s = oldName;
+        } else if (o.findRe) {
+            s = oldName.replace(o.findRe, o.regex ? replace : () => replace);
+        } else {
+            s = oldName.split(find).join(replace);
+        }
         const prefix = o.prefix != null ? String(o.prefix) : '';
         const suffix = o.suffix != null ? String(o.suffix) : '';
         const suffixBeforeExt = o.suffixBeforeExt !== false;
@@ -17195,9 +17798,13 @@ class FmBulkRenamePopup extends FmPopup {
         const sp = el.querySelector('.fm-br-c-step');
         const dig = el.querySelector('.fm-br-c-digits');
         const sep = el.querySelector('.fm-br-c-sep');
+        const rx = el.querySelector('.fm-br-regex');
+        const ic = el.querySelector('.fm-br-icase');
         return {
             find: find ? find.value : '',
             replace: replace ? replace.value : '',
+            regex: rx ? rx.checked : false,
+            ignoreCase: ic ? ic.checked : false,
             prefix: prefix ? prefix.value : '',
             suffix: suffix ? suffix.value : '',
             suffixBeforeExt: sb ? sb.checked : true,
@@ -17209,11 +17816,42 @@ class FmBulkRenamePopup extends FmPopup {
         };
     }
 
+    /**
+     * Compile Find as a global RegExp for regex / ignore-case mode (null for plain case-sensitive text).
+     * @param {Object} o - options from _readOpts
+     * @returns {{ re: RegExp|null, error: string }}
+     */
+    static _findRegex(o) {
+        const find = o.find != null ? String(o.find) : '';
+        if (find === '' || (!o.regex && !o.ignoreCase)) return { re: null, error: '' };
+        const source = o.regex ? find : find.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        try {
+            return { re: new RegExp(source, 'g' + (o.ignoreCase ? 'i' : '')), error: '' };
+        } catch (e) {
+            const msg = e && e.message ? String(e.message) : '';
+            return { re: null, error: /^invalid regular expression/i.test(msg) ? msg : 'Invalid regular expression' + (msg ? ': ' + msg : '') };
+        }
+    }
+
     _refreshPreview() {
         const esc = FmPopup.escapeHtml.bind(FmPopup);
         const tbody = this.el && this.el.querySelector('.fm-br-tbody');
         if (!tbody) return;
         const o = this._readOpts();
+        const compiled = FmBulkRenamePopup._findRegex(o);
+        o.findRe = compiled.re;
+        const reErrEl = this.el.querySelector('.fm-br-regex-err');
+        if (reErrEl) {
+            reErrEl.textContent = compiled.error;
+            reErrEl.style.display = compiled.error ? '' : 'none';
+        }
+        if (compiled.error) {
+            tbody.innerHTML = '';
+            this._previewHasError = true;
+            this._previewChangeCount = 0;
+            this._syncApplyButton();
+            return;
+        }
         const invalidRe = /[\\/:*?"<>|]/;
         let changeCount = 0;
         const seen = Object.create(null);
@@ -17308,6 +17946,8 @@ class FmBulkRenamePopup extends FmPopup {
             };
             setVal('.fm-br-find', d.find);
             setVal('.fm-br-replace', d.replace);
+            setChk('.fm-br-regex', d.regex);
+            setChk('.fm-br-icase', d.ignoreCase);
             setVal('.fm-br-prefix', d.prefix);
             setVal('.fm-br-suffix', d.suffix);
             setChk('.fm-br-suffix-before-ext', d.suffixBeforeExt);
@@ -17331,6 +17971,8 @@ class FmBulkRenamePopup extends FmPopup {
         };
         setVal('.fm-br-find', '');
         setVal('.fm-br-replace', '');
+        setChk('.fm-br-regex', false);
+        setChk('.fm-br-icase', false);
         setVal('.fm-br-prefix', '');
         setVal('.fm-br-suffix', '');
         setChk('.fm-br-suffix-before-ext', true);
@@ -17346,6 +17988,7 @@ class FmBulkRenamePopup extends FmPopup {
         this._refreshPreview();
         if (this._applyBusy || this._previewHasError || !this._previewChangeCount) return;
         const o = this._readOpts();
+        o.findRe = FmBulkRenamePopup._findRegex(o).re;
         const pairs = [];
         for (let i = 0; i < this._rows.length; i++) {
             const row = this._rows[i];
@@ -22996,6 +23639,8 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
     const curIps = Array.isArray(typeof fm_allowed_ips !== 'undefined' ? fm_allowed_ips : null)
         ? fm_allowed_ips.map((s) => String(s)) : [];
     const clientIp = typeof fm_client_ip === 'string' ? fm_client_ip : '';
+    const curTrash = typeof fm_trash_basename === 'string' && fm_trash_basename ? fm_trash_basename : '.trash';
+    const curTrashMode = curTrash === '.trash' ? 'default' : 'random';
     const parseIpText = (text) => {
         const seen = new Set();
         return String(text || '').split(/[\s,;]+/).map((s) => s.trim().toLowerCase())
@@ -23066,6 +23711,12 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
         '<textarea class="fm-input fm-cfg-ip-list cfg-ips" name="cfg-ips" rows="4" spellcheck="false" autocomplete="off" placeholder="Empty = allow everyone">' +
         FmPopup.escapeHtml(curIps.join('\n')) + '</textarea>' +
         '</fieldset>' +
+        '<fieldset class="fm-cfg-fieldset">' +
+        '<legend>Trash folder</legend>' +
+        '<p class="fm-cfg-server-desc">Current name: <code>' + FmPopup.escapeHtml(curTrash) + '</code>. A random name is harder to guess on servers that ignore <code>.htaccess</code> (nginx, IIS). The existing trash folder is renamed with the setting. Saved in this PHP file when changed.</p>' +
+        '<label class="fm-cfg-option"><input type="radio" name="cfg-trash-name" value="default" class="cfg-trash-name" ' + (curTrashMode === 'default' ? 'checked' : '') + '> <code>.trash</code> <span class="fm-cfg-perm-example">default</span></label>' +
+        '<label class="fm-cfg-option"><input type="radio" name="cfg-trash-name" value="random" class="cfg-trash-name" ' + (curTrashMode === 'random' ? 'checked' : '') + '> Random name <span class="fm-cfg-perm-example">e.g. .trash-3f9a1c2b7d4e</span></label>' +
+        '</fieldset>' +
         (authOn
             ? '<label class="fm-cfg-fileops-pass"><span>Password <span class="fm-cfg-hint">(required to change settings on this tab)</span></span><input class="fm-input" name="cfg-fileops-password" type="password" autocomplete="current-password"></label>'
             : '') +
@@ -23126,10 +23777,13 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
                 const nextOps = normalizeFileOpsModeUi(opsRadio ? opsRadio.value : curOps);
                 const nextIdle = idleSel ? parseInt(idleSel.value, 10) : curIdle;
                 const nextIps = ipsInp ? parseIpText(ipsInp.value) : curIps;
+                const trashRadio = p.querySelector('.cfg-trash-name:checked');
+                const nextTrashMode = trashRadio ? trashRadio.value : curTrashMode;
                 const opsChanged = nextOps !== curOps;
                 const idleChanged = nextIdle !== curIdle;
                 const ipsChanged = nextIps.join('\n') !== curIps.join('\n');
-                if (!opsChanged && !idleChanged && !ipsChanged) {
+                const trashChanged = nextTrashMode !== curTrashMode;
+                if (!opsChanged && !idleChanged && !ipsChanged && !trashChanged) {
                     p.hide();
                     fetchAndShowFolder(currentPath);
                     return;
@@ -23181,6 +23835,14 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
                         fields: { ips: nextIps.join('\n') },
                         errMsg: 'Could not update IP allowlist',
                         line: '$FM_ALLOWED_IPS = [' + nextIps.map((s) => '\'' + s + '\'').join(', ') + '];',
+                    });
+                }
+                if (trashChanged) {
+                    steps.push({
+                        action: 'set-trash-name',
+                        fields: { mode: nextTrashMode },
+                        errMsg: 'Could not change the trash folder name',
+                        line: '',
                     });
                 }
                 // Each step rewrites the PHP file, so they run one after another and stop at the first problem.
