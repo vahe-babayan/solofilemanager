@@ -8,7 +8,7 @@ declare(strict_types=1);
  */
 
 /** Product version (semver). Shown in UI / server info. */
-const SOLOFILEMANAGER_VERSION = '1.4.0';
+const SOLOFILEMANAGER_VERSION = '1.5.0';
 
 // Set max execution time to 1 day (86400 seconds)
 @set_time_limit(86400);
@@ -2858,24 +2858,42 @@ function getFilesAndFoldersList(string $path, string $rootDir, array $excludeNam
     if ($list === false) {
         return $result;
     }
+    // One lstat per entry (plus stat for links): large folders spend most of their time in these calls.
+    $isWin = PHP_OS_FAMILY === 'Windows';
+    $hideTrash = $excludeTrashFolder && !fmIsUnderTrashTree($folder, $rootDir);
     foreach ($list as $f) {
-        if (in_array($f, $excludeNames, true)) {
+        if ($f === '.' || $f === '..' || in_array($f, $excludeNames, true)) {
             continue;
         }
-        if ($excludeTrashFolder && $f === $tb && !fmIsUnderTrashTree($folder, $rootDir)) {
+        if ($hideTrash && $f === $tb) {
             continue;
         }
         if ($isRoot && $f === FM_UPLOAD_TMP_BASENAME) {
             continue;
         }
         $full = $folder . '/' . $f;
-        $perms = @fileperms($full);
-        $permissions = $perms !== false ? substr(sprintf('%o', $perms), -4) : '';
-        $mtime = @filemtime($full);
-        $mtime = $mtime !== false ? $mtime : null;
-        if (is_dir($full)) {
-            $result['folders'][$f] = ['permissions' => $permissions, 'mtime' => $mtime] + (fmLinkInfo($full, $rootDir) ?? []);
-        } elseif (is_file($full)) {
+        $ls = @lstat($full);
+        if ($ls === false) {
+            continue;
+        }
+        $isLink = ($ls['mode'] & 0170000) === 0120000;
+        $st = $ls;
+        if ($isLink || ($ls['mode'] & 0170000) === 0) {
+            // PHP on Windows reports a junction with mode 0 and caches that, so drop it before asking stat().
+            clearstatcache(true, $full);
+            $st = @stat($full);
+        }
+        if ($st === false) {
+            continue;
+        }
+        $kind = $st['mode'] & 0170000;
+        $permissions = substr(sprintf('%o', $st['mode']), -4);
+        $mtime = $st['mtime'];
+        if ($kind === 0040000) {
+            // Windows junctions are not always reported as links by lstat, so folders get the full check there.
+            $link = $isLink || $isWin ? fmLinkInfo($full, $rootDir) : null;
+            $result['folders'][$f] = ['permissions' => $permissions, 'mtime' => $mtime] + ($link ?? []);
+        } elseif ($kind === 0100000) {
             $shortcut = fmShortcutLinkInfo($full, $rootDir);
             if ($shortcut !== null && !empty($shortcut['link_target_is_dir'])) {
                 unset($shortcut['link_target_is_dir']);
@@ -2884,17 +2902,17 @@ function getFilesAndFoldersList(string $path, string $rootDir, array $excludeNam
                 unset($shortcut['link_target_is_dir']);
                 $result['files'][$f] = [
                     'ext' => 'lnk',
-                    'size' => @filesize($full) ?: 0,
+                    'size' => (int)$st['size'],
                     'permissions' => $permissions,
                     'mtime' => $mtime,
                 ] + $shortcut;
             } else {
                 $result['files'][$f] = [
                     'ext' => pathinfo($full, PATHINFO_EXTENSION),
-                    'size' => @filesize($full) ?: 0,
+                    'size' => (int)$st['size'],
                     'permissions' => $permissions,
                     'mtime' => $mtime,
-                ] + (fmLinkInfo($full, $rootDir) ?? []);
+                ] + (($isLink ? fmLinkInfo($full, $rootDir) : null) ?? []);
             }
         }
     }
@@ -3525,6 +3543,252 @@ function getFolderSize(string $path, string $rootDir): int {
         return 0;
     }
     return getFolderSizePhp($path, $rootDir);
+}
+
+/** Search stops after this many results or seconds (the client shows that the list is incomplete). */
+const FM_SEARCH_MAX_RESULTS = 5000;
+const FM_SEARCH_MAX_SECONDS = 120;
+
+/**
+ * Search criteria from the request.
+ *
+ * @return array{name: string, match: string, icase: bool, type: string, size_min: ?int, size_max: ?int, mtime_from: ?int, mtime_to: ?int, re: ?string, error?: string}
+ */
+function fmSearchCriteria(array $in): array {
+    $num = static function ($v): ?int {
+        $v = trim((string)$v);
+        return $v !== '' && ctype_digit($v) ? (int)$v : null;
+    };
+    $match = (string)($in['match'] ?? 'contains');
+    $type = (string)($in['type'] ?? 'any');
+    $c = [
+        'name'       => (string)($in['name'] ?? ''),
+        'match'      => in_array($match, ['contains', 'wildcard', 'regex'], true) ? $match : 'contains',
+        'icase'      => (string)($in['icase'] ?? '1') !== '0',
+        'type'       => in_array($type, ['any', 'file', 'folder'], true) ? $type : 'any',
+        'size_min'   => $num($in['size_min'] ?? ''),
+        'size_max'   => $num($in['size_max'] ?? ''),
+        'mtime_from' => $num($in['mtime_from'] ?? ''),
+        'mtime_to'   => $num($in['mtime_to'] ?? ''),
+        're'         => null,
+    ];
+    if (strlen($c['name']) > 500 || preg_match('/[\x00-\x1f]/', $c['name'])) {
+        return $c + ['error' => 'The name to find is too long or contains control characters.'];
+    }
+    if ($c['name'] !== '' && $c['match'] !== 'contains') {
+        $body = $c['match'] === 'regex' ? $c['name'] : '^' . fmSearchGlobToRegex($c['name']) . '$';
+        $re = "\x01" . $body . "\x01u" . ($c['icase'] ? 'i' : '');
+        if (@preg_match($re, '') === false) {
+            $err = error_get_last();
+            $msg = $err ? preg_replace('/^preg_match\(\):\s*/', '', (string)$err['message']) : 'invalid pattern';
+            return $c + ['error' => 'Invalid regular expression: ' . $msg];
+        }
+        $c['re'] = $re;
+    }
+    return $c;
+}
+
+/** Wildcard name (* = any text, ? = one character) as a regular expression body. */
+function fmSearchGlobToRegex(string $glob): string {
+    $out = '';
+    foreach (preg_split('//u', $glob, -1, PREG_SPLIT_NO_EMPTY) ?: str_split($glob) as $ch) {
+        $out .= $ch === '*' ? '.*' : ($ch === '?' ? '.' : preg_quote($ch, "\x01"));
+    }
+    return $out;
+}
+
+function fmSearchNameMatches(array $c, string $name): bool {
+    if ($c['name'] === '') {
+        return true;
+    }
+    if ($c['re'] !== null) {
+        return @preg_match($c['re'], $name) === 1;
+    }
+    if ($c['icase']) {
+        return function_exists('mb_stripos')
+            ? @mb_stripos($name, $c['name'], 0, 'UTF-8') !== false
+            : stripos($name, $c['name']) !== false;
+    }
+    return strpos($name, $c['name']) !== false;
+}
+
+/** Names the listing never shows: excluded names everywhere, Trash and unfinished uploads at the root. */
+function fmSearchSkipName(string $name, bool $atRoot, array $exclude, string $trashBasename): bool {
+    return in_array($name, $exclude, true)
+        || ($atRoot && ($name === $trashBasename || $name === FM_UPLOAD_TMP_BASENAME));
+}
+
+/**
+ * Result row for one candidate (same fields as a folder listing entry), or null when it does not match.
+ * Size filters apply to files only, so they leave folders out.
+ */
+function fmSearchEntry(array $c, string $full, string $rel, string $name, bool $isDir, string $rootDir): ?array {
+    if (($c['type'] === 'file' && $isDir) || ($c['type'] === 'folder' && !$isDir)) {
+        return null;
+    }
+    if ($isDir && ($c['size_min'] !== null || $c['size_max'] !== null)) {
+        return null;
+    }
+    if (!fmSearchNameMatches($c, $name)) {
+        return null;
+    }
+    $mtime = @filemtime($full);
+    $mtime = $mtime !== false ? $mtime : null;
+    if (($c['mtime_from'] !== null && ($mtime === null || $mtime < $c['mtime_from']))
+        || ($c['mtime_to'] !== null && ($mtime === null || $mtime > $c['mtime_to']))) {
+        return null;
+    }
+    $size = $isDir ? null : (int)(@filesize($full) ?: 0);
+    if (($c['size_min'] !== null && $size < $c['size_min']) || ($c['size_max'] !== null && $size > $c['size_max'])) {
+        return null;
+    }
+    $perms = @fileperms($full);
+    $row = [
+        'path'        => $rel,
+        'type'        => $isDir ? 'folder' : 'file',
+        'permissions' => $perms !== false ? substr(sprintf('%o', $perms), -4) : '',
+        'mtime'       => $mtime,
+    ];
+    if (!$isDir) {
+        $row['size'] = $size;
+        $row['ext'] = pathinfo($name, PATHINFO_EXTENSION);
+    }
+    return $row + (fmLinkInfo($full, $rootDir) ?? []);
+}
+
+/**
+ * PHP search below $baseDir. Links are listed but never followed.
+ * $emit gets each matching row and returns false to stop; $tick runs about every 0.3 s and returns false to stop.
+ */
+function fmSearchWalkPhp(string $baseDir, bool $atRoot, string $rootDir, array $c, array $exclude, callable $emit, callable $tick, int &$scanned): void {
+    $tb = fmTrashBasename();
+    $isWin = PHP_OS_FAMILY === 'Windows';
+    $stack = [[$baseDir, '']];
+    $next = microtime(true) + 0.3;
+    while ($stack) {
+        [$dir, $rel] = array_pop($stack);
+        $list = @scandir($dir);
+        if ($list === false) {
+            continue;
+        }
+        foreach ($list as $e) {
+            if ($e === '.' || $e === '..' || fmSearchSkipName($e, $atRoot && $rel === '', $exclude, $tb)) {
+                continue;
+            }
+            $full = $dir . '/' . $e;
+            $r = $rel === '' ? $e : $rel . '/' . $e;
+            $scanned++;
+            $isDir = is_dir($full);
+            $row = fmSearchEntry($c, $full, $r, $e, $isDir, $rootDir);
+            if ($row !== null && !$emit($row)) {
+                return;
+            }
+            if ($isDir && !is_link($full) && !($isWin && fmIsLinkPath($full))) {
+                $stack[] = [$full, $r];
+            }
+            if (microtime(true) >= $next) {
+                if (!$tick()) {
+                    return;
+                }
+                $next = microtime(true) + 0.3;
+            }
+        }
+    }
+}
+
+/**
+ * find(1) arguments: prune Trash and unfinished uploads at the root, pre-filter by name when find matches
+ * the same names (PHP checks every candidate again, so both engines return the same results).
+ *
+ * @return string[]
+ */
+function fmSearchFindArgv(string $baseDir, bool $atRoot, array $c): array {
+    $glob = static fn(string $s): string => addcslashes($s, '\\*?[]');
+    $argv = ['find', $baseDir, '-mindepth', '1'];
+    if ($atRoot) {
+        $b = $glob(rtrim($baseDir, '/'));
+        array_push($argv, '(', '-path', $b . '/' . $glob(fmTrashBasename()), '-o', '-path', $b . '/' . FM_UPLOAD_TMP_BASENAME, ')', '-prune', '-o');
+    }
+    // find's case folding depends on the locale, so ignore-case pre-filtering is limited to ASCII names.
+    $name = $c['name'];
+    if ($name !== '' && $c['match'] !== 'regex' && (!$c['icase'] || !preg_match('/[\x80-\xff]/', $name))) {
+        $pattern = $c['match'] === 'contains' ? '*' . $glob($name) . '*' : addcslashes($name, '\\[]');
+        array_push($argv, $c['icase'] ? '-iname' : '-name', $pattern);
+    }
+    $argv[] = '-print0';
+    return $argv;
+}
+
+/**
+ * Run find(1) and pass each found path to $onPath (returns false to stop); $tick as in fmSearchWalkPhp.
+ * Returns false when find could not run, so the caller may fall back to PHP.
+ */
+function fmSearchRunFind(array $argv, callable $onPath, callable $tick): bool {
+    $spec = [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['file', '/dev/null', 'w']];
+    $cmd = PHP_VERSION_ID >= 70400 ? $argv : implode(' ', array_map('escapeshellarg', $argv));
+    $proc = @proc_open($cmd, $spec, $pipes);
+    if (!is_resource($proc)) {
+        return false;
+    }
+    stream_set_blocking($pipes[1], false);
+    $buf = '';
+    $got = false;
+    $stopped = false;
+    $next = microtime(true) + 0.3;
+    while (true) {
+        $r = [$pipes[1]];
+        $w = null;
+        $x = null;
+        $ready = @stream_select($r, $w, $x, 0, 300000);
+        if ($ready === false) {
+            break;
+        }
+        if ($ready > 0) {
+            $chunk = fread($pipes[1], 65536);
+            if ($chunk === false || $chunk === '') {
+                if (feof($pipes[1])) {
+                    break;
+                }
+            } else {
+                $got = true;
+                $parts = explode("\0", $buf . $chunk);
+                $buf = (string)array_pop($parts);
+                foreach ($parts as $p) {
+                    if ($p !== '' && !$onPath($p)) {
+                        $stopped = true;
+                        break 2;
+                    }
+                }
+            }
+        }
+        if (microtime(true) >= $next) {
+            if (!$tick()) {
+                $stopped = true;
+                break;
+            }
+            $next = microtime(true) + 0.3;
+        }
+    }
+    fclose($pipes[1]);
+    if ($stopped) {
+        @proc_terminate($proc);
+    }
+    $rc = proc_close($proc);
+    return $stopped || $got || ($rc !== 126 && $rc !== 127);
+}
+
+/**
+ * Item name from names[]: a plain name or, for search results, a relative path below the request folder
+ * ("a/b.txt"). Every segment must be a valid name; callers still check the full path with pathInsideRoot().
+ */
+function fmRequestItemName($raw): ?string {
+    $parts = explode('/', (string)$raw);
+    foreach ($parts as $p) {
+        if ($p === '' || $p === '.' || $p === '..' || preg_match('/[\\\\:*?"<>|]/', $p)) {
+            return null;
+        }
+    }
+    return implode('/', $parts);
 }
 
 /**
@@ -4598,11 +4862,8 @@ function fmDownloadArchiveHandlePost(string $rootDir, bool $isUnixLikeShell, boo
 
     $names = [];
     foreach ((array)$_POST['names'] as $n) {
-        $n = basename((string)$n);
-        if ($n === '' || $n === '.' || $n === '..') {
-            continue;
-        }
-        if (preg_match('/[\\\\\/:*?"<>|]/', $n)) {
+        $n = fmRequestItemName($n);
+        if ($n === null) {
             continue;
         }
         $full = $dir . '/' . $n;
@@ -6235,9 +6496,8 @@ if (isset($_POST['action']) && $_POST['action'] === 'get-files-and-folders-count
     $totalFiles = 0;
     $totalFolders = 0;
     foreach ($_POST['names'] as $name) {
-        $name = basename((string)$name);
-        if ($name === '' || $name === '.' || $name === '..') continue;
-        if (preg_match('/[\\\\\/:*?"<>|]/', $name)) continue;
+        $name = fmRequestItemName($name);
+        if ($name === null) continue;
         $fullPath = $dir . '/' . $name;
         $counts = countPathFiles($fullPath, $ROOT_DIR);
         $totalFiles   += $counts['files'];
@@ -6274,17 +6534,18 @@ if (isset($_POST['action']) && $_POST['action'] === 'copy-move-stream' && isset(
 
     $names = [];
     foreach ($_POST['names'] as $n) {
-        $n = basename((string)$n);
-        if ($n === '' || $n === '.' || $n === '..') {
-            continue;
-        }
-        if (preg_match('/[\\\\\/:*?"<>|]/', $n)) {
+        $n = fmRequestItemName($n);
+        if ($n === null) {
             continue;
         }
         $names[] = $n;
     }
     if (count($names) === 0) {
         jsonOut(['status' => 'error', 'msg' => 'Nothing to copy or move']);
+    }
+    $destNames = array_map('basename', $names);
+    if (count(array_unique($destNames)) !== count($destNames)) {
+        jsonOut(['status' => 'error', 'msg' => 'Two selected items have the same name, so they cannot go into one folder.']);
     }
 
     while (ob_get_level()) {
@@ -6362,7 +6623,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'copy-move-stream' && isset(
 
     foreach ($names as $name) {
         $srcPath = $srcDir . '/' . $name;
-        $dstPath = $destDir . '/' . $name;
+        $dstPath = $destDir . '/' . basename($name);
         if (!pathInsideRoot($srcPath, $ROOT_DIR) || !file_exists($srcPath)) {
             $sendError('Source not found: ' . $name);
         }
@@ -6846,6 +7107,128 @@ if (isset($_POST['action']) && $_POST['action'] === 'chmod' && isset($_POST['in'
     ]);
 }
 
+if (isset($_POST['action']) && $_POST['action'] === 'search') {
+    $dirIn = (string)($_POST['in'] ?? '');
+    $baseDir = safeRealpath($dirIn !== '' ? $ROOT_DIR . '/' . trim($dirIn, '/') : $ROOT_DIR);
+    if (!pathInsideRoot($baseDir, $ROOT_DIR) || !is_dir($baseDir)) {
+        jsonOut(['status' => 'error', 'msg' => 'This folder does not exist or is outside the file manager root.']);
+    }
+    if (fmIsUnderTrashTree($baseDir, $ROOT_DIR)) {
+        jsonOut(['status' => 'error', 'msg' => 'Search is not available in Trash.']);
+    }
+    $crit = fmSearchCriteria($_POST);
+    if (isset($crit['error'])) {
+        jsonOut(['status' => 'error', 'msg' => $crit['error']]);
+    }
+    // Windows has no find(1); there PHP always walks the folders.
+    $useFind = PHP_OS_FAMILY !== 'Windows' && fmFileOpsTryShell() && fmIsProcOpenAvailable();
+    if (!$useFind && PHP_OS_FAMILY !== 'Windows' && !fmFileOpsAllowPhpFallback()) {
+        jsonOut(['status' => 'error', 'msg' => 'File ops mode is OS-only but exec() / proc_open() is disabled. Set $FM_FILE_OPS_MODE to "auto" or "php".']);
+    }
+
+    ignore_user_abort(true);
+    while (ob_get_level()) {
+        @ob_end_flush();
+    }
+    header('Content-Type: application/x-ndjson');
+    header('Cache-Control: no-cache');
+    header('X-Accel-Buffering: no');
+    fm_ob_implicit_flush_enable();
+    $send = static function (array $payload): void {
+        echo json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE) . "\n";
+        if (ob_get_level()) {
+            ob_flush();
+        }
+        flush();
+    };
+
+    $exclude = array_merge($EXCLUDE_NAMES, [$thisFileName]);
+    $atRoot = fmIsRootFolder($baseDir, $ROOT_DIR);
+    $started = microtime(true);
+    $batch = [];
+    $count = 0;
+    $scanned = 0;
+    $reason = null;
+    $flushBatch = static function () use (&$batch, $send): void {
+        if ($batch) {
+            $send(['items' => $batch]);
+            $batch = [];
+        }
+    };
+    $emit = static function (array $row) use (&$batch, &$count, &$reason, $flushBatch): bool {
+        $batch[] = $row;
+        $count++;
+        if (count($batch) >= 200) {
+            $flushBatch();
+        }
+        if ($count >= FM_SEARCH_MAX_RESULTS) {
+            $reason = 'limit';
+            return false;
+        }
+        return true;
+    };
+    $tick = static function () use (&$scanned, &$reason, $started, $send, $flushBatch): bool {
+        $flushBatch();
+        $send(['scanned' => $scanned]);
+        if (connection_aborted()) {
+            $reason = 'aborted';
+            return false;
+        }
+        if (microtime(true) - $started > FM_SEARCH_MAX_SECONDS) {
+            $reason = 'time';
+            return false;
+        }
+        return true;
+    };
+
+    $engine = $useFind ? 'find' : 'php';
+    $send(['start' => true, 'engine' => $engine]);
+    $ranFind = false;
+    if ($useFind) {
+        $tb = fmTrashBasename();
+        $prefix = rtrim($baseDir, '/') . '/';
+        $onPath = static function (string $p) use ($prefix, $atRoot, $exclude, $tb, $crit, $ROOT_DIR, &$scanned, $emit): bool {
+            if (strpos($p, $prefix) !== 0) {
+                return true;
+            }
+            $rel = substr($p, strlen($prefix));
+            $segs = explode('/', $rel);
+            foreach ($segs as $i => $seg) {
+                if ($seg === '' || fmSearchSkipName($seg, $atRoot && $i === 0, $exclude, $tb)) {
+                    return true;
+                }
+            }
+            $scanned++;
+            $row = fmSearchEntry($crit, $p, $rel, (string)end($segs), is_dir($p), $ROOT_DIR);
+            return $row === null || $emit($row);
+        };
+        $ranFind = fmSearchRunFind(fmSearchFindArgv($baseDir, $atRoot, $crit), $onPath, $tick);
+        if (!$ranFind) {
+            if (!fmFileOpsAllowPhpFallback()) {
+                $send(['error' => 'find could not run on this server (OS-only file ops mode).']);
+                $send(['done' => true, 'count' => 0, 'engine' => 'find']);
+                exit;
+            }
+            $engine = 'php';
+            $send(['fallback' => 'php']);
+        }
+    }
+    if (!$ranFind) {
+        fmSearchWalkPhp($baseDir, $atRoot, $ROOT_DIR, $crit, $exclude, $emit, $tick, $scanned);
+    }
+    $flushBatch();
+    $send([
+        'done'      => true,
+        'count'     => $count,
+        'scanned'   => $scanned,
+        'truncated' => $reason === 'limit' || $reason === 'time',
+        'reason'    => $reason,
+        'engine'    => $engine,
+        'seconds'   => round(microtime(true) - $started, 2),
+    ]);
+    exit;
+}
+
 if (isset($_POST['action']) && $_POST['action'] === 'trash-move' && isset($_POST['in']) && isset($_POST['names']) && is_array($_POST['names'])) {
     $dirIn = (string)$_POST['in'];
     $dir   = $dirIn !== '' ? $ROOT_DIR . '/' . trim($dirIn, '/') : $ROOT_DIR;
@@ -6859,13 +7242,10 @@ if (isset($_POST['action']) && $_POST['action'] === 'trash-move' && isset($_POST
     $relDir = fmRelFromRoot($dir, $ROOT_DIR);
     $errors = [];
     $ok     = [];
-    foreach ($_POST['names'] as $name) {
-        $name = basename((string)$name);
-        if ($name === '' || $name === '.' || $name === '..') {
-            continue;
-        }
-        if (preg_match('/[\\\\\/:*?"<>|]/', $name)) {
-            $errors[] = $name . ': invalid name';
+    foreach ($_POST['names'] as $raw) {
+        $name = fmRequestItemName($raw);
+        if ($name === null) {
+            $errors[] = basename((string)$raw) . ': invalid name';
             continue;
         }
         $src = $dir . '/' . $name;
@@ -6990,9 +7370,8 @@ if (isset($_POST['action']) && $_POST['action'] === 'delete-stream' && isset($_P
     }
     $names = [];
     foreach ($_POST['names'] as $name) {
-        $name = basename((string)$name);
-        if ($name === '' || $name === '.' || $name === '..') continue;
-        if (preg_match('/[\\\\\/:*?"<>|]/', $name)) continue;
+        $name = fmRequestItemName($name);
+        if ($name === null) continue;
         $fullPath = $dir . '/' . $name;
         if (pathInsideRoot($fullPath, $ROOT_DIR) && file_exists($fullPath)) {
             $names[] = $fullPath;
@@ -9210,22 +9589,6 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     font-size: 0.8125rem;
 }
 
-.fm-bulk-rename-popup .fm-br-find-opts {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0 1rem;
-}
-
-.fm-bulk-rename-popup .fm-br-opt-hint {
-    color: var(--muted-text, #6c757d);
-    font-size: 0.75rem;
-}
-
-.fm-bulk-rename-popup .fm-br-regex-err {
-    margin: 0.2rem 0;
-    font-size: 0.8125rem;
-}
-
 .fm-bulk-rename-popup .fm-br-counter-row {
     display: flex;
     flex-wrap: wrap;
@@ -10633,6 +10996,195 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
 .fm-breadcrumb-bar .fm-trash-cleanup-hint {
     margin: 0;
     padding: 0 2px;
+}
+
+.fm-search-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px 12px;
+    padding: 0 2px;
+}
+
+.fm-search-summary {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    margin: 0;
+    font-size: 12px;
+    line-height: 1.4;
+}
+
+.fm-search-criteria {
+    color: #666;
+    overflow-wrap: anywhere;
+}
+
+.fm-search-status {
+    color: #333;
+    font-weight: 600;
+}
+
+.fm-search-status--warn {
+    color: #9a6700;
+}
+
+.fm-search-status--error {
+    color: #c0392b;
+}
+
+.fm-search-bar-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.fm-search-bar-btn {
+    padding: 3px 10px;
+    border: 1px solid rgba(0, 0, 0, .15);
+    border-radius: 6px;
+    background: #fff;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.fm-search-bar-btn:hover,
+.fm-search-back-btn:hover {
+    border-color: var(--main-color);
+    color: var(--main-color);
+}
+
+.fm-pager {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 16px;
+    padding: 10px 4px;
+    font-size: 12px;
+    color: #444;
+}
+
+.fm-pager-nav {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.fm-pager-btn {
+    width: 28px;
+    height: 26px;
+    border: 1px solid rgba(0, 0, 0, .15);
+    border-radius: 6px;
+    background: #fff;
+    cursor: pointer;
+}
+
+.fm-pager-btn:hover:not(:disabled) {
+    border-color: var(--main-color);
+    color: var(--main-color);
+}
+
+.fm-pager-btn:disabled {
+    opacity: .4;
+    cursor: default;
+}
+
+.fm-pager-page {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin: 0 4px;
+}
+
+.fm-pager-input {
+    width: 64px;
+    padding: 3px 6px;
+    border: 1px solid #dee2e6;
+    border-radius: 5px;
+    font-size: 12px;
+}
+
+.fm-pager-select-note {
+    color: #666;
+}
+
+.fm-pager-link {
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--main-color);
+    font-size: 12px;
+    text-decoration: underline;
+    cursor: pointer;
+}
+
+.fm-search-back-btn {
+    flex-shrink: 0;
+    margin-left: 4px;
+    padding: 3px 10px;
+    border: 1px solid rgba(0, 0, 0, .15);
+    border-radius: 6px;
+    background: #fff;
+    font-size: 12px;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.fm-find-popup .fm-find-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 16px;
+    margin: 8px 0 4px;
+}
+
+.fm-find-popup select,
+.fm-find-popup input[type=number],
+.fm-find-popup input[type=date] {
+    padding: 6px;
+    border: 1px solid #dee2e6;
+    border-radius: 5px;
+    background: #fff;
+    font-size: 13px;
+}
+
+.fm-find-popup .fm-find-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    cursor: pointer;
+}
+
+.fm-find-popup .fm-find-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px 16px;
+    margin-top: 10px;
+}
+
+.fm-find-popup .fm-find-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 13px;
+}
+
+.fm-find-popup .fm-find-size {
+    display: flex;
+    gap: 6px;
+}
+
+.fm-find-popup .fm-find-size input {
+    flex: 1;
+    min-width: 0;
+}
+
+.fm-find-popup .fm-find-note {
+    margin: 10px 0 0;
+    font-size: 12px;
 }
 
 .fm-table-empty-actions {
@@ -12380,7 +12932,7 @@ function fmShowTerminalSettingsPopup(opts) {
                                 return;
                             }
                             if (data.saved) {
-                                p.hide();
+                                p.hideAndDestroy();
                                 if (typeof opts.onSaved === 'function') {
                                     opts.onSaved(data);
                                 } else {
@@ -12669,6 +13221,137 @@ class FmDownloadTracker {
  *     onSuccess:   (name) => { ... }
  *   }).show();
  */
+/**
+ * Find dialog: name (text / wildcard / regular expression), type, size and modified date.
+ * onSubmit(form, post) gets the dialog values and the request fields for action=search.
+ */
+class FmSearchPopup extends FmPopup {
+    static UNITS = { B: 1, KB: 1024, MB: 1048576, GB: 1073741824 };
+
+    /**
+     * @param {Object} options
+     * @param {string} options.whereLabel - Folder searched, relative to the root ("/docs")
+     * @param {Object|null} [options.initial] - Previous dialog values
+     * @param {(form: Object, post: Object<string, string>) => void} options.onSubmit
+     */
+    constructor(options = {}) {
+        const { whereLabel, initial, onSubmit, ...rest } = options;
+        const f = Object.assign({
+            name: '', match: 'contains', icase: true, type: 'any',
+            sizeMin: '', sizeMinUnit: 'MB', sizeMax: '', sizeMaxUnit: 'MB', dateFrom: '', dateTo: '',
+        }, initial || {});
+        const esc = FmPopup.escapeHtml;
+        const attr = FmPopup.escapeAttr;
+        const opt = (v, label, cur) => `<option value="${v}"${v === cur ? ' selected' : ''}>${label}</option>`;
+        const units = (cur) => Object.keys(FmSearchPopup.UNITS).map((u) => opt(u, u, cur)).join('');
+        super({
+            title: 'Find',
+            className: 'fm-find-popup',
+            maxWidth: '560px',
+            content:
+                '<p class="fm-hint mt-0">In <strong>' + esc(whereLabel) + '</strong> and all its subfolders. Links to other folders are listed but not searched.</p>' +
+                '<label><span>Name</span><input type="text" name="fm-find-name" class="fm-input fm-input-focus-on-open" autocomplete="off" ' +
+                'placeholder="Leave empty to find everything" value="' + attr(f.name) + '"></label>' +
+                '<div class="fm-find-row">' +
+                '<select class="fm-find-match" aria-label="How to match the name">' +
+                opt('contains', 'Name contains the text', f.match) +
+                opt('wildcard', 'Wildcard: * any text, ? one character', f.match) +
+                opt('regex', 'Regular expression', f.match) +
+                '</select>' +
+                '<label class="fm-find-check"><input type="checkbox" class="fm-find-icase"' + (f.icase ? ' checked' : '') + '> Ignore case</label>' +
+                '</div>' +
+                '<div class="fm-find-grid">' +
+                '<label class="fm-find-field"><span>Type</span><select class="fm-find-type">' +
+                opt('any', 'Files and folders', f.type) + opt('file', 'Files only', f.type) + opt('folder', 'Folders only', f.type) +
+                '</select></label><span></span>' +
+                '<label class="fm-find-field"><span>Size from</span><span class="fm-find-size">' +
+                '<input type="number" min="0" step="any" class="fm-find-size-min" value="' + attr(f.sizeMin) + '">' +
+                '<select class="fm-find-size-min-unit" aria-label="Unit">' + units(f.sizeMinUnit) + '</select></span></label>' +
+                '<label class="fm-find-field"><span>Size up to</span><span class="fm-find-size">' +
+                '<input type="number" min="0" step="any" class="fm-find-size-max" value="' + attr(f.sizeMax) + '">' +
+                '<select class="fm-find-size-max-unit" aria-label="Unit">' + units(f.sizeMaxUnit) + '</select></span></label>' +
+                '<label class="fm-find-field"><span>Modified from</span><input type="date" class="fm-find-date-from" value="' + attr(f.dateFrom) + '"></label>' +
+                '<label class="fm-find-field"><span>Modified until</span><input type="date" class="fm-find-date-to" value="' + attr(f.dateTo) + '"></label>' +
+                '</div>' +
+                '<p class="fm-hint fm-find-note">A size limit leaves folders out. The search stops after 5,000 results.</p>' +
+                '<p class="fm-error" data-err style="display:none"></p>',
+            buttons: [
+                { label: 'Cancel', close: true },
+                { label: 'Search', primary: true, close: false, onClick: () => this._submit() },
+            ],
+            submitOnEnter: true,
+            ...rest,
+        });
+        this._onSubmit = onSubmit || null;
+    }
+
+    _submit() {
+        const q = (sel) => this.querySelector(sel);
+        const err = q('[data-err]');
+        const fail = (msg) => {
+            if (err) {
+                err.textContent = msg;
+                err.style.display = 'block';
+            }
+        };
+        if (err) err.style.display = 'none';
+        const f = {
+            name:        q('[name="fm-find-name"]').value.trim(),
+            match:       q('.fm-find-match').value,
+            icase:       q('.fm-find-icase').checked,
+            type:        q('.fm-find-type').value,
+            sizeMin:     q('.fm-find-size-min').value.trim(),
+            sizeMinUnit: q('.fm-find-size-min-unit').value,
+            sizeMax:     q('.fm-find-size-max').value.trim(),
+            sizeMaxUnit: q('.fm-find-size-max-unit').value,
+            dateFrom:    q('.fm-find-date-from').value,
+            dateTo:      q('.fm-find-date-to').value,
+        };
+        if (f.match === 'regex' && f.name) {
+            try {
+                new RegExp(f.name, f.icase ? 'i' : '');
+            } catch (e) {
+                fail('Invalid regular expression: ' + (e && e.message ? String(e.message).replace(/^Invalid regular expression:\s*/i, '') : ''));
+                return;
+            }
+        }
+        const bytes = (v, unit) => {
+            if (v === '') return '';
+            const n = Number(v);
+            return Number.isFinite(n) && n >= 0 ? String(Math.round(n * FmSearchPopup.UNITS[unit])) : null;
+        };
+        const sizeMin = bytes(f.sizeMin, f.sizeMinUnit);
+        const sizeMax = bytes(f.sizeMax, f.sizeMaxUnit);
+        if (sizeMin === null || sizeMax === null) {
+            fail('Enter sizes as positive numbers.');
+            return;
+        }
+        if (sizeMin !== '' && sizeMax !== '' && Number(sizeMin) > Number(sizeMax)) {
+            fail('“Size from” is larger than “Size up to”.');
+            return;
+        }
+        // Dates are whole days in the browser's time zone.
+        const day = (v, endOfDay) => {
+            if (!v) return '';
+            const [y, m, d] = v.split('-').map(Number);
+            const t = endOfDay ? new Date(y, m - 1, d, 23, 59, 59) : new Date(y, m - 1, d, 0, 0, 0);
+            return Number.isNaN(t.getTime()) ? '' : String(Math.floor(t.getTime() / 1000));
+        };
+        const from = day(f.dateFrom, false);
+        const until = day(f.dateTo, true);
+        if (from !== '' && until !== '' && Number(from) > Number(until)) {
+            fail('“Modified from” is after “Modified until”.');
+            return;
+        }
+        const post = {
+            name: f.name, match: f.match, icase: f.icase ? '1' : '0', type: f.type,
+            size_min: sizeMin, size_max: sizeMax, mtime_from: from, mtime_to: until,
+        };
+        this.hideAndDestroy();
+        if (this._onSubmit) this._onSubmit(f, post);
+    }
+}
+
 class FmCreateNewFolderPopup extends FmPopup {
     /**
      * @param {Object} options
@@ -19579,6 +20262,7 @@ class FmFileManagerTable extends FmTable {
         { id: 'compress',          icon: 'bi-arrows-collapse',     title: 'Archive',           needSelection: true,  separatorBefore: true },
         { id: 'extract',           icon: 'bi-arrows-expand',       title: 'Extract',           needSelection: true,  requiresArchive: true },
         { id: 'refresh',           icon: 'bi-arrow-clockwise',     title: 'Refresh',           needSelection: false, separatorBefore: true },
+        { id: 'find',              icon: 'bi-search',              title: 'Find',              needSelection: false },
         { id: 'upload',            icon: 'bi-upload',              title: 'Upload',            needSelection: false, separatorBefore: true },
         { id: 'download',          icon: 'bi-download',            title: FM_DOWNLOAD_ACTION_TITLE, needSelection: true },
         { id: 'open-in-new-tab',   icon: 'bi-box-arrow-up-right',  title: 'Open in new tab',       needSelection: true, singleOnly: true },
@@ -19617,6 +20301,8 @@ class FmFileManagerTable extends FmTable {
         'extract':           'Ctrl + Alt + E',
         'open':              'Enter',
         'refresh':           'F5',
+        'find':              'Ctrl + Alt + S',
+        'close-search':      'Backspace',
     };
 
     /**
@@ -19625,6 +20311,22 @@ class FmFileManagerTable extends FmTable {
      */
     static TRASH_VIEW_ACTIONS = new Set([
         'refresh', 'delete', 'restore-trashed', 'empty-trash', 'select-none', 'invert-selection',
+    ]);
+
+    /**
+     * Action ids allowed in the search results view (items may come from different folders).
+     * @type {Set<string>}
+     */
+    static SEARCH_VIEW_ACTIONS = new Set([
+        'find', 'refresh', 'close-search', 'open', 'open-location', 'open-in-new-tab', 'download',
+        'copy', 'move', 'delete', 'copy-path', 'copy-relative-path', 'get-info', 'select-none', 'invert-selection',
+    ]);
+
+    /** Actions that may change files: kept search results are searched again when shown after one of them. */
+    static SEARCH_DIRTY_ACTIONS = new Set([
+        'create-new-folder', 'create-new-file', 'delete', 'restore-trashed', 'empty-trash', 'copy', 'move',
+        'duplicate', 'new-folder-from-selection', 'rename', 'bulk-rename', 'change-permissions', 'compress',
+        'extract', 'upload', 'terminal-here',
     ]);
 
     /**
@@ -19655,7 +20357,9 @@ class FmFileManagerTable extends FmTable {
             rows: [
                 ['Shift + F10', 'Open context menu for focused row'],
                 ['F2', 'Rename selected item'],
-                ['F5', 'Refresh the current folder'],
+                ['F5', 'Refresh the current folder (in search results: search again)'],
+                ['Ctrl + Alt + S', 'Find files and folders in this folder and its subfolders'],
+                ['Backspace', 'In search results: back to the folder'],
                 ['Alt + Enter', 'Get info for selected item'],
             ],
         },
@@ -19917,6 +20621,7 @@ class FmFileManagerTable extends FmTable {
         this._rootDir     = options.rootDir;
         this._currentPath = options.rootDir;
         this._onNavigate  = options.onNavigate || null;
+        this._onShowPath  = options.onShowPath || null;
         this._onTrashCount = options.onTrashCount || null;
         this._data        = null;
 
@@ -19958,6 +20663,9 @@ class FmFileManagerTable extends FmTable {
             ? options.permissionsDisplay
             : 'octal';
         this.options.showImagePreviews = options.showImagePreviews === true;
+        this.options.pageUpDownStep = options.pageUpDownStep != null ? options.pageUpDownStep : null;
+        this.options.listPageSize = options.listPageSize != null ? options.listPageSize : 100;
+        this._page = 0;
 
         this._initKeyboardShortcuts();
         this._initDragAndDrop();
@@ -20039,6 +20747,7 @@ class FmFileManagerTable extends FmTable {
     _dndAllowed() {
         if (this._invalidFolderMessage) return false;
         if (this._pathIsInTrash(this._currentPath)) return false;
+        if (this._inSearchView()) return false;
         return true;
     }
 
@@ -20165,6 +20874,7 @@ class FmFileManagerTable extends FmTable {
      * @param {DataTransfer|null} [dataTransfer]
      */
     _executeDnDDropToPath(destAbs, copyModifier, dataTransfer) {
+        if (this._parkedSearch) this._parkedSearch.dirty = true;
         let payload = this._dndDragPayload;
         if (!payload && dataTransfer) {
             try {
@@ -20260,6 +20970,11 @@ class FmFileManagerTable extends FmTable {
         return this._pathIsInTrash(this._currentPath);
     }
 
+    /** Whether the main list currently shows search results (row names are paths below the searched folder). */
+    _inSearchView() {
+        return !!this._search;
+    }
+
     _rowPhysicalPath(row) {
         if (!row || !row.name) return null;
         if (this._inTrashView()) {
@@ -20332,10 +21047,26 @@ class FmFileManagerTable extends FmTable {
                 { ...byId['refresh'], separatorBefore: true },
             ].map(withShortcut);
         }
+        if (this._inSearchView()) {
+            const byId = Object.fromEntries(FmFileManagerTable.ACTIONS.map((x) => [x.id, x]));
+            return [
+                { ...byId['find'], title: 'New search', separatorBefore: false },
+                { ...byId['refresh'], title: 'Search again', separatorBefore: false },
+                { id: 'close-search', icon: 'bi-x-lg', title: 'Close search results', needSelection: false },
+                { id: 'open-location', icon: 'bi-folder-symlink', title: 'Open containing folder', needSelection: true, singleOnly: true, separatorBefore: true },
+                { ...byId['download'] },
+                { ...byId['copy'], separatorBefore: true },
+                { ...byId['move'] },
+                { ...byId['delete'], separatorBefore: true },
+                { ...byId['copy-path'], separatorBefore: true },
+                { ...byId['copy-relative-path'] },
+                { ...byId['get-info'] },
+            ].map(withShortcut);
+        }
         const allowed = new Set([
             "create-new-folder", "create-new-file", "rename", "delete", "copy", "move", "duplicate", "new-folder-from-selection",
             "copy-path", "copy-relative-path",
-            "get-info", "bulk-rename", "change-permissions", "compress", "extract", "refresh", "download", "open-in-new-tab", "terminal-here", "upload",
+            "get-info", "bulk-rename", "change-permissions", "compress", "extract", "refresh", "find", "download", "open-in-new-tab", "terminal-here", "upload",
         ]);
         return FmFileManagerTable.ACTIONS.filter((a) => allowed.has(a.id)).map(withShortcut);
     }
@@ -20363,6 +21094,7 @@ class FmFileManagerTable extends FmTable {
         });
 
         super.updateActionsState();
+        this._updatePagerSelectionNote();
         const selected   = this.getSelectedRows();
         const dupBtn = toolbar.querySelector('[data-action="duplicate"]');
         if (dupBtn) {
@@ -20474,6 +21206,11 @@ class FmFileManagerTable extends FmTable {
      */
     _navigateFolder(path, opts = {}) {
         if (!this._onNavigate) return;
+        // The URL does not change for the searched folder itself, so leave the results directly.
+        if (this._inSearchView() && norm(path) === norm(this._currentPath)) {
+            this.exitSearch();
+            return;
+        }
         const { skipHistory = false, skipRestoreChild = false } = opts;
         if (norm(path) !== norm(this._currentPath)) {
             if (!skipRestoreChild) {
@@ -20484,10 +21221,18 @@ class FmFileManagerTable extends FmTable {
             }
         }
         if (!skipHistory && norm(path) !== norm(this._currentPath)) {
-            this._navBackStack.push(this._currentPath);
+            this._navBackStack.push(this._historyEntryForCurrent());
             this._navForwardStack = [];
         }
         this._onNavigate(path);
+    }
+
+    /** History entry for the search results: Back shows them again from memory instead of searching again. */
+    static SEARCH_HISTORY_ENTRY = '\u0000search-results';
+
+    /** @returns {string} */
+    _historyEntryForCurrent() {
+        return this._inSearchView() ? FmFileManagerTable.SEARCH_HISTORY_ENTRY : this._currentPath;
     }
 
     /**
@@ -20496,9 +21241,20 @@ class FmFileManagerTable extends FmTable {
      * @returns {void}
      */
     _navigateFolderBack() {
+        if (this._inSearchView()) {
+            this.exitSearch();
+            return;
+        }
         if (!this._onNavigate || this._navBackStack.length === 0) return;
         const prev = this._navBackStack.pop();
         this._navForwardStack.push(this._currentPath);
+        if (prev === FmFileManagerTable.SEARCH_HISTORY_ENTRY) {
+            if (!this.restoreParkedSearch()) {
+                this._navForwardStack.pop();
+                this._navigateFolderBack();
+            }
+            return;
+        }
         this._navigateFolder(prev, { skipHistory: true });
     }
 
@@ -20510,7 +21266,7 @@ class FmFileManagerTable extends FmTable {
     _navigateFolderForward() {
         if (!this._onNavigate || this._navForwardStack.length === 0) return;
         const next = this._navForwardStack.pop();
-        this._navBackStack.push(this._currentPath);
+        this._navBackStack.push(this._historyEntryForCurrent());
         this._navigateFolder(next, { skipHistory: true });
     }
 
@@ -20570,7 +21326,7 @@ class FmFileManagerTable extends FmTable {
      */
     _breadcrumbCrumbHtml(cr) {
         const cur = norm(this._currentPath);
-        if (norm(cr.path) === cur) {
+        if (norm(cr.path) === cur && !this._inSearchView()) {
             return `<span class="fm-breadcrumb-crumb fm-breadcrumb-crumb--current" aria-current="page">${this.escapeHtml(cr.label)}</span>`;
         }
         return `<button type="button" class="fm-breadcrumb-crumb" data-path="${this.escapeAttr(cr.path)}">${this.escapeHtml(cr.label)}</button>`;
@@ -20626,7 +21382,7 @@ class FmFileManagerTable extends FmTable {
             '</div>';
         if (this._invalidFolderMessage) return navDisabled;
 
-        const canBack    = this._navBackStack.length > 0;
+        const canBack    = this._navBackStack.length > 0 || this._inSearchView();
         const canForward = this._navForwardStack.length > 0;
         const cur        = norm(this._currentPath);
         const parent     = norm(getParentPath(this._currentPath));
@@ -20638,11 +21394,17 @@ class FmFileManagerTable extends FmTable {
             `<button type="button" class="fm-breadcrumb-nav-btn" data-bc="back" title="Back (Alt + ←)" aria-label="Back"${canBack ? '' : ' disabled'}><i class="bi bi-arrow-left"></i></button>` +
             `<button type="button" class="fm-breadcrumb-nav-btn" data-bc="forward" title="Forward (Alt + →)" aria-label="Forward"${canForward ? '' : ' disabled'}><i class="bi bi-arrow-right"></i></button>` +
             `<button type="button" class="fm-breadcrumb-nav-btn" data-bc="up" title="Up to parent folder (Backspace / Alt + \u2191)" aria-label="Up to parent folder"${canUp ? '' : ' disabled'}><i class="bi bi-arrow-up"></i></button>` +
+            this._buildSearchBackHtml() +
             this._buildBreadcrumbCountHtml() +
             this._buildNameFilterHtml() +
             '</div>';
 
-        const crumbsHtml = this._buildBreadcrumbPathHtml(crumbs);
+        let crumbsHtml = this._buildBreadcrumbPathHtml(crumbs);
+        if (this._inSearchView()) {
+            crumbsHtml += this._breadcrumbSepHtml() +
+                '<span class="fm-breadcrumb-crumb fm-breadcrumb-crumb--current" aria-current="page">Search results</span>';
+            return nav + '<div class="fm-breadcrumb-path">' + crumbsHtml + '</div>' + this._buildSearchBarHtml();
+        }
         let trashHint = '';
         if (this._inTrashView()) {
             trashHint =
@@ -20670,20 +21432,102 @@ class FmFileManagerTable extends FmTable {
     }
 
     /**
+     * Search criteria in words, e.g. "name contains “report” · files · from 1 MB".
+     * @param {Object} f - Search form values
+     * @returns {string}
+     */
+    static _searchCriteriaText(f) {
+        const parts = [];
+        if (f.name) {
+            const how = f.match === 'regex' ? 'matches regex' : (f.match === 'wildcard' ? 'is like' : 'contains');
+            parts.push('name ' + how + ' “' + f.name + '”' + (f.icase ? '' : ' (match case)'));
+        }
+        if (f.type === 'file') parts.push('files');
+        if (f.type === 'folder') parts.push('folders');
+        if (f.sizeMin !== '') parts.push('from ' + f.sizeMin + ' ' + f.sizeMinUnit);
+        if (f.sizeMax !== '') parts.push('up to ' + f.sizeMax + ' ' + f.sizeMaxUnit);
+        if (f.dateFrom) parts.push('modified from ' + f.dateFrom);
+        if (f.dateTo) parts.push('modified until ' + f.dateTo);
+        return parts.length ? parts.join(' · ') : 'everything';
+    }
+
+    /**
+     * "Search results (N)" button while results are kept in memory and another folder is shown.
+     * @returns {string}
+     */
+    _buildSearchBackHtml() {
+        const p = this._parkedSearch;
+        if (!p || this._inSearchView()) return '';
+        const n = p.search.items.length;
+        return '<button type="button" class="fm-search-back-btn" data-search-back="1" title="Back to the search results">' +
+            '<i class="bi bi-search" aria-hidden="true"></i> Search results (' + n.toLocaleString() + ')</button>';
+    }
+
+    /**
+     * Status line and buttons under the breadcrumb while search results are shown.
+     * @returns {string}
+     */
+    _buildSearchBarHtml() {
+        const s = this._search;
+        const n = s.items.length.toLocaleString();
+        let status;
+        let cls = '';
+        if (s.error) {
+            status = s.error;
+            cls = ' fm-search-status--error';
+        } else if (s.running) {
+            status = 'Searching… ' + n + ' found' + (s.scanned ? ', ' + s.scanned.toLocaleString() + ' checked' : '');
+        } else if (s.stopped) {
+            status = 'Stopped — ' + n + ' found. The list may be incomplete.';
+            cls = ' fm-search-status--warn';
+        } else if (s.done && s.done.reason === 'limit') {
+            status = 'Showing the first ' + n + ' results. Narrow the search to see the rest.';
+            cls = ' fm-search-status--warn';
+        } else if (s.done && s.done.reason === 'time') {
+            status = 'Search took too long and was stopped — ' + n + ' found. Narrow the search to see the rest.';
+            cls = ' fm-search-status--warn';
+        } else {
+            const secs = s.done && typeof s.done.seconds === 'number' ? s.done.seconds : null;
+            status = n + ' found' + (secs !== null ? ' in ' + secs + ' s' : '') + (s.engine === 'find' ? ' (via find)' : '');
+        }
+        if (s.restoredAt && !s.running) {
+            const t = new Date(s.restoredAt);
+            const hm = String(t.getHours()).padStart(2, '0') + ':' + String(t.getMinutes()).padStart(2, '0');
+            status += ' · Results from ' + hm + ', press F5 to search again.';
+        }
+        const where = '/' + (this._pathRelativeToRoot(s.base) || '');
+        return '<div class="fm-search-bar">' +
+            '<p class="fm-search-summary">' +
+            '<span class="fm-search-criteria">' + this.escapeHtml('In ' + where + ' and subfolders: ' + FmFileManagerTable._searchCriteriaText(s.form)) + '</span>' +
+            '<span class="fm-search-status' + cls + '" role="status">' + (s.running ? '<i class="bi bi-arrow-repeat fm-rotating" aria-hidden="true"></i> ' : '') + this.escapeHtml(status) + '</span>' +
+            '</p>' +
+            '<div class="fm-search-bar-actions">' +
+            (s.running ? '<button type="button" class="fm-search-bar-btn" data-search="stop"><i class="bi bi-stop-circle" aria-hidden="true"></i> Stop</button>' : '') +
+            '<button type="button" class="fm-search-bar-btn" data-search="edit"><i class="bi bi-pencil" aria-hidden="true"></i> Edit search</button>' +
+            '<button type="button" class="fm-search-bar-btn" data-search="close" title="Back to the folder (Backspace)"><i class="bi bi-x-lg" aria-hidden="true"></i> Close</button>' +
+            '</div></div>';
+    }
+
+    /**
      * Build HTML for the current folder item counts shown next to breadcrumb nav.
      * @returns {string}
      */
     _buildBreadcrumbCountHtml() {
         if (this._invalidFolderMessage) return '';
-        const rows = Array.isArray(this.rows) ? this.rows : [];
+        // Counts cover the whole filtered list, not only the page in the table.
+        const rows = Array.isArray(this._viewRows) ? this._viewRows : (Array.isArray(this.rows) ? this.rows : []);
         const all = Array.isArray(this._allRows) && this._allRows.length ? this._allRows : rows;
         const filterOn = String(this._nameFilter || '').trim() !== '';
         if (filterOn && all.length > 0) {
-            return '<span class="fm-breadcrumb-count">Showing ' + rows.length + ' of ' + all.length + '</span>';
+            return '<span class="fm-breadcrumb-count">Showing ' + rows.length.toLocaleString() + ' of ' + all.length.toLocaleString() + '</span>';
         }
         if (this._inTrashView()) {
             const n = rows.length;
             return '<span class="fm-breadcrumb-count">' + (n === 0 ? 'Trash is empty' : (n === 1 ? '1 item' : n + ' items')) + '</span>';
+        }
+        if (this._inSearchView()) {
+            const n = rows.length;
+            return '<span class="fm-breadcrumb-count">' + (n === 1 ? '1 found' : n.toLocaleString() + ' found') + '</span>';
         }
         const folders = rows.filter(r => r.type === 'folder').length;
         const files = rows.filter(r => r.type === 'file').length;
@@ -20692,9 +21536,9 @@ class FmFileManagerTable extends FmTable {
         }
         const parts = [];
         if (folders === 1) parts.push('1 folder');
-        else if (folders > 1) parts.push(`${folders} folders`);
+        else if (folders > 1) parts.push(`${folders.toLocaleString()} folders`);
         if (files === 1) parts.push('1 file');
-        else if (files > 1) parts.push(`${files} files`);
+        else if (files > 1) parts.push(`${files.toLocaleString()} files`);
         return '<span class="fm-breadcrumb-count">' + this.escapeHtml(parts.join(', ')) + '</span>';
     }
 
@@ -20742,6 +21586,24 @@ class FmFileManagerTable extends FmTable {
                 this.render();
             });
         }
+        const searchBack = bar.querySelector('[data-search-back]');
+        if (searchBack) {
+            searchBack.addEventListener('click', (e) => {
+                e.preventDefault();
+                this._navBackStack.push(this._currentPath);
+                this._navForwardStack = [];
+                this.restoreParkedSearch();
+            });
+        }
+        bar.querySelectorAll('[data-search]').forEach((btn) => {
+            btn.addEventListener('click', (e) => {
+                e.preventDefault();
+                const a = btn.getAttribute('data-search');
+                if (a === 'stop') this.stopSearch();
+                else if (a === 'edit') this._handleFind();
+                else if (a === 'close') this.exitSearch();
+            });
+        });
         this._bindNameFilterInput(bar.querySelector('.fm-table-filter'));
     }
 
@@ -20753,6 +21615,7 @@ class FmFileManagerTable extends FmTable {
         if (!input) return;
         input.addEventListener('input', () => {
             this._nameFilter = input.value || '';
+            this._page = 0;
             this._filterKeepFocus = true;
             this._filterSelStart = input.selectionStart;
             this._filterSelEnd = input.selectionEnd;
@@ -20805,6 +21668,17 @@ class FmFileManagerTable extends FmTable {
                 '<p class="fm-table-empty-text fm-hint">Clear the filter to see all items in this folder.</p>';
             return;
         }
+        if (this._inSearchView()) {
+            const s = this._search;
+            el.innerHTML = s.running
+                ? '<p class="fm-table-empty-text">Searching…</p>'
+                : '<p class="fm-table-empty-text">' + this.escapeHtml(s.error ? 'The search failed.' : 'Nothing found.') + '</p>' +
+                  '<div class="fm-table-empty-actions">' +
+                  '<button type="button" class="fm-table-empty-btn" data-empty-action="find"><i class="bi bi-pencil"></i> Edit search</button>' +
+                  '<button type="button" class="fm-table-empty-btn" data-empty-action="close-search"><i class="bi bi-x-lg"></i> Close</button>' +
+                  '</div>';
+            return;
+        }
         if (this._inTrashView()) {
             el.innerHTML =
                 '<p class="fm-table-empty-text fm-table-empty-text--trash">' +
@@ -20839,13 +21713,32 @@ class FmFileManagerTable extends FmTable {
             showActionsColumn: this.options.showActionsColumn,
             showLastModifiedColumn: this.options.showLastModifiedColumn
         }).map((col) => (inTrash && col.key === 'mtime' ? { ...col, label: 'Deleted' } : col));
-        if (Array.isArray(this._allRows) && this._allRows.length) {
-            this.rows = this._filteredRows(this._allRows);
-        }
+        // Whole filtered + sorted list; only one page of it is put into the table.
+        const all = this.sortRows(Array.isArray(this._allRows) && this._allRows.length
+            ? this._filteredRows(this._allRows)
+            : (this.rows || []));
+        this._viewRows = all;
+        const size = this._listPageSize();
+        const pages = size ? Math.max(1, Math.ceil(all.length / size)) : 1;
+        this._page = Math.min(Math.max(0, this._page || 0), pages - 1);
+        this.rows = size ? all.slice(this._page * size, (this._page + 1) * size) : all;
         super.render();
         if (this.tableEl) {
             this.tableEl.classList.toggle('fm-table--image-previews', !!this.options.showImagePreviews);
             this.tableEl.classList.toggle('fm-table--trash-view', inTrash);
+            this.tableEl.classList.toggle('fm-table--search-view', this._inSearchView());
+            if (this.selectedRows.length) {
+                const sel = new Set(this.selectedRows);
+                this.rows.forEach((row, i) => {
+                    if (!sel.has(row)) return;
+                    const tr = this.tableEl.querySelector(`tbody tr[data-index="${i}"]`);
+                    if (tr) tr.classList.add('fm-table-row-selected');
+                });
+            }
+            if (pages > 1) {
+                this.tableEl.insertAdjacentElement('afterend', this._buildPager(all.length, pages));
+                this._updatePagerSelectionNote();
+            }
         }
         if (this._filterKeepFocus) {
             const bar = this.container && this.container.querySelector('.fm-breadcrumb-bar');
@@ -20862,6 +21755,129 @@ class FmFileManagerTable extends FmTable {
         this._filterKeepFocus = false;
         this._filterSelStart = null;
         this._filterSelEnd = null;
+    }
+
+    /** Rows per page of the list; 0 = no pages. */
+    _listPageSize() {
+        const n = parseInt(this.options.listPageSize, 10);
+        return Number.isFinite(n) && n > 0 ? n : 0;
+    }
+
+    /**
+     * Pager under the table: "1–500 of 60,000", first / previous / page number / next / last.
+     * @param {number} total
+     * @param {number} pages
+     * @returns {HTMLElement}
+     */
+    _buildPager(total, pages) {
+        const size = this._listPageSize();
+        const from = this._page * size + 1;
+        const to = Math.min(total, from + size - 1);
+        const el = document.createElement('div');
+        el.className = 'fm-pager';
+        const btn = (go, icon, title, disabled) =>
+            `<button type="button" class="fm-pager-btn" data-page-go="${go}" title="${title}" aria-label="${title}"${disabled ? ' disabled' : ''}><i class="bi ${icon}" aria-hidden="true"></i></button>`;
+        const first = this._page === 0;
+        const last = this._page === pages - 1;
+        el.innerHTML =
+            '<span class="fm-pager-info">' + from.toLocaleString() + '–' + to.toLocaleString() + ' of ' + total.toLocaleString() + '</span>' +
+            '<span class="fm-pager-nav">' +
+            btn('first', 'bi-chevron-double-left', 'First page', first) +
+            btn('prev', 'bi-chevron-left', 'Previous page', first) +
+            '<label class="fm-pager-page">Page <input type="number" class="fm-pager-input" min="1" max="' + pages + '" value="' + (this._page + 1) + '"> of ' + pages.toLocaleString() + '</label>' +
+            btn('next', 'bi-chevron-right', 'Next page', last) +
+            btn('last', 'bi-chevron-double-right', 'Last page', last) +
+            '</span>' +
+            '<span class="fm-pager-select-note"></span>';
+        el.querySelectorAll('[data-page-go]').forEach((b) => {
+            b.addEventListener('click', () => {
+                const go = b.getAttribute('data-page-go');
+                const target = go === 'first' ? 0 : go === 'last' ? pages - 1 : this._page + (go === 'next' ? 1 : -1);
+                this._goToPage(target);
+            });
+        });
+        const input = el.querySelector('.fm-pager-input');
+        input.addEventListener('keydown', (e) => {
+            if (e.key !== 'Enter') return;
+            e.preventDefault();
+            const n = parseInt(input.value, 10);
+            if (Number.isFinite(n)) this._goToPage(Math.min(pages, Math.max(1, n)) - 1);
+        });
+        input.addEventListener('change', () => {
+            const n = parseInt(input.value, 10);
+            if (Number.isFinite(n)) this._goToPage(Math.min(pages, Math.max(1, n)) - 1);
+        });
+        return el;
+    }
+
+    /**
+     * Show another page of the list; the selection is kept.
+     * @param {number} page - 0-based
+     * @param {'first'|'last'} [focus] - Row to focus and select on the new page (keyboard paging)
+     */
+    _goToPage(page, focus) {
+        const size = this._listPageSize();
+        const total = Array.isArray(this._viewRows) ? this._viewRows.length : 0;
+        const pages = size ? Math.max(1, Math.ceil(total / size)) : 1;
+        const p = Math.min(Math.max(0, page), pages - 1);
+        if (p === this._page && !focus) return;
+        this._page = p;
+        this._focusedIndex = -1;
+        this._selectionAnchor = null;
+        this.render();
+        const sc = this._scrollParent();
+        if (sc && this.tableEl) sc.scrollTop = Math.max(0, this.tableEl.offsetTop - 80);
+        if (focus && this.rows.length) {
+            const idx = focus === 'last' ? this.rows.length - 1 : 0;
+            this._selectionAnchor = idx;
+            this._selectRow(idx);
+            this._focusRow(idx);
+        }
+        if (this.options.automaticGetFoldersSize) this._fetchAllFolderSizes(this._data);
+    }
+
+    /**
+     * Open the page that holds the row with this name (rows on other pages are not in the table).
+     * @param {string} name
+     * @returns {boolean} Whether the row exists in the list
+     */
+    _showPageOfName(name) {
+        if (this.rows.some((r) => r.name === name)) return true;
+        const size = this._listPageSize();
+        const i = Array.isArray(this._viewRows) ? this._viewRows.findIndex((r) => r.name === name) : -1;
+        if (i < 0 || !size) return false;
+        this._goToPage(Math.floor(i / size));
+        return true;
+    }
+
+    /** "All 500 on this page are selected — Select all 60,000" under the table. */
+    _updatePagerSelectionNote() {
+        const note = this.container && this.container.querySelector('.fm-pager-select-note');
+        if (!note) return;
+        const total = Array.isArray(this._viewRows) ? this._viewRows.length : 0;
+        const n = this.selectedRows.length;
+        if (n > 0 && n >= total) {
+            note.innerHTML = 'All ' + total.toLocaleString() + ' items are selected. <button type="button" class="fm-pager-link" data-sel="none">Clear selection</button>';
+        } else if (n > 0 && n === this.rows.length && this.rows.every((r) => this.selectedRows.includes(r))) {
+            note.innerHTML = 'All ' + n.toLocaleString() + ' on this page are selected. <button type="button" class="fm-pager-link" data-sel="all">Select all ' + total.toLocaleString() + '</button>';
+        } else {
+            note.innerHTML = n > 0 ? this.escapeHtml(n.toLocaleString() + ' selected') : '';
+        }
+        const b = note.querySelector('[data-sel]');
+        if (b) {
+            b.addEventListener('click', () => {
+                if (b.getAttribute('data-sel') === 'all') {
+                    this.selectedRows = this._viewRows.slice();
+                    this.rows.forEach((row, i) => {
+                        const tr = this.tableEl && this.tableEl.querySelector(`tbody tr[data-index="${i}"]`);
+                        if (tr) tr.classList.add('fm-table-row-selected');
+                    });
+                    this.updateActionsState();
+                } else {
+                    this._selectNone();
+                }
+            });
+        }
     }
 
     /**
@@ -20886,6 +21902,24 @@ class FmFileManagerTable extends FmTable {
         return '<span class="fm-table-name-cell fm-table-name-cell--trash">' +
             `<span class="fm-table-name" title="${this.escapeAttr(title)}">${this.escapeHtml(name)}</span>` +
             `<span class="fm-trash-origin" title="${this.escapeAttr(title)}">${this.escapeHtml(fromLabel)}</span>` +
+            '</span>';
+    }
+
+    /**
+     * Name cell in search results: the name plus the folder it is in (relative to the root).
+     * @param {Object} row
+     * @returns {string}
+     */
+    _searchNameCellHtml(row) {
+        const name = row.displayName || row.name;
+        const baseRel = this._pathRelativeToRoot(this._search.base) || '';
+        const dir = [baseRel, row.searchDir].filter(Boolean).join('/');
+        const link = this._rowLink(row);
+        const title = '/' + (dir ? dir + '/' : '') + name + (link ? ' — ' + link.title : '');
+        const isImg = row.type === 'file' && FmFileManagerTable.isImagePreviewExt(row.ext, name);
+        return '<span class="fm-table-name-cell fm-table-name-cell--trash fm-table-name-cell--search">' +
+            `<span class="fm-table-name${isImg ? ' fm-table-name--image-preview' : ''}" title="${this.escapeAttr(title)}">${this.escapeHtml(name)}</span>` +
+            `<span class="fm-trash-origin" title="${this.escapeAttr(title)}">${this.escapeHtml('in /' + dir)}</span>` +
             '</span>';
     }
 
@@ -20958,6 +21992,7 @@ class FmFileManagerTable extends FmTable {
             }
             case 'name': {
                 if (this._inTrashView()) return this._trashNameCellHtml(row);
+                if (this._inSearchView()) return this._searchNameCellHtml(row);
                 const isImgFile = row.type === 'file' && FmFileManagerTable.isImagePreviewExt(row.ext, row.name);
                 const nameLink  = this._rowLink(row);
                 const nameTitle = nameLink
@@ -21061,6 +22096,12 @@ class FmFileManagerTable extends FmTable {
         super.setData(this._filteredRows(this._allRows));
     }
 
+    /** @override Sorting starts again on the first page. */
+    handleSortClick(column) {
+        this._page = 0;
+        super.handleSortClick(column);
+    }
+
     /**
      * @param {Object[]} rows
      * @returns {Object[]}
@@ -21107,9 +22148,32 @@ class FmFileManagerTable extends FmTable {
         const { selectedRows, selectedRow } = payload || {};
         if (this._inTrashView() && !FmFileManagerTable.TRASH_VIEW_ACTIONS.has(actionId)) return;
         if (!this._inTrashView() && (actionId === 'restore-trashed' || actionId === 'empty-trash')) return;
+        if (this._inSearchView() && !FmFileManagerTable.SEARCH_VIEW_ACTIONS.has(actionId)) return;
+        if (!this._inSearchView() && (actionId === 'open-location' || actionId === 'close-search')) return;
+        if (this._inSearchView() && Array.isArray(selectedRows) && ['delete', 'copy', 'move', 'download'].includes(actionId)) {
+            // A selected folder already covers the results inside it.
+            const folders = selectedRows.filter((r) => r.type === 'folder').map((r) => r.name + '/');
+            payload = { ...payload, selectedRows: selectedRows.filter((r) => !folders.some((f) => r.name.startsWith(f))) };
+            return this._dispatchAction(actionId, payload);
+        }
+        return this._dispatchAction(actionId, payload);
+    }
+
+    /**
+     * @param {string} actionId
+     * @param {Object} payload
+     */
+    _dispatchAction(actionId, payload) {
+        const { selectedRows, selectedRow } = payload || {};
+        if (this._parkedSearch && FmFileManagerTable.SEARCH_DIRTY_ACTIONS.has(actionId)) {
+            this._parkedSearch.dirty = true;
+        }
         this._callHook('before', actionId, payload);
         switch (actionId) {
             case 'refresh':           return this._handleRefresh();
+            case 'find':              return this._handleFind();
+            case 'close-search':      return this.exitSearch();
+            case 'open-location':     return this._handleOpenLocation({ selectedRow });
             case 'open':              return this._handleOpen({ selectedRow });
             case 'create-new-folder': return this._handleCreateNewFolder();
             case 'create-new-file':   return this._handleCreateNewFile();
@@ -21175,6 +22239,272 @@ class FmFileManagerTable extends FmTable {
         this.load(this._currentPath, () => {
             this._callHook('after', 'refresh', { currentPath: this._currentPath });
         });
+    }
+
+    /** Open the Find dialog (new search from this folder, or edit the shown search). */
+    _handleFind() {
+        if (this._inTrashView() || this._invalidFolderMessage) return;
+        const s = this._search;
+        const base = s ? s.base : this._currentPath;
+        new FmSearchPopup({
+            whereLabel: '/' + (this._pathRelativeToRoot(base) || ''),
+            initial:    s ? s.form : (this._lastSearchForm || null),
+            onSubmit:   (form, post) => this._startSearch(base, form, post),
+        }).show();
+    }
+
+    /**
+     * Show search results for `base` (the current folder) and start streaming them from the server.
+     * @param {string} base
+     * @param {Object} form - Dialog values (kept to edit the search later)
+     * @param {Object<string, string>} post - Request fields for action=search
+     */
+    _startSearch(base, form, post) {
+        this.leaveSearch();
+        this._dropParkedSearch();
+        this._lastSearchForm = form;
+        this._search = { base: norm(base), form, post, items: [] };
+        this._nameFilter = '';
+        this._page = 0;
+        this._breadcrumbMidExpanded = false;
+        this._runSearch();
+    }
+
+    /**
+     * (Re)run the shown search; also used by Refresh and after actions on results.
+     * @param {Function} [onLoaded]
+     */
+    _runSearch(onLoaded) {
+        const s = this._search;
+        if (!s) return;
+        if (s.ctrl) {
+            try { s.ctrl.abort(); } catch (e) { /* ignore */ }
+        }
+        Object.assign(s, { items: [], running: true, stopped: false, done: null, error: null, scanned: 0, engine: '', restoredAt: null });
+        const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        s.ctrl = ctrl;
+        this._searchRender(true);
+
+        const form = new FormData();
+        form.append('action', 'search');
+        form.append('in', this._pathRelativeToRoot(s.base) || '');
+        Object.keys(s.post).forEach((k) => form.append(k, s.post[k]));
+        const init = fmPostInit(form);
+        if (ctrl) init.signal = ctrl.signal;
+
+        const finish = () => {
+            if (this._search !== s) return;
+            s.running = false;
+            s.ctrl = null;
+            s.finishedAt = Date.now();
+            this._searchRender(true);
+            if (typeof onLoaded === 'function') onLoaded(s.base);
+        };
+        const onLine = (line) => {
+            if (!line.trim()) return;
+            let m;
+            try { m = JSON.parse(line); } catch (e) { return; }
+            if (m.start) s.engine = m.engine || '';
+            if (m.fallback) s.engine = 'php';
+            if (Array.isArray(m.items)) s.items.push(...m.items);
+            if (typeof m.scanned === 'number') s.scanned = m.scanned;
+            if (m.error) s.error = m.error;
+            if (m.done) s.done = m;
+        };
+        requireAuthFetch(this._ajaxUrl, init)
+            .then(async (r) => {
+                if ((r.headers.get('Content-Type') || '').indexOf('ndjson') < 0 || !r.body) {
+                    const data = await r.json().catch(() => null);
+                    s.error = (data && data.msg) || 'The search failed.';
+                    finish();
+                    return;
+                }
+                const reader = r.body.getReader();
+                const decoder = new TextDecoder();
+                let buf = '';
+                for (;;) {
+                    const { value, done } = await reader.read();
+                    if (this._search !== s) {
+                        try { reader.cancel(); } catch (e) { /* ignore */ }
+                        return;
+                    }
+                    if (value) {
+                        buf += decoder.decode(value, { stream: !done });
+                        const lines = buf.split('\n');
+                        buf = lines.pop() || '';
+                        lines.forEach(onLine);
+                    }
+                    if (done) {
+                        if (buf) onLine(buf);
+                        break;
+                    }
+                    this._searchRender(false);
+                }
+                if (!s.done && !s.error) s.error = 'The search ended unexpectedly (connection or server error).';
+                finish();
+            })
+            .catch((err) => {
+                if (this._search !== s) return;
+                if (!s.stopped && !(err && err.name === 'AbortError')) {
+                    s.error = 'The search failed (network or session error).';
+                }
+                finish();
+            });
+    }
+
+    /**
+     * Re-render the results; while streaming at most every 400 ms. Keeps the selection by name.
+     * @param {boolean} now
+     */
+    _searchRender(now) {
+        if (!now) {
+            if (this._searchRenderTimer) return;
+            this._searchRenderTimer = setTimeout(() => {
+                this._searchRenderTimer = null;
+                if (this._search) this._searchRender(true);
+            }, 400);
+            return;
+        }
+        if (this._searchRenderTimer) {
+            clearTimeout(this._searchRenderTimer);
+            this._searchRenderTimer = null;
+        }
+        const keep = new Set((this.selectedRows || []).map((r) => r.name));
+        this._invalidFolderMessage = null;
+        this.setData({ search_view: true });
+        if (keep.size && this.tableEl) {
+            this.rows.forEach((row, i) => {
+                if (!keep.has(row.name)) return;
+                this.selectedRows.push(row);
+                const tr = this.tableEl.querySelector(`tbody tr[data-index="${i}"]`);
+                if (tr) tr.classList.add('fm-table-row-selected');
+            });
+            this.updateActionsState();
+        }
+    }
+
+    /** Stop a running search and keep what was found so far. */
+    stopSearch() {
+        const s = this._search;
+        if (!s || !s.running) return;
+        s.stopped = true;
+        if (s.ctrl) {
+            s.ctrl.abort();
+        } else {
+            s.running = false;
+            this._searchRender(true);
+        }
+    }
+
+    /**
+     * Leave the search results without loading anything (navigation loads the next folder).
+     * @param {boolean} [park] - Keep them in memory so Back or the "Search results" button can show them again
+     */
+    leaveSearch(park = false) {
+        const s = this._search;
+        if (!s) return;
+        if (park) {
+            if (s.running) {
+                s.running = false;
+                s.stopped = true;
+            }
+            const sc = this._scrollParent();
+            const focused = this._focusedIndex >= 0 ? this.rows[this._focusedIndex] : this.getSelected();
+            this._parkedSearch = {
+                search:    s,
+                page:      this._page || 0,
+                scrollTop: sc ? sc.scrollTop : 0,
+                focusName: focused ? focused.name : null,
+                dirty:     false,
+                at:        Date.now(),
+            };
+        } else {
+            this._dropParkedSearch();
+        }
+        this._search = null;
+        if (this._searchRenderTimer) {
+            clearTimeout(this._searchRenderTimer);
+            this._searchRenderTimer = null;
+        }
+        if (s.ctrl) {
+            try { s.ctrl.abort(); } catch (e) { /* ignore */ }
+        }
+        this._nameFilter = '';
+    }
+
+    /** Forget results kept for Back and remove their history entries. */
+    _dropParkedSearch() {
+        this._parkedSearch = null;
+        const mark = FmFileManagerTable.SEARCH_HISTORY_ENTRY;
+        this._navBackStack = this._navBackStack.filter((e) => e !== mark);
+        this._navForwardStack = this._navForwardStack.filter((e) => e !== mark);
+    }
+
+    /**
+     * Show the kept search results again: from memory with the same scroll position and focused item,
+     * or searched again when files were changed meanwhile.
+     * @returns {boolean} False when no results are kept
+     */
+    restoreParkedSearch() {
+        const p = this._parkedSearch;
+        if (!p) return false;
+        const mark = FmFileManagerTable.SEARCH_HISTORY_ENTRY;
+        this._parkedSearch = null;
+        this._navBackStack = this._navBackStack.filter((e) => e !== mark);
+        this._navForwardStack = this._navForwardStack.filter((e) => e !== mark);
+        const s = p.search;
+        this._search = s;
+        this._currentPath = s.base;
+        this._nameFilter = '';
+        this._page = p.page;
+        this._invalidFolderMessage = null;
+        this._breadcrumbMidExpanded = false;
+        if (this._onShowPath) this._onShowPath(s.base);
+        if (p.dirty) {
+            this._runSearch(() => {
+                if (p.focusName) this._focusRowByName(p.focusName);
+            });
+            return true;
+        }
+        s.restoredAt = s.finishedAt || p.at;
+        this._searchRender(true);
+        requestAnimationFrame(() => {
+            const sc = this._scrollParent();
+            if (sc) sc.scrollTop = p.scrollTop;
+            if (p.focusName) this._focusRowByName(p.focusName);
+        });
+        return true;
+    }
+
+    /** Nearest scrolling ancestor of the table (kept per search results for Back). */
+    _scrollParent() {
+        let el = this.tableEl ? this.tableEl.parentElement : null;
+        while (el && el !== document.body) {
+            const oy = getComputedStyle(el).overflowY;
+            if ((oy === 'auto' || oy === 'scroll') && el.scrollHeight > el.clientHeight) return el;
+            el = el.parentElement;
+        }
+        return document.scrollingElement;
+    }
+
+    /** Close the search results and show the searched folder again. */
+    exitSearch() {
+        if (!this._search) return;
+        this.leaveSearch();
+        this.load(this._currentPath);
+    }
+
+    /**
+     * Search results: open the folder that holds the item and focus it there.
+     * @param {{ selectedRow?: Object }} param0
+     */
+    _handleOpenLocation({ selectedRow } = {}) {
+        if (!selectedRow || !this._inSearchView()) return;
+        const full = this._rowPhysicalPath(selectedRow);
+        if (!full) return;
+        const slash = full.lastIndexOf('/');
+        this._navigateFolder(full.slice(0, slash));
+        this._pendingRestoreChildName = full.slice(slash + 1);
     }
 
     /**
@@ -21395,6 +22725,17 @@ class FmFileManagerTable extends FmTable {
         const rows  = selectedRows || [];
         const names = rows.map(r => r.name);
         if (names.length === 0) return;
+        if (this._inSearchView()) {
+            const seen = new Set();
+            const dup = rows.map((r) => r.displayName || r.name).find((n) => (seen.has(n) ? true : (seen.add(n), false)));
+            if (dup) {
+                fmUserNotice({
+                    title:   operation === 'move' ? 'Move' : 'Copy',
+                    message: 'Several selected items are named “' + dup + '”, so they cannot go into one folder. Select only one of them.',
+                });
+                return;
+            }
+        }
         const depth = typeof sidebarMaxDepth !== 'undefined' ? sidebarMaxDepth : 12;
         new FmCopyMovePopup({
             operation,
@@ -21846,7 +23187,7 @@ class FmFileManagerTable extends FmTable {
         }
         const names = rowsDl.map(r => r.name);
         // Several items keep the popup's timestamped "download-…" default.
-        const defaultArchiveName = names.length === 1 ? names[0] + '.zip' : undefined;
+        const defaultArchiveName = names.length === 1 ? (rowsDl[0].displayName || names[0]) + '.zip' : undefined;
         new FmDownloadArchivePopup({
             currentPath:         this._currentPath,
             rootDir:             this._rootDir,
@@ -22021,6 +23362,19 @@ class FmFileManagerTable extends FmTable {
                 const len = this.rows.length;
                 if (!len) return;
                 const cur = this._focusedIndex < 0 ? (e.key === 'ArrowDown' || e.key === 'PageDown' || e.key === 'End' ? -1 : len) : this._focusedIndex;
+                // Moving past the first / last row of a page opens the previous / next page.
+                const pageSize = this._listPageSize();
+                const pageCount = pageSize && Array.isArray(this._viewRows) ? Math.ceil(this._viewRows.length / pageSize) : 1;
+                if (!e.shiftKey && (e.key === 'ArrowDown' || e.key === 'PageDown') && cur >= len - 1 && this._page < pageCount - 1) {
+                    e.preventDefault();
+                    this._goToPage(this._page + 1, 'first');
+                    return;
+                }
+                if (!e.shiftKey && (e.key === 'ArrowUp' || e.key === 'PageUp') && cur === 0 && this._page > 0) {
+                    e.preventDefault();
+                    this._goToPage(this._page - 1, 'last');
+                    return;
+                }
                 // On first row, Arrow Up / Page Up / Home cannot move selection; do not preventDefault so the page scrolls normally.
                 if ((e.key === 'ArrowUp' || e.key === 'PageUp' || e.key === 'Home') && cur === 0) return;
 
@@ -22052,6 +23406,18 @@ class FmFileManagerTable extends FmTable {
                     e.preventDefault();
                     this._handleRowDoubleClickNav(row, null);
                 }
+                return;
+            }
+
+            if (e.key === 'Backspace' && this._inSearchView()) {
+                e.preventDefault();
+                this.exitSearch();
+                return;
+            }
+
+            if (e.ctrlKey && e.altKey && !e.shiftKey && e.key.toLowerCase() === 's') {
+                e.preventDefault();
+                this.handleAction('find', { selectedRows: [], selectedRow: null });
                 return;
             }
 
@@ -22221,6 +23587,22 @@ class FmFileManagerTable extends FmTable {
             ], clientX, clientY, { selectedRows: this.getSelectedRows(), selectedRow: this.getSelected() });
             return;
         }
+        if (this._inSearchView()) {
+            const items = [
+                { id: 'find', title: 'Edit search', icon: 'bi-search', shortcut: sc['find'] },
+                { id: 'refresh', title: 'Search again', icon: 'bi-arrow-clockwise', shortcut: sc['refresh'] },
+                { id: 'close-search', title: 'Close search results', icon: 'bi-x-lg', shortcut: sc['close-search'] },
+            ];
+            if (this.rows.length > 0) {
+                items.push(
+                    { type: 'separator' },
+                    { id: 'invert-selection', title: 'Invert selection', icon: 'bi-arrow-left-right', shortcut: sc['invert-selection'] },
+                    { id: 'select-none', title: 'Select none', icon: 'bi-x-square', shortcut: sc['select-none'] }
+                );
+            }
+            this._renderContextMenu(items, clientX, clientY, { selectedRows: this.getSelectedRows(), selectedRow: this.getSelected() });
+            return;
+        }
         const items = [
             { id: 'create-new-folder', title: 'Create new folder', icon: 'bi-folder-plus', shortcut: sc['create-new-folder'] },
             { id: 'create-new-file', title: 'Create new file', icon: 'bi-file-earmark-plus', shortcut: sc['create-new-file'] },
@@ -22303,6 +23685,32 @@ class FmFileManagerTable extends FmTable {
                 { id: 'invert-selection', title: 'Invert selection', icon: 'bi-arrow-left-right', shortcut: sc['invert-selection'] },
                 { id: 'select-none', title: 'Select none', icon: 'bi-x-square', shortcut: sc['select-none'] },
             ];
+            return items;
+        } else if (this._inSearchView()) {
+            const items = [];
+            if (row.type === 'folder') {
+                items.push({ id: 'open', title: 'Open', icon: 'bi-folder2-open', shortcut: sc['open'] });
+            }
+            items.push(
+                { id: 'open-location', title: 'Open containing folder', icon: 'bi-folder-symlink' },
+                { id: 'download', title: FM_CONTEXT_MENU_DOWNLOAD_LABEL, icon: 'bi-download', shortcut: sc['download'] }
+            );
+            if (row.type === 'folder') {
+                items.push({ id: 'open-in-new-tab', title: 'Open in new tab', icon: 'bi-box-arrow-up-right', shortcut: sc['open-in-new-tab'] });
+            }
+            items.push(
+                { type: 'separator' },
+                { id: 'copy', title: 'Copy', icon: 'bi-copy', shortcut: sc['copy'] },
+                { id: 'move', title: 'Move', icon: 'bi-arrow-right-square', shortcut: sc['move'] },
+                { id: 'delete', title: 'Delete', icon: 'bi-trash', shortcut: sc['delete'] },
+                { type: 'separator' },
+                { id: 'copy-path', title: 'Copy path', icon: 'bi-clipboard', shortcut: sc['copy-path'] },
+                { id: 'copy-relative-path', title: 'Copy relative path', icon: 'bi-clipboard2', shortcut: sc['copy-relative-path'] },
+                { id: 'get-info', title: 'Get info', icon: 'bi-info-circle', shortcut: sc['get-info'] },
+                { type: 'separator' },
+                { id: 'invert-selection', title: 'Invert selection', icon: 'bi-arrow-left-right', shortcut: sc['invert-selection'] },
+                { id: 'select-none', title: 'Select none', icon: 'bi-x-square', shortcut: sc['select-none'] }
+            );
             return items;
         } else {
             if (row.type === 'folder') {
@@ -22535,7 +23943,7 @@ class FmFileManagerTable extends FmTable {
             return this._folderNavigatePath(payload.selectedRow) === null;
         }
 
-        if (actionId === 'rename' || actionId === 'get-info') {
+        if (actionId === 'rename' || actionId === 'get-info' || actionId === 'open-location') {
             if (!single || !payload.selectedRow) return true;
         }
 
@@ -22614,12 +24022,21 @@ class FmFileManagerTable extends FmTable {
      * @param {Function} [onLoaded] - Called after the table has been updated
      */
     load(path, onLoaded) {
+        // Reloading the searched folder (Refresh, after delete / move…) runs the search again.
+        if (this._search) {
+            if (norm(path) === this._search.base) {
+                this._runSearch(onLoaded);
+                return;
+            }
+            this.leaveSearch();
+        }
         // Trash has no subfolders to browse: any path inside it shows the Trash list.
         if (this._pathIsInTrash(path)) path = this._trashRootPath();
         if (norm(path) !== norm(this._currentPath)) {
             this._breadcrumbMidExpanded = false;
             this._pendingKeyboardAnchor = null;
             this._nameFilter = '';
+            this._page = 0;
         }
         const openParams = { action: 'open', folder: path };
         requireAuthFetch(this._ajaxUrl + '?' + new URLSearchParams(openParams))
@@ -22679,6 +24096,25 @@ class FmFileManagerTable extends FmTable {
      */
     buildRows(data) {
         const rows = [];
+        if (data && data.search_view === true && this._search) {
+            for (const item of this._search.items) {
+                if (!item || !item.path) continue;
+                const isFolder = item.type === 'folder';
+                const slash = item.path.lastIndexOf('/');
+                rows.push({
+                    type:        isFolder ? 'folder' : 'file',
+                    name:        item.path,
+                    displayName: slash >= 0 ? item.path.slice(slash + 1) : item.path,
+                    searchDir:   slash >= 0 ? item.path.slice(0, slash) : '',
+                    size:        isFolder ? null : (item.size != null ? item.size : null),
+                    ext:         isFolder ? null : (item.ext || ''),
+                    permissions: item.permissions != null ? item.permissions : null,
+                    mtime:       item.mtime != null ? item.mtime : null,
+                    raw:         item,
+                });
+            }
+            return rows;
+        }
         if (data && data.trash_view === true) {
             for (const item of (Array.isArray(data.trash_items) ? data.trash_items : [])) {
                 if (!item || !item.id) continue;
@@ -22809,6 +24245,7 @@ class FmFileManagerTable extends FmTable {
      */
     highlightRowByName(name) {
         if (!this.tableEl || name == null || name === '') return;
+        this._showPageOfName(name);
         const idx = this.rows.findIndex(r => r.name === name);
         if (idx < 0) return;
         const tr = this.tableEl.querySelector(`tbody tr[data-index="${idx}"]`);
@@ -22821,12 +24258,15 @@ class FmFileManagerTable extends FmTable {
      */
     highlightRowsByNames(names) {
         if (!Array.isArray(names) || names.length === 0) return;
+        // Show the page of the first item; items on other pages are not flashed.
+        this._showPageOfName(String(names[0]));
         const seen = new Set();
         names.forEach((name) => {
             const n = name != null ? String(name) : '';
             if (n === '' || seen.has(n)) return;
             seen.add(n);
-            this.highlightRowByName(n);
+            const idx = this.rows.findIndex((r) => r.name === n);
+            if (idx >= 0 && this.tableEl) this._flashRowHighlight(this.tableEl.querySelector(`tbody tr[data-index="${idx}"]`));
         });
     }
 
@@ -22836,6 +24276,7 @@ class FmFileManagerTable extends FmTable {
      */
     _focusRowByName(name) {
         if (!this.tableEl || name == null || name === '') return;
+        this._showPageOfName(name);
         let idx = this.rows.findIndex(r => r.name === name && r.type === 'folder');
         if (idx < 0) idx = this.rows.findIndex(r => r.name === name);
         if (idx < 0) return;
@@ -22883,7 +24324,8 @@ class FmFileManagerTable extends FmTable {
      * @param {number|null} bytes - Raw byte count, or null to display '—'
      */
     setFolderSize(rowName, bytes) {
-        const row = this.rows.find(r => r.type === 'folder' && r.name === rowName);
+        const row = (Array.isArray(this._allRows) && this._allRows.length ? this._allRows : this.rows)
+            .find(r => r.type === 'folder' && r.name === rowName);
         if (row) row.size = (bytes != null && bytes >= 0) ? bytes : null;
 
         if (!this.tableEl) return;
@@ -22942,6 +24384,14 @@ class FmFileManagerTable extends FmTable {
                 actions.push({ id: 'restore-trashed', icon: 'bi-arrow-counterclockwise', title: 'Restore' });
             }
             actions.push({ id: 'delete', icon: 'bi-trash', title: 'Delete forever' });
+            return actions.map(rowBtn).join('');
+        }
+        if (this._inSearchView()) {
+            actions.push({ id: 'open-location', icon: 'bi-folder-symlink', title: 'Open containing folder' });
+            actions.push(row.type === 'folder'
+                ? { id: 'open', icon: 'bi-folder2-open', title: 'Open' }
+                : { id: 'download', icon: 'bi-download', title: FM_DOWNLOAD_ACTION_TITLE });
+            actions.push({ id: 'delete', icon: 'bi-trash', title: 'Delete' });
             return actions.map(rowBtn).join('');
         }
         if (row.type === 'folder') {
@@ -23012,6 +24462,9 @@ class FmFileManagerTable extends FmTable {
         } else {
             return;
         }
+        // Only folders on the shown page whose size is not known yet (large folders have many pages).
+        const onPage = new Map((this.rows || []).filter((r) => r.type === 'folder').map((r) => [r.name, r]));
+        entries = entries.filter(([folderName]) => onPage.has(folderName) && onPage.get(folderName).size == null);
         entries.forEach(([folderName, fullPath]) => {
             this._setFolderSizeSpinning(folderName);
             requireAuthFetch(this._ajaxUrl + '?' + new URLSearchParams({ action: 'get-folder-size', folder: fullPath }))
@@ -23080,7 +24533,7 @@ class FmFileManagerTable extends FmTable {
      */
     _collectImageViewerItems() {
         const out = [];
-        const rows = Array.isArray(this.rows) ? this.rows : [];
+        const rows = Array.isArray(this._viewRows) ? this._viewRows : (Array.isArray(this.rows) ? this.rows : []);
         for (let i = 0; i < rows.length; i++) {
             const r = rows[i];
             if (!r || r.type !== 'file' || !FmFileManagerTable.isImagePreviewExt(r.ext, r.name)) continue;
@@ -23207,9 +24660,19 @@ const defaultConfig = {
     sortDir: 'asc',
     /** Rows to move selection on Page Up / Page Down (keyboard). */
     pageUpDownStep:         10,
+    /** Items per page of the file list (0 = all on one page). */
+    listPageSize:           100,
     /** Permissions column: octal, symbolic (ls-style), or both. */
     permissionsDisplay:     'octal',
 };
+
+const LIST_PAGE_SIZES = [100, 250, 500, 1000, 2000, 0];
+
+/** Items per page: one of LIST_PAGE_SIZES (0 = all), default 100. */
+function clampListPageSize(n) {
+    const x = parseInt(n, 10);
+    return LIST_PAGE_SIZES.includes(x) ? x : 100;
+}
 
 let config = loadConfig(defaultConfig);
 function loadConfig(base) {
@@ -23450,6 +24913,7 @@ function replaceFolderLocation(path) {
 // Login is handled server-side (we render only the login page when unauthenticated).
 
 function fetchAndShowFolder(path, callback, _retried) {
+    mainTable.leaveSearch(true);
     mainTable.load(path, (resolved) => {
         if (mainTable._invalidFolderMessage && !_retried && norm(path) !== norm(root_dir)) {
             try { localStorage.removeItem(LAST_FOLDER_STORAGE_KEY); } catch (e) {}
@@ -23681,6 +25145,15 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
         '<label class="fm-cfg-option"><input type="radio" name="cfg-perm-display" value="both" class="cfg-perm-display" ' + (normalizePermissionsDisplay(config.permissionsDisplay) === 'both' ? 'checked' : '') + '> Both <span class="fm-cfg-perm-example">e.g. 0644 on one line, -rw-r--r-- below</span></label>' +
         '</fieldset>' +
         '<fieldset class="fm-cfg-fieldset">' +
+        '<legend>Large folders</legend>' +
+        '<p class="fm-cfg-server-desc">Long folder lists and search results are shown in pages, so the browser stays fast with many thousands of items. Saved in this browser only.</p>' +
+        '<label class="fm-cfg-pagestep-label">Items per page ' +
+        '<select name="cfg-listpage" class="cfg-listpage">' +
+        LIST_PAGE_SIZES.map((n) => '<option value="' + n + '"' + (n === clampListPageSize(config.listPageSize) ? ' selected' : '') + '>' +
+            (n === 0 ? 'All (no pages)' : n.toLocaleString()) + '</option>').join('') +
+        '</select></label>' +
+        '</fieldset>' +
+        '<fieldset class="fm-cfg-fieldset">' +
         '<legend>Keyboard</legend>' +
         '<p class="fm-cfg-server-desc">Page Up / Page Down in the file list. Saved in this browser only.</p>' +
         '<label class="fm-cfg-pagestep-label">Rows per Page Up / Down ' +
@@ -23767,7 +25240,11 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
                 if (cbImg) config.showImagePreviews = cbImg.checked;
                 if (permRadio) config.permissionsDisplay = normalizePermissionsDisplay(permRadio.value);
                 if (stepInp) config.pageUpDownStep = clampPageUpDownStep(stepInp.value);
+                const listPageSel = p.querySelector('.cfg-listpage');
+                if (listPageSel) config.listPageSize = clampListPageSize(listPageSel.value);
                 if (mainTable) {
+                    if (mainTable.options.listPageSize !== config.listPageSize) mainTable._page = 0;
+                    mainTable.options.listPageSize = config.listPageSize;
                     mainTable.options.pageUpDownStep = config.pageUpDownStep;
                     mainTable.options.permissionsDisplay = config.permissionsDisplay;
                     mainTable.options.showImagePreviews = config.showImagePreviews === true;
@@ -23784,7 +25261,7 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
                 const ipsChanged = nextIps.join('\n') !== curIps.join('\n');
                 const trashChanged = nextTrashMode !== curTrashMode;
                 if (!opsChanged && !idleChanged && !ipsChanged && !trashChanged) {
-                    p.hide();
+                    p.hideAndDestroy();
                     fetchAndShowFolder(currentPath);
                     return;
                 }
@@ -24112,12 +25589,22 @@ window.addEventListener('hashchange', () => {
         showImagePreviews: config.showImagePreviews === true,
         permissionsDisplay: normalizePermissionsDisplay(config.permissionsDisplay),
         pageUpDownStep: clampPageUpDownStep(config.pageUpDownStep),
+        listPageSize: clampListPageSize(config.listPageSize),
         onSortChange: ({ sortBy, sortDir }) => {
             config.sortBy  = sortBy;
             config.sortDir = sortDir;
             saveConfig();
         },
         onNavigate: applyFolderLocation,
+        // Search results shown again from memory: update URL, sidebar and bookmarks without loading the folder.
+        onShowPath: (p) => {
+            replaceFolderLocation(p);
+            currentPath = p;
+            rememberLastFolder(p);
+            if (sidebarTree) sidebarTree.render(p);
+            syncTrashSidebarButton(p);
+            renderBookmarks(window.fmBookmarks || [], p);
+        },
         onTrashCount: fmSetTrashCount,
     });
 

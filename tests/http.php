@@ -208,6 +208,61 @@ try {
         rmTree($dirA . '/ex/jx');
     }
 
+    section('Search and actions on results');
+    mkdir($dirA . '/s/docs', 0775, true);
+    mkdir($dirA . '/s/dest', 0775, true);
+    file_put_contents($dirA . '/s/docs/report-a.txt', 'A');
+    file_put_contents($dirA . '/s/report-b.txt', 'B');
+    file_put_contents($dirA . '/s/dest/report-a.txt', 'other');
+    file_put_contents($outside . '/report-outside.txt', 'O');
+    $sLink = makeDirLink($dirA . '/s/out', $outside);
+    $ndjson = static function (string $body): array {
+        return array_values(array_filter(array_map(static fn($l) => json_decode($l, true), explode("\n", $body))));
+    };
+    $found = static function (array $lines): array {
+        $paths = [];
+        foreach ($lines as $l) {
+            foreach ($l['items'] ?? [] as $it) {
+                $paths[] = $it['path'];
+            }
+        }
+        sort($paths);
+        return $paths;
+    };
+    [, $body] = $br->post($u('a'), ['action' => 'search', 'in' => 's', 'name' => 'report']);
+    $lines = $ndjson($body);
+    $last = end($lines) ?: [];
+    check('search streams results below the folder, not through links', $found($lines) === ['dest/report-a.txt', 'docs/report-a.txt', 'report-b.txt'] && !empty($last['done']) && $last['count'] === 3, $body);
+    [, $body] = $br->post($u('a'), ['action' => 'search', 'in' => '', 'name' => '*.TXT', 'match' => 'wildcard', 'icase' => '0']);
+    check('case-sensitive wildcard finds nothing for *.TXT', $found($ndjson($body)) === [], $body);
+    [, $body] = $br->post($u('a'), ['action' => 'search', 'in' => '', 'name' => '(', 'match' => 'regex']);
+    check('invalid regex is a plain JSON error', strpos($body, '"status":"error"') !== false && strpos($body, 'Invalid regular expression') !== false, $body);
+    mkdir($dirA . '/.trash');
+    [, $body] = $br->post($u('a'), ['action' => 'search', 'in' => '.trash', 'name' => 'x']);
+    check('search inside Trash refused', strpos($body, 'not available in Trash') !== false, $body);
+    rmdir($dirA . '/.trash');
+    [, $body] = $br->post($u('a'), ['action' => 'search', 'in' => '../..', 'name' => 'x']);
+    check('search outside the root refused', strpos($body, '"status":"error"') !== false, $body);
+
+    [, $body] = $br->post($u('a'), ['action' => 'copy-move-stream', 'operation' => 'copy', 'in' => 's', 'dest' => 's/dest', 'names[]' => ['report-b.txt', 'docs/report-a.txt']]);
+    check('copy of results stops at a name that exists in the destination', strpos($body, 'Already exists in destination: docs/report-a.txt') !== false && file_get_contents($dirA . '/s/dest/report-a.txt') === 'other', $body);
+    [, $body] = $br->post($u('a'), ['action' => 'copy-move-stream', 'operation' => 'copy', 'in' => 's', 'dest' => 's', 'names[]' => ['docs/report-a.txt', 'dest/report-a.txt']]);
+    check('two results with the same name cannot go into one folder', strpos($body, 'same name') !== false, $body);
+    [, $body] = $br->post($u('a'), ['action' => 'copy-move-stream', 'operation' => 'move', 'in' => 's', 'dest' => 's', 'names[]' => 'docs/report-a.txt']);
+    check('move of a result from a subfolder', strpos($body, '"done":true') !== false && !file_exists($dirA . '/s/docs/report-a.txt') && @file_get_contents($dirA . '/s/report-a.txt') === 'A', $body);
+    $br->post($u('a'), ['action' => 'trash-move', 'in' => 's', 'names[]' => 'dest/report-a.txt']);
+    [, $body] = $br->req($u('a') . '?action=open&folder=' . rawurlencode($dirA . '/.trash'));
+    check('result moved to Trash remembers its folder', strpos($body, '"original_path":"s/dest/report-a.txt"') !== false && !file_exists($dirA . '/s/dest/report-a.txt'), $body);
+    $br->post($u('a'), ['action' => 'trash-empty']);
+    [, $body] = $br->post($u('a'), ['action' => 'delete-stream', 'in' => 's', 'names[]' => ['docs/../../outside-x', '../s']]);
+    check('names with .. are refused', strpos($body, 'Nothing to delete') !== false, $body);
+    if ($sLink) {
+        [, $body] = $br->post($u('a'), ['action' => 'delete-stream', 'in' => 's', 'names[]' => 'out/report-outside.txt']);
+        check('a path through a link to outside the root is refused', strpos($body, 'Nothing to delete') !== false && file_exists($outside . '/report-outside.txt'), $body);
+        rmTree($dirA . '/s/out');
+    }
+    @unlink($outside . '/report-outside.txt');
+
     section('Random trash folder name');
     file_put_contents($dirA . '/up/to-trash.txt', 'T');
     $br->post($u('a'), ['action' => 'trash-move', 'in' => 'up', 'names[]' => 'to-trash.txt']);

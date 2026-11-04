@@ -154,5 +154,124 @@ check('session name is SOLOFM_ + 16 hex', (bool)preg_match('/^SOLOFM_[0-9a-f]{16
 check('password fingerprint differs per hash', fmPasswordFingerprint('a') !== fmPasswordFingerprint('b'));
 check('password fingerprint is stable', fmPasswordFingerprint('a') === fmPasswordFingerprint('a'));
 
+section('Folder listing');
+file_put_contents($root . '/sub/big.bin', str_repeat('x', 1234));
+file_put_contents($root . '/sub/README.md', 'hidden');
+mkdir($root . '/sub/inner');
+mkdir($root . '/.trash');
+$haveInLink = makeDirLink($root . '/sub/in-link', $root . '/sub/inner');
+$ls = getFilesAndFoldersList($root . '/sub', $root, ['.', '..', 'README.md'], true);
+$fileMeta = $ls['files']['file.txt'] ?? [];
+check('file size and extension', ($ls['files']['big.bin']['size'] ?? null) === 1234 && ($ls['files']['big.bin']['ext'] ?? '') === 'bin');
+check('modified time and permissions', ($fileMeta['mtime'] ?? null) === filemtime($root . '/sub/file.txt')
+    && ($fileMeta['permissions'] ?? '') === substr(sprintf('%o', fileperms($root . '/sub/file.txt')), -4));
+check('plain folder and file are not links', isset($ls['folders']['inner']) && empty($ls['folders']['inner']['link']) && empty($fileMeta['link']));
+check('excluded names are not listed', !isset($ls['files']['README.md']));
+if ($haveInLink) {
+    check('folder link inside the root has its target', !empty($ls['folders']['in-link']['link'])
+        && ($ls['folders']['in-link']['link_target'] ?? '') === normPath((string)realpath($root . '/sub/inner')));
+}
+$lsRoot = getFilesAndFoldersList($root, $root, ['.', '..'], true);
+check('Trash folder hidden at the root', !isset($lsRoot['folders']['.trash']) && isset($lsRoot['folders']['sub']));
+if ($haveLink) {
+    check('folder link outside the root is marked', !empty($lsRoot['folders']['out-link']['link_outside']));
+}
+if ($haveInLink) {
+    rmTree($root . '/sub/in-link');
+}
+
+section('Search');
+$sr = $base . '/search';
+mkdir($sr . '/docs/deep', 0775, true);
+mkdir($sr . '/photos', 0775, true);
+mkdir($sr . '/.trash/files', 0775, true);
+mkdir($sr . '/.fm-upload-tmp', 0775, true);
+mkdir($base . '/search-outside', 0775, true);
+file_put_contents($sr . '/Report-2024.TXT', str_repeat('x', 10));
+file_put_contents($sr . '/docs/report-old.txt', str_repeat('x', 2000));
+file_put_contents($sr . '/docs/notes.md', 'n');
+touch($sr . '/docs/notes.md', time() - 86400 * 30);
+file_put_contents($sr . '/docs/deep/Отчёт.txt', 'r');
+file_put_contents($sr . '/README.md', 'excluded');
+file_put_contents($sr . '/.trash/files/report-trashed.txt', 't');
+file_put_contents($sr . '/.fm-upload-tmp/report.part', 'p');
+file_put_contents($base . '/search-outside/report-outside.txt', 'o');
+$haveSearchLink = makeDirLink($sr . '/link-out', $base . '/search-outside');
+/** Paths found by the PHP engine (sorted), or the criteria error. */
+$phpSearch = static function (array $post, int $stopAfter = 0) use ($sr) {
+    $c = fmSearchCriteria($post);
+    if (isset($c['error'])) {
+        return $c['error'];
+    }
+    $rows = [];
+    $scanned = 0;
+    $emit = static function (array $r) use (&$rows, $stopAfter): bool {
+        $rows[] = $r;
+        return $stopAfter === 0 || count($rows) < $stopAfter;
+    };
+    fmSearchWalkPhp($sr, true, $sr, $c, ['README.md'], $emit, static fn() => true, $scanned);
+    $paths = array_column($rows, 'path');
+    sort($paths);
+    return $paths;
+};
+check('contains, ignore case', $phpSearch(['name' => 'report']) === ['Report-2024.TXT', 'docs/report-old.txt']);
+check('contains, case-sensitive', $phpSearch(['name' => 'report', 'icase' => '0']) === ['docs/report-old.txt']);
+check('wildcard *.txt, ignore case', $phpSearch(['name' => '*.txt', 'match' => 'wildcard']) === ['Report-2024.TXT', 'docs/deep/Отчёт.txt', 'docs/report-old.txt']);
+check('wildcard is anchored (*.tx finds nothing)', $phpSearch(['name' => '*.tx', 'match' => 'wildcard']) === []);
+check('regex with groups', $phpSearch(['name' => '^report-\d{4}', 'match' => 'regex']) === ['Report-2024.TXT']);
+check('invalid regex reported', is_string($phpSearch(['name' => '(', 'match' => 'regex'])));
+check('Cyrillic, ignore case', $phpSearch(['name' => 'отчёт']) === ['docs/deep/Отчёт.txt']);
+check('folders only (links listed, not followed)', $phpSearch(['type' => 'folder']) === ($haveSearchLink ? ['docs', 'docs/deep', 'link-out', 'photos'] : ['docs', 'docs/deep', 'photos']));
+check('size from 1000 bytes (folders left out)', $phpSearch(['size_min' => '1000']) === ['docs/report-old.txt']);
+check('modified before 10 days ago', $phpSearch(['type' => 'file', 'mtime_to' => (string)(time() - 86400 * 10)]) === ['docs/notes.md']);
+check('Trash, unfinished uploads and excluded names are skipped', $phpSearch(['name' => 'report']) === $phpSearch(['name' => 'report', 'type' => 'file']) && !in_array('README.md', $phpSearch([]), true));
+check('nothing found through a folder link', $phpSearch(['name' => 'outside']) === []);
+check('stops when emit returns false', count($phpSearch([], 2)) === 2);
+check('control characters refused', is_string($phpSearch(['name' => "a\x01b"])));
+
+$argv = fmSearchFindArgv($sr, true, fmSearchCriteria(['name' => 'rep*rt']));
+check('find: prunes Trash and upload parts at the root', in_array('-prune', $argv, true) && in_array($sr . '/.trash', $argv, true));
+check('find: contains text is escaped for -iname', array_slice($argv, -3) === ['-iname', '*rep\\*rt*', '-print0']);
+check('find: no name pre-filter for regex', !in_array('-iname', fmSearchFindArgv($sr, false, fmSearchCriteria(['name' => 'a', 'match' => 'regex'])), true));
+check('find: no ignore-case pre-filter for non-ASCII', !in_array('-iname', fmSearchFindArgv($sr, false, fmSearchCriteria(['name' => 'отчёт'])), true));
+check('find: case-sensitive wildcard uses -name', in_array('-name', fmSearchFindArgv($sr, false, fmSearchCriteria(['name' => '*.txt', 'match' => 'wildcard', 'icase' => '0'])), true));
+if (PHP_OS_FAMILY !== 'Windows' && fmIsProcOpenAvailable()) {
+    $findSearch = static function (array $post) use ($sr): array {
+        $c = fmSearchCriteria($post);
+        $paths = [];
+        $prefix = $sr . '/';
+        fmSearchRunFind(fmSearchFindArgv($sr, true, $c), static function (string $p) use (&$paths, $prefix, $c, $sr): bool {
+            $rel = substr($p, strlen($prefix));
+            $segs = explode('/', $rel);
+            foreach ($segs as $i => $seg) {
+                if (fmSearchSkipName($seg, $i === 0, ['README.md'], '.trash')) {
+                    return true;
+                }
+            }
+            if (fmSearchEntry($c, $p, $rel, (string)end($segs), is_dir($p), $sr) !== null) {
+                $paths[] = $rel;
+            }
+            return true;
+        }, static fn() => true);
+        sort($paths);
+        return $paths;
+    };
+    foreach ([['name' => 'report'], ['name' => '*.txt', 'match' => 'wildcard'], ['name' => 'отчёт'], ['type' => 'folder'], ['name' => '^report-\d{4}', 'match' => 'regex']] as $q) {
+        check('find and PHP return the same: ' . json_encode($q, JSON_UNESCAPED_UNICODE), $findSearch($q) === $phpSearch($q));
+    }
+} else {
+    echo "  (skipped find(1) comparison: Windows or proc_open unavailable)\n";
+}
+
+section('Item names from names[]');
+check('plain name', fmRequestItemName('a.txt') === 'a.txt');
+check('relative path from search results', fmRequestItemName('docs/a.txt') === 'docs/a.txt');
+check('.. refused', fmRequestItemName('docs/../x') === null);
+check('empty segment refused', fmRequestItemName('docs//a') === null && fmRequestItemName('/a') === null);
+check('backslash and colon refused', fmRequestItemName('a\\b') === null && fmRequestItemName('c:x') === null);
+
+if ($haveSearchLink) {
+    rmTree($sr . '/link-out');
+}
 rmTree($base);
 exit(summary('unit'));

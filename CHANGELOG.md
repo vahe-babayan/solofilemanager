@@ -2,6 +2,26 @@
 
 All notable changes to SoloFileManager are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] - 2026-11-03
+
+### Added
+
+- Find (toolbar search icon, Ctrl + Alt + S): search the current folder and all its subfolders by name (contains the text, wildcard `*` / `?`, or regular expression; ignore case on by default), type, size range and modified date. Results stream in while the search runs and can be stopped; the search ends after 5,000 results or 2 minutes and says so. Links are listed but not searched, and Trash, unfinished uploads and the names the listing hides are left out
+- Search results view: each item shows the folder it is in; filter, sort, Get info, Copy path, Open containing folder, open found folders, Download (one file, or several items as an archive that keeps their folders), Copy, Move and Delete (to Trash or forever) work on items from different folders. Refresh / F5 runs the search again, and actions refresh the results. Backspace, Back or Close return to the folder
+- Back to the search results: after opening a found folder (or going anywhere else), Back or the "Search results (N)" button next to the navigation buttons shows the results again from memory, with the opened item focused, without searching again. If files were changed meanwhile (delete, move, upload, rename…), the search runs again instead. Close or a new search forgets the kept results
+- On Linux / macOS in `auto` / `os` file ops mode the search uses `find` to walk the folders (much faster on large trees); PHP checks every candidate with the same rules, so the results are the same as with PHP. On Windows the search always runs in PHP
+- Large folders and search results are shown in pages (100 items per page by default; 100 / 250 / 500 / 1,000 / 2,000 or All in Configuration → Display). Sorting, the name filter and counts cover the whole folder; a pager under the list shows "1–100 of 60,000" with first / previous / page number / next / last; Arrow / Page keys move on to the next or previous page; Ctrl+A selects the page and "Select all N" the whole folder. Finding an item (Open containing folder, highlight after create / rename) opens its page
+
+### Changed
+
+- Opening a folder is much faster on large folders: the listing reads each entry once (`lstat`) and checks for links only where they can be, instead of several file system calls per entry (60,000 files: about 36 s → 8 s on a slow Windows disk, about 0.6 s on a Linux host; the browser draws one page of rows instead of 60,000)
+- Copy, Move, Delete, Move to Trash and archive downloads accept items in subfolders of the request folder (needed for search results); every part of the path is validated and the full path must stay inside the root folder, as before. Copying or moving two items with the same name into one folder is refused
+
+### Fixed
+
+- "Rows per Page Up / Down" from Configuration was ignored after a page reload until Configuration was applied again
+- Configuration (Apply without server changes) and Terminal settings (Save) left their closed dialog hidden in the page, so every Apply added another copy with the same element ids; the dialog is now removed when it closes
+
 ## [1.4.0] - 2026-11-02
 
 ### Security

@@ -25,8 +25,8 @@ php tests/http.php --source=path/to/solofilemanager.php --port=8766
 
 ## What is checked
 
-- `unit.php` loads the product file without handling a request (`SOLOFM_TEST_INCLUDE=1`) and calls its functions: root folder boundary (`..`, links, similar folder names), upload relative paths, IP allowlist and CIDR matching, client IP behind trusted proxies, archive entry checks (traversal, absolute paths, links, write-through existing links), the built-in TAR reader, upload name conflicts, session name and password fingerprint.
-- `http.php` installs temporary copies with their own passwords, starts PHP's built-in server and uses the API like a browser: login and CSRF, separate sessions per installation, logout of other sessions after a password change, 403 for an IP not on the allowlist, upload with Replace / Skip / Keep both, chunked upload, a hostile archive, and switching the trash folder to a random name and back.
+- `unit.php` loads the product file without handling a request (`SOLOFM_TEST_INCLUDE=1`) and calls its functions: root folder boundary (`..`, links, similar folder names), upload relative paths, IP allowlist and CIDR matching, client IP behind trusted proxies, archive entry checks (traversal, absolute paths, links, write-through existing links), the built-in TAR reader, upload name conflicts, session name and password fingerprint, search filters (text / wildcard / regex, case, type, size, date; links not followed; Trash and hidden names skipped), the `find` arguments, and item paths from `names[]`. On Linux / macOS it also checks that `find` and PHP return the same results.
+- `http.php` installs temporary copies with their own passwords, starts PHP's built-in server and uses the API like a browser: login and CSRF, separate sessions per installation, logout of other sessions after a password change, 403 for an IP not on the allowlist, upload with Replace / Skip / Keep both, chunked upload, a hostile archive, search and copy / move / Trash / delete on search results (including refused `..` and link paths), and switching the trash folder to a random name and back.
 
 ## Files
 

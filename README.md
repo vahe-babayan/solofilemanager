@@ -6,7 +6,7 @@ Manage files directly from your browser — without installing WordPress, Larave
 
 ### One PHP file. No installation. No database.
 
-Current version: **1.4.0** — see [CHANGELOG.md](CHANGELOG.md)
+Current version: **1.5.0** — see [CHANGELOG.md](CHANGELOG.md)
 
 ## Why SoloFileManager?
 
@@ -14,6 +14,7 @@ Current version: **1.4.0** — see [CHANGELOG.md](CHANGELOG.md)
 - 📦 No database required
 - 🔧 Works on shared hosting, VPS and XAMPP
 - 📁 Upload, download, copy, move and rename files
+- 🔍 Find files and folders in all subfolders
 - 🗑️ Trash and restore
 - 📦 ZIP compression and extraction
 - 🔐 Built-in authentication
@@ -26,56 +27,96 @@ Current version: **1.4.0** — see [CHANGELOG.md](CHANGELOG.md)
 <table>
     <tr>
         <td width="100%" colspan="2">
-            <img src="./screenshots/screenshot-1.png" alt="SoloFileManager: folder tree, bookmarks, file list with folder sizes and a folder link" width="100%">
+            <img src="./screenshots/main.png" alt="SoloFileManager: folder tree, bookmarks, file list with folder sizes and a folder link" width="100%">
+            <br><sub>Folder tree, bookmarks and the file list with folder sizes, a folder link and Trash</sub>
         </td>
     </tr>
     <tr>
         <td width="50%">
-            <img src="./screenshots/screenshot-3.png" alt="Upload: a large file sent in parts, small files done" width="100%">
+            <img src="./screenshots/find.png" alt="Find: name, type, size and modified date, in this folder and all subfolders" width="100%">
+            <br><sub>Find by name, type, size and date in all subfolders</sub>
         </td>
         <td width="50%">
-            <img src="./screenshots/screenshot-5.png" alt="Trash: deleted items with original location, Restore and Delete forever" width="100%">
+            <img src="./screenshots/search-results.png" alt="Search results from several folders, each with the folder it is in" width="100%">
+            <br><sub>Search results from several folders, ready to open, download, copy, move or delete</sub>
         </td>
     </tr>
     <tr>
         <td width="50%">
-            <img src="./screenshots/screenshot-4.png" alt="Copy to folder" width="100%">
+            <img src="./screenshots/large-folder-pages.png" alt="Large folder shown in pages: 2,400 files, page 2 of 24" width="100%">
+            <br><sub>Large folders are shown in pages</sub>
         </td>
         <td width="50%">
-            <img src="./screenshots/screenshot-7.png" alt="Bulk rename with live preview" width="100%">
+            <img src="./screenshots/trash.png" alt="Trash: deleted items with original location, Restore and Delete forever" width="100%">
+            <br><sub>Trash with the original location, Restore and Delete forever</sub>
         </td>
     </tr>
     <tr>
         <td width="50%">
-            <img src="./screenshots/screenshot-10.png" alt="Extract / Unzip" width="100%">
+            <img src="./screenshots/upload.png" alt="Upload: a large file sent in parts, small files done" width="100%">
+            <br><sub>Upload: large files are sent in parts</sub>
         </td>
         <td width="50%">
-            <img src="./screenshots/screenshot-11.png" alt="Change permissions for folders and files" width="100%">
+            <img src="./screenshots/upload-conflict.png" alt="Upload: files that already exist, Skip / Replace / Keep both" width="100%">
+            <br><sub>Files that already exist: Skip, Replace or Keep both</sub>
         </td>
     </tr>
     <tr>
         <td width="50%">
-            <img src="./screenshots/screenshot-8.png" alt="Configuration: Display tab" width="100%">
+            <img src="./screenshots/copy.png" alt="Copy to folder" width="100%">
+            <br><sub>Copy or move to another folder</sub>
         </td>
         <td width="50%">
-            <img src="./screenshots/screenshot-9.png" alt="Configuration: Server tab with file operations, idle lock and IP allowlist" width="100%">
+            <img src="./screenshots/bulk-rename.png" alt="Bulk rename with a regular expression and live preview" width="100%">
+            <br><sub>Bulk rename with regular expressions and live preview</sub>
         </td>
     </tr>
     <tr>
         <td width="50%">
-            <img src="./screenshots/screenshot-6.png" alt="Terminal" width="100%">
+            <img src="./screenshots/extract.png" alt="Extract / Unzip" width="100%">
+            <br><sub>Extract ZIP / TAR / TAR.GZ</sub>
         </td>
         <td width="50%">
-            <img src="./screenshots/screenshot-12.png" alt="Server info" width="100%">
+            <img src="./screenshots/extract-unsafe-entries.png" alt="Extract: unsafe archive entries skipped and listed" width="100%">
+            <br><sub>Unsafe archive entries are skipped and listed</sub>
         </td>
     </tr>
     <tr>
         <td width="50%">
-            <img src="./screenshots/screenshot-2.png" alt="Keyboard shortcuts" width="100%">
+            <img src="./screenshots/permissions.png" alt="Change permissions for folders and files" width="100%">
+            <br><sub>Change permissions for folders and files</sub>
         </td>
         <td width="50%">
-            <img src="./screenshots/screenshot-13.png" alt="Session locked after idle time" width="100%">
+            <img src="./screenshots/terminal.png" alt="Terminal" width="100%">
+            <br><sub>Optional terminal (off by default)</sub>
         </td>
+    </tr>
+    <tr>
+        <td width="50%">
+            <img src="./screenshots/config-display.png" alt="Configuration: Display tab with items per page" width="100%">
+            <br><sub>Configuration: display settings</sub>
+        </td>
+        <td width="50%">
+            <img src="./screenshots/config-server.png" alt="Configuration: Server tab with file operations, idle lock, IP allowlist and trash folder name" width="100%">
+            <br><sub>Configuration: file operations, idle lock, IP allowlist, Trash folder</sub>
+        </td>
+    </tr>
+    <tr>
+        <td width="50%">
+            <img src="./screenshots/server-info.png" alt="Server info" width="100%">
+            <br><sub>Server info</sub>
+        </td>
+        <td width="50%">
+            <img src="./screenshots/keyboard-shortcuts.png" alt="Keyboard shortcuts" width="100%">
+            <br><sub>Keyboard shortcuts</sub>
+        </td>
+    </tr>
+    <tr>
+        <td width="50%">
+            <img src="./screenshots/session-locked.png" alt="Session locked after idle time" width="100%">
+            <br><sub>Session locked after idle time</sub>
+        </td>
+        <td width="50%"></td>
     </tr>
 </table>
 
@@ -118,7 +159,7 @@ Current version: **1.4.0** — see [CHANGELOG.md](CHANGELOG.md)
 ## Features
 
 - Folder tree (sidebar) with bookmarks and trash
-- File/folder listing with sortable columns
+- File/folder listing with sortable columns; large folders are shown in pages (100 items by default, set in Configuration → Display)
 - Remembers the last opened folder in the browser: reopen without a URL hash and you land there again (hash in the URL still wins)
 - Optional session idle lock (off by default): lock after 15–120 minutes of idle time; unlock with the password without losing the current folder view. Long jobs keep the session alive
 - Optional IP allowlist (off by default): only listed IPs / CIDR ranges (IPv4 and IPv6) can open the file manager; everyone else gets 403 before the login page
@@ -127,6 +168,7 @@ Current version: **1.4.0** — see [CHANGELOG.md](CHANGELOG.md)
 - Copy / move with progress; drag and drop
 - Delete to Trash or delete forever. Trash works like the Windows Recycle Bin: a flat list showing each item's original name, the folder it came from, deletion date and size, with Restore (back to where it was, renamed to "name (restored)" if that name is taken) and Delete forever; Empty Trash (with confirm); item count on the Trash button, a reminder on Logout, and Server info shows how many items / how much space Trash holds; the `.trash` folder is removed as soon as it is empty
 - Filter the current folder listing by name (search field in the breadcrumb bar)
+- Find in the current folder and all subfolders by name (text, wildcard or regular expression), type, size and modified date; results show where each item is and can be opened, downloaded, copied, moved or deleted; Back returns to the results without searching again. Uses `find` on Linux / macOS when OS file ops are allowed, PHP otherwise
 - Compress / extract archives; entries that would land outside the root folder (links, `..`, absolute paths) are skipped and listed
 - Change permissions (chmod) for folders and files, including recursive 0755 / 0644 style fixes
 - Upload (large files in parts, with retries on connection problems; asks Replace / Skip / Keep both when names already exist), get info, copy paths
@@ -144,7 +186,7 @@ Edit the config block at the top of `solofilemanager.php`:
 |---------|---------|
 | `$ROOT_DIR` | Root path users may browse (default: script directory) |
 | `$ENABLE_AUTH` / `$PASSWORD_HASH` | Session login (keep auth on). Prefer changing the password in the UI (key icon); manual hash paste is the fallback |
-| `$FM_FILE_OPS_MODE` | `'auto'`, `'php'`, or `'os'` for heavy file operations. Prefer changing from **Configuration** (password to save); file edit is the fallback |
+| `$FM_FILE_OPS_MODE` | `'auto'`, `'php'`, or `'os'` for heavy file operations (and for Find: `find` on Linux / macOS in `auto` / `os`). Prefer changing from **Configuration** (password to save); file edit is the fallback |
 | `$FM_IDLE_TIMEOUT_MINUTES` | Idle session lock: `0` (off) or `15` / `30` / `60` / `120`. Prefer **Configuration** (password); file edit is the fallback |
 | `$FM_ALLOWED_IPS` | IP allowlist, e.g. `['203.0.113.5', '192.168.1.0/24']`. Empty `[]` = everyone (default). Editable in **Configuration → Server** (password); if you lock yourself out, edit this line in the PHP file |
 | `$FM_TRUSTED_PROXIES` | Reverse proxies (e.g. Cloudflare ranges) allowed to pass the real client IP in `X-Forwarded-For`. Empty = use the direct connection IP only (default). File edit only |
@@ -178,7 +220,7 @@ The `tests/` folder is for development only (it is not included in release archi
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). Latest: **1.4.0** — security fix: extracting an archive can no longer write outside the root folder through links; plus upload Replace / Skip / Keep both, regular expressions in bulk rename and an optional random trash folder name. Update recommended.
+See [CHANGELOG.md](CHANGELOG.md). Latest: **1.5.0** — Find in all subfolders (name, type, size, date) with actions on the results, large folders shown in pages, and a much faster folder listing.
 
 ## License
 
