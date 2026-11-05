@@ -256,12 +256,70 @@ if (PHP_OS_FAMILY !== 'Windows' && fmIsProcOpenAvailable()) {
         sort($paths);
         return $paths;
     };
-    foreach ([['name' => 'report'], ['name' => '*.txt', 'match' => 'wildcard'], ['name' => 'отчёт'], ['type' => 'folder'], ['name' => '^report-\d{4}', 'match' => 'regex']] as $q) {
+    foreach ([['name' => 'report'], ['name' => '*.txt', 'match' => 'wildcard'], ['name' => 'отчёт'], ['type' => 'folder'], ['name' => '^report-\d{4}', 'match' => 'regex'], ['content' => 'x']] as $q) {
         check('find and PHP return the same: ' . json_encode($q, JSON_UNESCAPED_UNICODE), $findSearch($q) === $phpSearch($q));
     }
 } else {
     echo "  (skipped find(1) comparison: Windows or proc_open unavailable)\n";
 }
+
+section('Search: text inside files');
+$cs = $base . '/content';
+mkdir($cs . '/sub', 0775, true);
+file_put_contents($cs . '/a.txt', "first line\n    Hello World here\nthird\n");
+file_put_contents($cs . '/b.txt', "no match\n");
+file_put_contents($cs . '/sub/ru.txt', "Строка один\nПРИВЕТ мир\n");
+file_put_contents($cs . '/bin.dat', "abc\0hello");
+file_put_contents($cs . '/cp1251.txt', "\xcf\xf0\xe8 hello\n");
+file_put_contents($cs . '/nonl.txt', 'x hello');
+file_put_contents($cs . '/long.txt', str_repeat('a', 70000) . "hello\nnext hello");
+/** Content search below $cs: [path => match]. */
+$contentSearch = static function (array $post, ?callable $tune = null) use ($cs) {
+    $c = fmSearchCriteria($post);
+    if (isset($c['error'])) {
+        return $c['error'];
+    }
+    if ($tune) {
+        $c = $tune($c);
+    }
+    $rows = [];
+    $scanned = 0;
+    fmSearchWalkPhp($cs, false, $cs, $c, [], static function (array $r) use (&$rows): bool {
+        $rows[$r['path']] = $r['match'] ?? null;
+        return true;
+    }, static fn() => true, $scanned);
+    ksort($rows);
+    return $rows;
+};
+$r = $contentSearch(['content' => 'hello']);
+check('text, ignore case: text files only, binary skipped, folders left out', is_array($r) && array_keys($r) === ['a.txt', 'cp1251.txt', 'long.txt', 'nonl.txt'], json_encode($r));
+check('line number and snippet without indentation', ($r['a.txt'] ?? null) === ['line' => 2, 'text' => 'Hello World here', 'at' => 0, 'len' => 5], json_encode($r['a.txt'] ?? null));
+check('line without a final newline', ($r['nonl.txt']['line'] ?? 0) === 1 && ($r['nonl.txt']['text'] ?? '') === 'x hello');
+check('long line checked in parts, still line 1, snippet cut at the start', ($r['long.txt']['line'] ?? 0) === 1 && strpos($r['long.txt']['text'] ?? '', '…') === 0
+    && mb_substr($r['long.txt']['text'], $r['long.txt']['at'], 5) === 'hello');
+check('non-UTF-8 line matched byte by byte, its bytes shown as ?', ($r['cp1251.txt']['text'] ?? '') === '??? hello');
+check('case-sensitive text', array_keys((array)$contentSearch(['content' => 'Hello', 'content_icase' => '0'])) === ['a.txt']);
+$r = $contentSearch(['content' => 'привет']);
+check('Cyrillic, ignore case', array_keys((array)$r) === ['sub/ru.txt'] && ($r['sub/ru.txt']['line'] ?? 0) === 2 && ($r['sub/ru.txt']['len'] ?? 0) === 6, json_encode($r, JSON_UNESCAPED_UNICODE));
+check('regex', array_keys((array)$contentSearch(['content' => '^(first|third)$', 'content_match' => 'regex'])) === ['a.txt']);
+check('invalid regex reported', is_string($contentSearch(['content' => '(', 'content_match' => 'regex'])));
+check('name and text together', array_keys((array)$contentSearch(['name' => 'nonl', 'content' => 'hello'])) === ['nonl.txt']);
+check('file bigger than the limit is skipped', !isset($contentSearch(['content' => 'hello'], static function (array $c): array {
+    $c['content_max_file'] = 100;
+    return $c;
+})['long.txt']));
+$budgetCrit = fmSearchCriteria(['content' => 'zzz']);
+$budgetCrit['content_state']->left = 20;
+$contentSearch(['content' => 'zzz'], static fn(array $c): array => $budgetCrit);
+check('read budget is used up and stays shared', $budgetCrit['content_state']->left <= 0);
+$zero = 0;
+check('nothing is read once the budget is used up', fmSearchContentMatch(fmSearchCriteria(['content' => 'hello']), $cs . '/a.txt', $cs, $zero) === null);
+if ($haveSearchLink) {
+    $left = 1000;
+    check('file through a link to outside the root is not read', fmSearchContentMatch(fmSearchCriteria(['content' => 'o']), $sr . '/link-out/report-outside.txt', $sr, $left) === null && $left === 1000);
+}
+check('find: text search keeps files and links only', in_array('-type', fmSearchFindArgv($cs, false, fmSearchCriteria(['content' => 'x'])), true)
+    && !in_array('-type', fmSearchFindArgv($cs, false, fmSearchCriteria(['name' => 'x'])), true));
 
 section('Item names from names[]');
 check('plain name', fmRequestItemName('a.txt') === 'a.txt');

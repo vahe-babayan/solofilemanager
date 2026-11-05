@@ -237,10 +237,20 @@ try {
     check('case-sensitive wildcard finds nothing for *.TXT', $found($ndjson($body)) === [], $body);
     [, $body] = $br->post($u('a'), ['action' => 'search', 'in' => '', 'name' => '(', 'match' => 'regex']);
     check('invalid regex is a plain JSON error', strpos($body, '"status":"error"') !== false && strpos($body, 'Invalid regular expression') !== false, $body);
+    file_put_contents($dirA . '/s/docs/notes.txt', "intro\n  Budget for 2026\n");
+    [, $body] = $br->post($u('a'), ['action' => 'search', 'in' => 's', 'content' => 'budget']);
+    $lines = $ndjson($body);
+    $last = end($lines) ?: [];
+    $items = array_merge(...array_map(static fn($l) => $l['items'] ?? [], $lines));
+    check('text inside files: result carries the matching line', $found($lines) === ['docs/notes.txt'] && ($items[0]['match'] ?? null) === ['line' => 2, 'text' => 'Budget for 2026', 'at' => 0, 'len' => 6]
+        && isset($last['bytes_read']) && $last['bytes_read'] > 0, $body);
+    [, $body] = $br->post($u('a'), ['action' => 'search', 'in' => '', 'content' => '(', 'content_match' => 'regex']);
+    check('invalid regex for the text is a plain JSON error', strpos($body, '"status":"error"') !== false && strpos($body, 'Contains text') !== false, $body);
+    unlink($dirA . '/s/docs/notes.txt');
     mkdir($dirA . '/.trash');
     [, $body] = $br->post($u('a'), ['action' => 'search', 'in' => '.trash', 'name' => 'x']);
     check('search inside Trash refused', strpos($body, 'not available in Trash') !== false, $body);
-    rmdir($dirA . '/.trash');
+    rmTree($dirA . '/.trash');
     [, $body] = $br->post($u('a'), ['action' => 'search', 'in' => '../..', 'name' => 'x']);
     check('search outside the root refused', strpos($body, '"status":"error"') !== false, $body);
 
@@ -256,9 +266,37 @@ try {
     $br->post($u('a'), ['action' => 'trash-empty']);
     [, $body] = $br->post($u('a'), ['action' => 'delete-stream', 'in' => 's', 'names[]' => ['docs/../../outside-x', '../s']]);
     check('names with .. are refused', strpos($body, 'Nothing to delete') !== false, $body);
+
+    file_put_contents($dirA . '/s/docs/img1.txt', 'D');
+    file_put_contents($dirA . '/s/dest/img1.txt', 'E');
+    [, $body] = $br->post($u('a'), ['action' => 'bulk-rename', 'in' => 's', 'from[]' => ['docs/img1.txt', 'dest/img1.txt'], 'to[]' => ['photo.txt', 'photo.txt']]);
+    check('bulk rename of results: the same new name in different folders', strpos($body, '"success"') !== false
+        && @file_get_contents($dirA . '/s/docs/photo.txt') === 'D' && @file_get_contents($dirA . '/s/dest/photo.txt') === 'E', $body);
+    [, $body] = $br->post($u('a'), ['action' => 'bulk-rename', 'in' => 's', 'from[]' => ['docs', 'docs/photo.txt'], 'to[]' => ['papers', 'pic.txt']]);
+    check('bulk rename of a folder and a file inside it', strpos($body, '"success"') !== false && @file_get_contents($dirA . '/s/papers/pic.txt') === 'D', $body);
+    [, $body] = $br->post($u('a'), ['action' => 'bulk-rename', 'in' => 's', 'from[]' => ['papers/pic.txt', 'report-b.txt'], 'to[]' => ['x.txt', 'report-a.txt']]);
+    check('a conflict in one folder renames nothing in the others', strpos($body, 'Target already exists: report-a.txt') !== false
+        && file_exists($dirA . '/s/papers/pic.txt') && !file_exists($dirA . '/s/papers/x.txt'), $body);
+    [, $body] = $br->post($u('a'), ['action' => 'bulk-rename', 'in' => 's', 'from[]' => '../s/report-b.txt', 'to[]' => 'z.txt']);
+    check('bulk rename with .. refused', strpos($body, 'Invalid name in batch') !== false && file_exists($dirA . '/s/report-b.txt'), $body);
+    [, $body] = $br->post($u('a'), ['action' => 'bulk-rename', 'in' => 's', 'from[]' => 'report-b.txt', 'to[]' => 'dest/z.txt']);
+    check('new name with a folder in it refused', strpos($body, 'Invalid name in batch') !== false && !file_exists($dirA . '/s/dest/z.txt'), $body);
+    [, $body] = $br->post($u('a'), ['action' => 'chmod', 'in' => 's', 'file_names[]' => 'dest/photo.txt', 'file_mode' => '444']);
+    clearstatcache();
+    check('chmod of a result in a subfolder', strpos($body, '"ok":["dest\/photo.txt"]') !== false || strpos($body, '"ok":["dest/photo.txt"]') !== false, $body);
+    check('chmod made the file read-only', !is_writable($dirA . '/s/dest/photo.txt'));
+    $br->post($u('a'), ['action' => 'chmod', 'in' => 's', 'file_names[]' => 'dest/photo.txt', 'file_mode' => '644']);
+    [, $body] = $br->post($u('a'), ['action' => 'chmod', 'in' => 's', 'file_names[]' => '../s/report-b.txt', 'file_mode' => '444']);
+    check('chmod with .. refused', strpos($body, 'invalid name') !== false, $body);
+
     if ($sLink) {
         [, $body] = $br->post($u('a'), ['action' => 'delete-stream', 'in' => 's', 'names[]' => 'out/report-outside.txt']);
         check('a path through a link to outside the root is refused', strpos($body, 'Nothing to delete') !== false && file_exists($outside . '/report-outside.txt'), $body);
+        [, $body] = $br->post($u('a'), ['action' => 'bulk-rename', 'in' => 's', 'from[]' => 'out/report-outside.txt', 'to[]' => 'renamed.txt']);
+        check('bulk rename through a link to outside refused', strpos($body, '"error"') !== false && file_exists($outside . '/report-outside.txt'), $body);
+        [, $body] = $br->post($u('a'), ['action' => 'chmod', 'in' => 's', 'file_names[]' => 'out/report-outside.txt', 'file_mode' => '444']);
+        clearstatcache();
+        check('chmod through a link to outside refused', strpos($body, 'not found') !== false && is_writable($outside . '/report-outside.txt'), $body);
         rmTree($dirA . '/s/out');
     }
     @unlink($outside . '/report-outside.txt');

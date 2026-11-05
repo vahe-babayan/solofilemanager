@@ -8,7 +8,7 @@ declare(strict_types=1);
  */
 
 /** Product version (semver). Shown in UI / server info. */
-const SOLOFILEMANAGER_VERSION = '1.5.0';
+const SOLOFILEMANAGER_VERSION = '1.6.0';
 
 // Set max execution time to 1 day (86400 seconds)
 @set_time_limit(86400);
@@ -337,9 +337,10 @@ function fmApplyChmodTree(
  * @param string $dir
  * @param string $rootDir
  * @param list<array{0:string,1:string}> $pairs
+ * @param bool $checkOnly Only validate (names, conflicts, sources exist); rename nothing
  * @return array{ok: list<string>, errors: list<string>}
  */
-function fmBulkRenamePairs(string $dir, string $rootDir, array $pairs): array {
+function fmBulkRenamePairs(string $dir, string $rootDir, array $pairs, bool $checkOnly = false): array {
     $dir = safeRealpath($dir);
     if (!pathInsideRoot($dir, $rootDir) || !is_dir($dir)) {
         return ['ok' => [], 'errors' => ['Invalid folder']];
@@ -388,6 +389,9 @@ function fmBulkRenamePairs(string $dir, string $rootDir, array $pairs): array {
         if (!file_exists($fullFrom)) {
             return ['ok' => [], 'errors' => ['Not found: ' . $w['from']]];
         }
+    }
+    if ($checkOnly) {
+        return ['ok' => [], 'errors' => []];
     }
 
     $tmps = [];
@@ -3548,11 +3552,17 @@ function getFolderSize(string $path, string $rootDir): int {
 /** Search stops after this many results or seconds (the client shows that the list is incomplete). */
 const FM_SEARCH_MAX_RESULTS = 5000;
 const FM_SEARCH_MAX_SECONDS = 120;
+/** Content search: bigger files are skipped. */
+const FM_SEARCH_CONTENT_MAX_FILE_BYTES = 10485760;
+/** Content search: the search stops after reading this much in total. */
+const FM_SEARCH_CONTENT_MAX_TOTAL_BYTES = 1073741824;
 
 /**
  * Search criteria from the request.
+ * With a content text, content_state->left is the read budget shared by every copy of the criteria array.
  *
- * @return array{name: string, match: string, icase: bool, type: string, size_min: ?int, size_max: ?int, mtime_from: ?int, mtime_to: ?int, re: ?string, error?: string}
+ * @return array{name: string, match: string, icase: bool, type: string, size_min: ?int, size_max: ?int, mtime_from: ?int, mtime_to: ?int, re: ?string,
+ *     content: string, content_match: string, content_icase: bool, content_re: ?string, content_re_bytes: ?string, content_max_file: int, content_state: ?object, error?: string}
  */
 function fmSearchCriteria(array $in): array {
     $num = static function ($v): ?int {
@@ -3561,6 +3571,7 @@ function fmSearchCriteria(array $in): array {
     };
     $match = (string)($in['match'] ?? 'contains');
     $type = (string)($in['type'] ?? 'any');
+    $contentMatch = (string)($in['content_match'] ?? 'contains');
     $c = [
         'name'       => (string)($in['name'] ?? ''),
         'match'      => in_array($match, ['contains', 'wildcard', 'regex'], true) ? $match : 'contains',
@@ -3571,7 +3582,32 @@ function fmSearchCriteria(array $in): array {
         'mtime_from' => $num($in['mtime_from'] ?? ''),
         'mtime_to'   => $num($in['mtime_to'] ?? ''),
         're'         => null,
+        'content'          => (string)($in['content'] ?? ''),
+        'content_match'    => $contentMatch === 'regex' ? 'regex' : 'contains',
+        'content_icase'    => (string)($in['content_icase'] ?? '1') !== '0',
+        'content_re'       => null,
+        'content_re_bytes' => null,
+        'content_max_file' => FM_SEARCH_CONTENT_MAX_FILE_BYTES,
+        'content_state'    => null,
     ];
+    if (strlen($c['content']) > 500 || preg_match('/[\x00-\x08\x0a-\x1f]/', $c['content'])) {
+        return $c + ['error' => 'The text to find in files is too long or contains control characters.'];
+    }
+    if ($c['content'] !== '') {
+        $body = $c['content_match'] === 'regex' ? $c['content'] : preg_quote($c['content'], "\x01");
+        $flags = $c['content_icase'] ? 'i' : '';
+        $re = "\x01" . $body . "\x01u" . $flags;
+        if (@preg_match($re, '') === false) {
+            $err = error_get_last();
+            $msg = $err ? preg_replace('/^preg_match\(\):\s*/', '', (string)$err['message']) : 'invalid pattern';
+            return $c + ['error' => 'Invalid regular expression in “Contains text”: ' . $msg];
+        }
+        $c['content_re'] = $re;
+        // Lines that are not UTF-8 are matched byte by byte (ignore case then covers ASCII letters only).
+        $bytes = "\x01" . $body . "\x01" . $flags;
+        $c['content_re_bytes'] = @preg_match($bytes, '') === false ? null : $bytes;
+        $c['content_state'] = (object)['left' => FM_SEARCH_CONTENT_MAX_TOTAL_BYTES];
+    }
     if (strlen($c['name']) > 500 || preg_match('/[\x00-\x1f]/', $c['name'])) {
         return $c + ['error' => 'The name to find is too long or contains control characters.'];
     }
@@ -3626,7 +3662,7 @@ function fmSearchEntry(array $c, string $full, string $rel, string $name, bool $
     if (($c['type'] === 'file' && $isDir) || ($c['type'] === 'folder' && !$isDir)) {
         return null;
     }
-    if ($isDir && ($c['size_min'] !== null || $c['size_max'] !== null)) {
+    if ($isDir && ($c['size_min'] !== null || $c['size_max'] !== null || ($c['content'] ?? '') !== '')) {
         return null;
     }
     if (!fmSearchNameMatches($c, $name)) {
@@ -3642,6 +3678,13 @@ function fmSearchEntry(array $c, string $full, string $rel, string $name, bool $
     if (($c['size_min'] !== null && $size < $c['size_min']) || ($c['size_max'] !== null && $size > $c['size_max'])) {
         return null;
     }
+    $match = null;
+    if (($c['content'] ?? '') !== '') {
+        $match = fmSearchContentMatch($c, $full, $rootDir, $c['content_state']->left);
+        if ($match === null) {
+            return null;
+        }
+    }
     $perms = @fileperms($full);
     $row = [
         'path'        => $rel,
@@ -3653,7 +3696,114 @@ function fmSearchEntry(array $c, string $full, string $rel, string $name, bool $
         $row['size'] = $size;
         $row['ext'] = pathinfo($name, PATHINFO_EXTENSION);
     }
+    if ($match !== null) {
+        $row['match'] = $match;
+    }
     return $row + (fmLinkInfo($full, $rootDir) ?? []);
+}
+
+/**
+ * First line of a text file that matches the content criteria: ['line' => N, 'text' => snippet, 'at' => offset
+ * of the match in the snippet, 'len' => its length] (characters), or null. Files outside the root (through a link),
+ * bigger than content_max_file or binary (a NUL byte in the first 8 KB) are not read. Every byte read is taken
+ * from $budget; nothing is read once it is used up. Lines longer than 64 KB are checked in 64 KB parts.
+ */
+function fmSearchContentMatch(array $c, string $full, string $rootDir, int &$budget): ?array {
+    if ($budget <= 0 || !is_file($full) || !pathInsideRoot($full, $rootDir)) {
+        return null;
+    }
+    $size = @filesize($full);
+    if ($size === false || $size > $c['content_max_file']) {
+        return null;
+    }
+    $h = @fopen($full, 'rb');
+    if ($h === false) {
+        return null;
+    }
+    $head = (string)fread($h, 8192);
+    if (strpos($head, "\0") !== false) {
+        $budget -= strlen($head);
+        fclose($h);
+        return null;
+    }
+    rewind($h);
+    $lineNo = 0;
+    $inLongLine = false;
+    $found = null;
+    while (($line = fgets($h, 65537)) !== false) {
+        $budget -= strlen($line);
+        if (!$inLongLine) {
+            $lineNo++;
+        }
+        $inLongLine = substr($line, -1) !== "\n";
+        $text = rtrim($line, "\r\n");
+        $utf8 = preg_match('//u', $text) === 1;
+        $re = $utf8 ? $c['content_re'] : $c['content_re_bytes'];
+        if ($re !== null && @preg_match($re, $text, $m, PREG_OFFSET_CAPTURE) === 1) {
+            $found = ['line' => $lineNo] + fmSearchSnippet($text, (int)$m[0][1], strlen($m[0][0]), $utf8);
+            break;
+        }
+        if ($budget <= 0) {
+            break;
+        }
+    }
+    fclose($h);
+    return $found;
+}
+
+/**
+ * Up to about 160 characters of $text around the match at byte $off (length $len): leading indentation dropped,
+ * "…" where cut, control characters as spaces; bytes of a non-UTF-8 line shown as "?".
+ *
+ * @return array{text: string, at: int, len: int}
+ */
+function fmSearchSnippet(string $text, int $off, int $len, bool $utf8): array {
+    if (!$utf8) {
+        $text = (string)preg_replace('/[\x80-\xff]/', '?', $text);
+    }
+    $chars = static function (string $s): array {
+        $s = (string)preg_replace('/[\x00-\x1f\x7f]/', ' ', $s);
+        return $s === '' ? [] : (preg_split('//u', $s, -1, PREG_SPLIT_NO_EMPTY) ?: []);
+    };
+    // Only bytes near the match are split into characters; cut edges may hold half a character, which is dropped.
+    $preStart = max(0, $off - 400);
+    $pre = (string)preg_replace('/^[\x80-\xbf]+/', '', substr($text, $preStart, $off - $preStart));
+    $hitBytes = substr($text, $off, $len);
+    $hitCut = strlen($hitBytes) > 400;
+    if ($hitCut) {
+        $hitBytes = (string)preg_replace('/[\xc0-\xff][\x80-\xbf]*$/', '', substr($hitBytes, 0, 400));
+    }
+    $post = substr($text, $off + $len, 400);
+    if (strlen($text) - $off - $len > 400) {
+        $post = (string)preg_replace('/[\xc0-\xff][\x80-\xbf]*$/', '', $post);
+    }
+    $preC = $chars($pre);
+    $hitC = $chars($hitBytes);
+    $postC = $chars($post);
+    if ($preStart === 0) {
+        while ($preC && $preC[0] === ' ') {
+            array_shift($preC);
+        }
+    }
+    $preCut = $preStart > 0;
+    if (count($preC) > 50) {
+        $preC = array_slice($preC, -50);
+        $preCut = true;
+    }
+    if (count($hitC) > 80) {
+        $hitC = array_slice($hitC, 0, 80);
+        $hitCut = true;
+    }
+    $room = max(0, 160 - count($preC) - count($hitC));
+    $postCut = strlen($text) - $off - $len > 400 || count($postC) > $room;
+    $postC = array_slice($postC, 0, $room);
+    $before = ($preCut ? '…' : '') . implode('', $preC);
+    $hit = implode('', $hitC) . ($hitCut ? '…' : '');
+    return [
+        'text' => $before . $hit . implode('', $postC) . ($postCut ? '…' : ''),
+        'at'   => count($preC) + ($preCut ? 1 : 0),
+        'len'  => count($hitC),
+    ];
 }
 
 /**
@@ -3714,6 +3864,10 @@ function fmSearchFindArgv(string $baseDir, bool $atRoot, array $c): array {
     if ($name !== '' && $c['match'] !== 'regex' && (!$c['icase'] || !preg_match('/[\x80-\xff]/', $name))) {
         $pattern = $c['match'] === 'contains' ? '*' . $glob($name) . '*' : addcslashes($name, '\\[]');
         array_push($argv, $c['icase'] ? '-iname' : '-name', $pattern);
+    }
+    // Content is read from files only; links stay in (PHP reads a linked file when it is inside the root).
+    if (($c['content'] ?? '') !== '') {
+        array_push($argv, '(', '-type', 'f', '-o', '-type', 'l', ')');
     }
     $argv[] = '-print0';
     return $argv;
@@ -5504,16 +5658,39 @@ if (isset($_POST['action']) && $_POST['action'] === 'bulk-rename' && isset($_POS
     if (count($from) !== count($to) || count($from) === 0) {
         jsonOut(['status' => 'error', 'msg' => 'Invalid batch']);
     }
-    $pairs = [];
+    // Search results rename items in several folders: "from" may be a path below the folder, "to" is the new
+    // name in the same folder. Every folder is checked before anything is renamed; deeper folders go first so
+    // renaming a parent does not break the paths of selected items inside it.
+    $groups = [];
     $n = count($from);
     for ($i = 0; $i < $n; $i++) {
-        $pairs[] = [(string)$from[$i], (string)$to[$i]];
+        $f = fmRequestItemName((string)$from[$i]);
+        $t = (string)$to[$i];
+        if ($f === null || $t === '' || $t === '.' || $t === '..' || preg_match('/[\\\\\/:*?"<>|]/', $t)) {
+            jsonOut(['status' => 'error', 'msg' => 'Invalid name in batch']);
+        }
+        $slash = strrpos($f, '/');
+        $sub = $slash === false ? '' : substr($f, 0, $slash);
+        $groups[$sub][] = [$slash === false ? $f : substr($f, $slash + 1), $t];
     }
-    $result = fmBulkRenamePairs($dir, $ROOT_DIR, $pairs);
-    if ($result['errors'] !== []) {
-        jsonOut(['status' => 'error', 'msg' => implode('; ', $result['errors'])]);
+    uksort($groups, static fn($a, $b) => substr_count($b, '/') + ($b !== '' ? 1 : 0) <=> substr_count($a, '/') + ($a !== '' ? 1 : 0));
+    foreach ($groups as $sub => $pairs) {
+        $check = fmBulkRenamePairs($sub === '' ? $dir : $dir . '/' . $sub, $ROOT_DIR, $pairs, true);
+        if ($check['errors'] !== []) {
+            jsonOut(['status' => 'error', 'msg' => ($sub === '' ? '' : $sub . ': ') . implode('; ', $check['errors'])]);
+        }
     }
-    jsonOut(['status' => 'success', 'msg' => 'Renamed', 'ok' => $result['ok']]);
+    $ok = [];
+    foreach ($groups as $sub => $pairs) {
+        $result = fmBulkRenamePairs($sub === '' ? $dir : $dir . '/' . $sub, $ROOT_DIR, $pairs);
+        foreach ($result['ok'] as $name) {
+            $ok[] = $sub === '' ? $name : $sub . '/' . $name;
+        }
+        if ($result['errors'] !== []) {
+            jsonOut(['status' => 'error', 'msg' => ($sub === '' ? '' : $sub . ': ') . implode('; ', $result['errors']), 'ok' => $ok]);
+        }
+    }
+    jsonOut(['status' => 'success', 'msg' => 'Renamed', 'ok' => $ok]);
 }
 
 if (isset($_POST['action']) && $_POST['action'] === 'create-new-folder' && isset($_POST['in'], $_POST['name'])) {
@@ -7050,13 +7227,10 @@ if (isset($_POST['action']) && $_POST['action'] === 'chmod' && isset($_POST['in'
         jsonOut(['status' => 'error', 'msg' => 'Nothing to change']);
     }
 
-    foreach ($folderNames as $name) {
-        $name = basename((string)$name);
-        if ($name === '' || $name === '.' || $name === '..') {
-            continue;
-        }
-        if (preg_match('/[\\\\\/:*?"<>|]/', $name)) {
-            $errors[] = $name . ': invalid name';
+    foreach ($folderNames as $raw) {
+        $name = fmRequestItemName($raw);
+        if ($name === null) {
+            $errors[] = basename((string)$raw) . ': invalid name';
             continue;
         }
         $full = $dir . '/' . $name;
@@ -7075,13 +7249,10 @@ if (isset($_POST['action']) && $_POST['action'] === 'chmod' && isset($_POST['in'
         $ok[] = $name;
     }
 
-    foreach ($fileNames as $name) {
-        $name = basename((string)$name);
-        if ($name === '' || $name === '.' || $name === '..') {
-            continue;
-        }
-        if (preg_match('/[\\\\\/:*?"<>|]/', $name)) {
-            $errors[] = $name . ': invalid name';
+    foreach ($fileNames as $raw) {
+        $name = fmRequestItemName($raw);
+        if ($name === null) {
+            $errors[] = basename((string)$raw) . ': invalid name';
             continue;
         }
         $full = $dir . '/' . $name;
@@ -7167,7 +7338,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'search') {
         }
         return true;
     };
-    $tick = static function () use (&$scanned, &$reason, $started, $send, $flushBatch): bool {
+    $tick = static function () use (&$scanned, &$reason, $started, $send, $flushBatch, $crit): bool {
         $flushBatch();
         $send(['scanned' => $scanned]);
         if (connection_aborted()) {
@@ -7176,6 +7347,10 @@ if (isset($_POST['action']) && $_POST['action'] === 'search') {
         }
         if (microtime(true) - $started > FM_SEARCH_MAX_SECONDS) {
             $reason = 'time';
+            return false;
+        }
+        if ($crit['content_state'] !== null && $crit['content_state']->left <= 0) {
+            $reason = 'content_limit';
             return false;
         }
         return true;
@@ -7216,16 +7391,24 @@ if (isset($_POST['action']) && $_POST['action'] === 'search') {
     if (!$ranFind) {
         fmSearchWalkPhp($baseDir, $atRoot, $ROOT_DIR, $crit, $exclude, $emit, $tick, $scanned);
     }
+    // The walk may end before the next tick notices the used-up budget.
+    if ($reason === null && $crit['content_state'] !== null && $crit['content_state']->left <= 0) {
+        $reason = 'content_limit';
+    }
     $flushBatch();
-    $send([
+    $done = [
         'done'      => true,
         'count'     => $count,
         'scanned'   => $scanned,
-        'truncated' => $reason === 'limit' || $reason === 'time',
+        'truncated' => in_array($reason, ['limit', 'time', 'content_limit'], true),
         'reason'    => $reason,
         'engine'    => $engine,
         'seconds'   => round(microtime(true) - $started, 2),
-    ]);
+    ];
+    if ($crit['content_state'] !== null) {
+        $done['bytes_read'] = FM_SEARCH_CONTENT_MAX_TOTAL_BYTES - max(0, $crit['content_state']->left);
+    }
+    $send($done);
     exit;
 }
 
@@ -8078,6 +8261,46 @@ html:has(.fm-table-wrapper) body {
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    container-type: inline-size;
+    container-name: fm-list;
+}
+
+/*
+ * Narrow list: the other columns have fixed widths (48 + 124 + 80 + 148 + 80 + 152 = 632 px), so Name would
+ * shrink to a few characters. Hide the less important columns one by one to keep Name at about 220 px.
+ * Trash has a wider Actions column (+32 px).
+ */
+@container fm-list (max-width: 852px) {
+    .fm-table th.fm-table-col-permissions,
+    .fm-table td.fm-table-col-permissions { display: none; }
+}
+@container fm-list (max-width: 772px) {
+    .fm-table th.fm-table-col-type,
+    .fm-table td.fm-table-col-type { display: none; }
+}
+@container fm-list (max-width: 692px) {
+    .fm-table th.fm-table-col-mtime,
+    .fm-table td.fm-table-col-mtime { display: none; }
+}
+@container fm-list (max-width: 540px) {
+    .fm-table th.fm-table-col-actions,
+    .fm-table td.fm-table-col-actions { display: none; }
+}
+@container fm-list (max-width: 884px) {
+    .fm-table--trash-view th.fm-table-col-permissions,
+    .fm-table--trash-view td.fm-table-col-permissions { display: none; }
+}
+@container fm-list (max-width: 804px) {
+    .fm-table--trash-view th.fm-table-col-type,
+    .fm-table--trash-view td.fm-table-col-type { display: none; }
+}
+@container fm-list (max-width: 724px) {
+    .fm-table--trash-view th.fm-table-col-mtime,
+    .fm-table--trash-view td.fm-table-col-mtime { display: none; }
+}
+@container fm-list (max-width: 572px) {
+    .fm-table--trash-view th.fm-table-col-actions,
+    .fm-table--trash-view td.fm-table-col-actions { display: none; }
 }
 
 /* --- Core UI styles (table + popup) --- */
@@ -9662,6 +9885,13 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     font-size: 0.75rem;
 }
 
+.fm-bulk-rename-popup .fm-br-dir {
+    display: block;
+    font-size: 0.75rem;
+    opacity: 0.65;
+    word-break: break-all;
+}
+
 .fm-bulk-rename-popup .fm-br-hint {
     margin: 0.35rem 0 0;
     font-size: 0.75rem;
@@ -10379,6 +10609,8 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     background-color: #dcdcdc;
     flex-shrink: 0;
     display: block;
+    /* On the header itself (not the cells) so the line also runs above the scrollbar space. */
+    border-bottom: 2px solid #ccc;
 }
 
 .fm-table tbody {
@@ -10508,7 +10740,6 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     text-align: left;
     font-weight: 600;
     color: #373737;
-    border-bottom: 2px solid #ccc;
     white-space: nowrap;
     font-size: 13px;
 }
@@ -10844,6 +11075,36 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     color: rgba(255, 255, 255, .8);
 }
 
+.fm-search-match {
+    display: block;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: pre;
+    font-size: 11px;
+    color: #555;
+}
+
+.fm-search-match-line {
+    color: #888;
+}
+
+.fm-search-match mark {
+    padding: 0 1px;
+    border-radius: 2px;
+    background: #ffe58f;
+    color: inherit;
+}
+
+.fm-table tbody tr.fm-table-row-selected .fm-search-match,
+.fm-table tbody tr.fm-table-row-selected .fm-search-match-line {
+    color: rgba(255, 255, 255, .85);
+}
+
+.fm-table tbody tr.fm-table-row-selected .fm-search-match mark {
+    background: rgba(255, 255, 255, .3);
+}
+
 .fm-table .fm-table-name {
     display: block;
     /* flex: 1 1 0; */
@@ -11148,6 +11409,11 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     border-radius: 5px;
     background: #fff;
     font-size: 13px;
+}
+
+.fm-find-popup .fm-find-content-label {
+    display: block;
+    margin-top: 10px;
 }
 
 .fm-find-popup .fm-find-check {
@@ -13238,6 +13504,7 @@ class FmSearchPopup extends FmPopup {
         const { whereLabel, initial, onSubmit, ...rest } = options;
         const f = Object.assign({
             name: '', match: 'contains', icase: true, type: 'any',
+            content: '', contentMatch: 'contains', contentIcase: true,
             sizeMin: '', sizeMinUnit: 'MB', sizeMax: '', sizeMaxUnit: 'MB', dateFrom: '', dateTo: '',
         }, initial || {});
         const esc = FmPopup.escapeHtml;
@@ -13260,6 +13527,15 @@ class FmSearchPopup extends FmPopup {
                 '</select>' +
                 '<label class="fm-find-check"><input type="checkbox" class="fm-find-icase"' + (f.icase ? ' checked' : '') + '> Ignore case</label>' +
                 '</div>' +
+                '<label class="fm-find-content-label"><span>Contains text</span><input type="text" name="fm-find-content" class="fm-input" autocomplete="off" ' +
+                'placeholder="Text inside files (optional)" value="' + attr(f.content) + '"></label>' +
+                '<div class="fm-find-row">' +
+                '<select class="fm-find-content-match" aria-label="How to match the text inside files">' +
+                opt('contains', 'Line contains the text', f.contentMatch) +
+                opt('regex', 'Regular expression (one line)', f.contentMatch) +
+                '</select>' +
+                '<label class="fm-find-check"><input type="checkbox" class="fm-find-content-icase"' + (f.contentIcase ? ' checked' : '') + '> Ignore case</label>' +
+                '</div>' +
                 '<div class="fm-find-grid">' +
                 '<label class="fm-find-field"><span>Type</span><select class="fm-find-type">' +
                 opt('any', 'Files and folders', f.type) + opt('file', 'Files only', f.type) + opt('folder', 'Folders only', f.type) +
@@ -13273,7 +13549,7 @@ class FmSearchPopup extends FmPopup {
                 '<label class="fm-find-field"><span>Modified from</span><input type="date" class="fm-find-date-from" value="' + attr(f.dateFrom) + '"></label>' +
                 '<label class="fm-find-field"><span>Modified until</span><input type="date" class="fm-find-date-to" value="' + attr(f.dateTo) + '"></label>' +
                 '</div>' +
-                '<p class="fm-hint fm-find-note">A size limit leaves folders out. The search stops after 5,000 results.</p>' +
+                '<p class="fm-hint fm-find-note">A size limit or text inside files leaves folders out. Text is searched in text files up to 10 MB; binary files are skipped. The search stops after 5,000 results.</p>' +
                 '<p class="fm-error" data-err style="display:none"></p>',
             buttons: [
                 { label: 'Cancel', close: true },
@@ -13299,6 +13575,9 @@ class FmSearchPopup extends FmPopup {
             name:        q('[name="fm-find-name"]').value.trim(),
             match:       q('.fm-find-match').value,
             icase:       q('.fm-find-icase').checked,
+            content:     q('[name="fm-find-content"]').value,
+            contentMatch: q('.fm-find-content-match').value,
+            contentIcase: q('.fm-find-content-icase').checked,
             type:        q('.fm-find-type').value,
             sizeMin:     q('.fm-find-size-min').value.trim(),
             sizeMinUnit: q('.fm-find-size-min-unit').value,
@@ -13312,6 +13591,14 @@ class FmSearchPopup extends FmPopup {
                 new RegExp(f.name, f.icase ? 'i' : '');
             } catch (e) {
                 fail('Invalid regular expression: ' + (e && e.message ? String(e.message).replace(/^Invalid regular expression:\s*/i, '') : ''));
+                return;
+            }
+        }
+        if (f.contentMatch === 'regex' && f.content) {
+            try {
+                new RegExp(f.content, f.contentIcase ? 'i' : '');
+            } catch (e) {
+                fail('Invalid regular expression in “Contains text”: ' + (e && e.message ? String(e.message).replace(/^Invalid regular expression:\s*/i, '') : ''));
                 return;
             }
         }
@@ -13345,6 +13632,7 @@ class FmSearchPopup extends FmPopup {
         }
         const post = {
             name: f.name, match: f.match, icase: f.icase ? '1' : '0', type: f.type,
+            content: f.content, content_match: f.contentMatch, content_icase: f.contentIcase ? '1' : '0',
             size_min: sizeMin, size_max: sizeMax, mtime_from: from, mtime_to: until,
         };
         this.hideAndDestroy();
@@ -18354,11 +18642,13 @@ class FmBulkRenamePopup extends FmPopup {
     constructor(options = {}) {
         const { currentPath, rootDir, ajaxUrl, rows = [], onSuccess, ...rest } = options;
         const n = rows.length;
+        const dirCount = new Set(rows.map((r) => FmBulkRenamePopup._splitName(r && r.name).dir)).size;
         const content =
             '<p class="fm-br-intro">Rename <strong>' +
             n +
             '</strong> item' +
             (n === 1 ? '' : 's') +
+            (dirCount > 1 ? ' in <strong>' + dirCount + '</strong> folders' : '') +
             ' using the rules below. Preview updates as you type.</p>' +
             '<div class="fm-br-controls">' +
             '<div class="fm-br-row"><label class="fm-br-label">Find</label>' +
@@ -18415,6 +18705,17 @@ class FmBulkRenamePopup extends FmPopup {
         this._rootDir = rootDir || '';
         this._ajaxUrl = ajaxUrl || '';
         this._onSuccess = typeof onSuccess === 'function' ? onSuccess : null;
+    }
+
+    /**
+     * Search results give rows a path below the current folder ("docs/a.txt"); only the last part is renamed.
+     * @param {string} name
+     * @returns {{ dir: string, base: string }}
+     */
+    static _splitName(name) {
+        const s = name ? String(name) : '';
+        const slash = s.lastIndexOf('/');
+        return slash < 0 ? { dir: '', base: s } : { dir: s.slice(0, slash), base: s.slice(slash + 1) };
     }
 
     /**
@@ -18520,6 +18821,7 @@ class FmBulkRenamePopup extends FmPopup {
         const esc = FmPopup.escapeHtml.bind(FmPopup);
         const tbody = this.el && this.el.querySelector('.fm-br-tbody');
         if (!tbody) return;
+        const baseRel = this._currentPath === this._rootDir ? '' : this._currentPath.slice(this._rootDir.length + 1);
         const o = this._readOpts();
         const compiled = FmBulkRenamePopup._findRegex(o);
         o.findRe = compiled.re;
@@ -18543,27 +18845,29 @@ class FmBulkRenamePopup extends FmPopup {
         let hasErr = false;
         for (let i = 0; i < this._rows.length; i++) {
             const row = this._rows[i];
-            const oldName = row && row.name ? String(row.name) : '';
+            const { dir, base: oldName } = FmBulkRenamePopup._splitName(row && row.name);
             const isFolder = !!(row && row.type === 'folder');
             const neu = FmBulkRenamePopup._computeNewName(oldName, isFolder, i, o);
+            const seenKey = dir + '/' + neu;
             let cellErr = '';
             if (invalidRe.test(neu)) {
                 cellErr = 'Invalid characters';
                 hasErr = true;
-            } else if (neu === '') {
+            } else if (neu === '' || neu === '.' || neu === '..') {
                 cellErr = 'Empty name';
                 hasErr = true;
-            } else if (seen[neu]) {
+            } else if (seen[seenKey]) {
                 cellErr = 'Duplicate new name';
                 hasErr = true;
             } else {
-                seen[neu] = true;
+                seen[seenKey] = true;
             }
             if (neu !== oldName) changeCount += 1;
             const cls = cellErr ? ' fm-br-preview-cell--err' : '';
             html +=
                 '<tr><td>' +
                 esc(oldName) +
+                (dir ? '<span class="fm-br-dir">in /' + esc([baseRel, dir].filter(Boolean).join('/')) + '</span>' : '') +
                 '</td><td class="' +
                 cls.trim() +
                 '">' +
@@ -18675,10 +18979,10 @@ class FmBulkRenamePopup extends FmPopup {
         const pairs = [];
         for (let i = 0; i < this._rows.length; i++) {
             const row = this._rows[i];
-            const oldName = row && row.name ? String(row.name) : '';
+            const { base: oldName } = FmBulkRenamePopup._splitName(row && row.name);
             const isFolder = !!(row && row.type === 'folder');
             const neu = FmBulkRenamePopup._computeNewName(oldName, isFolder, i, o);
-            if (neu !== oldName) pairs.push([oldName, neu]);
+            if (neu !== oldName) pairs.push([String(row.name), neu]);
         }
         if (pairs.length === 0) {
             this.hideAndDestroy();
@@ -20319,7 +20623,8 @@ class FmFileManagerTable extends FmTable {
      */
     static SEARCH_VIEW_ACTIONS = new Set([
         'find', 'refresh', 'close-search', 'open', 'open-location', 'open-in-new-tab', 'download',
-        'copy', 'move', 'delete', 'copy-path', 'copy-relative-path', 'get-info', 'select-none', 'invert-selection',
+        'copy', 'move', 'delete', 'bulk-rename', 'change-permissions', 'copy-path', 'copy-relative-path', 'get-info',
+        'select-none', 'invert-selection',
     ]);
 
     /** Actions that may change files: kept search results are searched again when shown after one of them. */
@@ -20656,9 +20961,9 @@ class FmFileManagerTable extends FmTable {
             ? options.execAvailable
             : (typeof fm_exec_available !== 'undefined' ? fm_exec_available : true);
 
-        this.options.showActionsColumn = options.showActionsColumn || true;
-        this.options.showLastModifiedColumn = options.showLastModifiedColumn || true;
-        this.options.automaticGetFoldersSize = options.automaticGetFoldersSize || false;
+        this.options.showActionsColumn = options.showActionsColumn !== false;
+        this.options.showLastModifiedColumn = options.showLastModifiedColumn !== false;
+        this.options.automaticGetFoldersSize = options.automaticGetFoldersSize === true;
         this.options.permissionsDisplay = ['octal', 'symbolic', 'both'].includes(options.permissionsDisplay)
             ? options.permissionsDisplay
             : 'octal';
@@ -21057,6 +21362,8 @@ class FmFileManagerTable extends FmTable {
                 { ...byId['download'] },
                 { ...byId['copy'], separatorBefore: true },
                 { ...byId['move'] },
+                { ...byId['bulk-rename'], separatorBefore: true },
+                { ...byId['change-permissions'] },
                 { ...byId['delete'], separatorBefore: true },
                 { ...byId['copy-path'], separatorBefore: true },
                 { ...byId['copy-relative-path'] },
@@ -21442,6 +21749,9 @@ class FmFileManagerTable extends FmTable {
             const how = f.match === 'regex' ? 'matches regex' : (f.match === 'wildcard' ? 'is like' : 'contains');
             parts.push('name ' + how + ' “' + f.name + '”' + (f.icase ? '' : ' (match case)'));
         }
+        if (f.content) {
+            parts.push('text ' + (f.contentMatch === 'regex' ? 'matches regex' : 'contains') + ' “' + f.content + '”' + (f.contentIcase === false ? ' (match case)' : ''));
+        }
         if (f.type === 'file') parts.push('files');
         if (f.type === 'folder') parts.push('folders');
         if (f.sizeMin !== '') parts.push('from ' + f.sizeMin + ' ' + f.sizeMinUnit);
@@ -21485,6 +21795,9 @@ class FmFileManagerTable extends FmTable {
             cls = ' fm-search-status--warn';
         } else if (s.done && s.done.reason === 'time') {
             status = 'Search took too long and was stopped — ' + n + ' found. Narrow the search to see the rest.';
+            cls = ' fm-search-status--warn';
+        } else if (s.done && s.done.reason === 'content_limit') {
+            status = 'Stopped after reading ' + FmFileManagerTable.bytesToSize(Number(s.done.bytes_read) || 0) + ' of files — ' + n + ' found. Narrow the search (name, type, folder) to see the rest.';
             cls = ' fm-search-status--warn';
         } else {
             const secs = s.done && typeof s.done.seconds === 'number' ? s.done.seconds : null;
@@ -21739,6 +22052,15 @@ class FmFileManagerTable extends FmTable {
                 this.tableEl.insertAdjacentElement('afterend', this._buildPager(all.length, pages));
                 this._updatePagerSelectionNote();
             }
+            this._syncHeaderGutter();
+            if (typeof ResizeObserver !== 'undefined') {
+                if (this._gutterObserver) this._gutterObserver.disconnect();
+                const tbody = this.tableEl.querySelector('tbody');
+                if (tbody) {
+                    this._gutterObserver = new ResizeObserver(() => this._syncHeaderGutter());
+                    this._gutterObserver.observe(tbody);
+                }
+            }
         }
         if (this._filterKeepFocus) {
             const bar = this.container && this.container.querySelector('.fm-breadcrumb-bar');
@@ -21755,6 +22077,18 @@ class FmFileManagerTable extends FmTable {
         this._filterKeepFocus = false;
         this._filterSelStart = null;
         this._filterSelEnd = null;
+    }
+
+    /**
+     * Header and rows are separate tables; the rows lose the scrollbar width, so the header gets the same
+     * space on the right to keep the columns aligned.
+     */
+    _syncHeaderGutter() {
+        const thead = this.tableEl && this.tableEl.querySelector('thead');
+        const tbody = this.tableEl && this.tableEl.querySelector('tbody');
+        if (!thead || !tbody) return;
+        const gutter = Math.max(0, tbody.offsetWidth - tbody.clientWidth);
+        thead.style.paddingRight = gutter ? gutter + 'px' : '';
     }
 
     /** Rows per page of the list; 0 = no pages. */
@@ -21920,6 +22254,29 @@ class FmFileManagerTable extends FmTable {
         return '<span class="fm-table-name-cell fm-table-name-cell--trash fm-table-name-cell--search">' +
             `<span class="fm-table-name${isImg ? ' fm-table-name--image-preview' : ''}" title="${this.escapeAttr(title)}">${this.escapeHtml(name)}</span>` +
             `<span class="fm-trash-origin" title="${this.escapeAttr(title)}">${this.escapeHtml('in /' + dir)}</span>` +
+            this._searchMatchHtml(row.raw && row.raw.match) +
+            '</span>';
+    }
+
+    /**
+     * First matching line of a content search under the name: "line 42: …text…" with the match marked.
+     * @param {{line: number, text: string, at: number, len: number}|undefined} m - at / len count characters
+     * @returns {string}
+     */
+    _searchMatchHtml(m) {
+        if (!m || typeof m.text !== 'string') return '';
+        const chars = Array.from(m.text);
+        const at = Math.max(0, Math.min(chars.length, Number(m.at) || 0));
+        const end = Math.min(chars.length, at + Math.max(0, Number(m.len) || 0));
+        const label = 'line ' + Number(m.line).toLocaleString() + ': ';
+        // The Name column is narrow: keep only a little text before the match so the match is always visible.
+        const keep = 15;
+        const before = at > keep + 1 ? '…' + chars.slice(at - keep, at).join('') : chars.slice(0, at).join('');
+        return `<span class="fm-search-match" title="${this.escapeAttr(label + m.text)}">` +
+            `<span class="fm-search-match-line">${this.escapeHtml(label)}</span>` +
+            this.escapeHtml(before) +
+            (end > at ? '<mark>' + this.escapeHtml(chars.slice(at, end).join('')) + '</mark>' : '') +
+            this.escapeHtml(chars.slice(end).join('')) +
             '</span>';
     }
 
@@ -22277,6 +22634,7 @@ class FmFileManagerTable extends FmTable {
     _runSearch(onLoaded) {
         const s = this._search;
         if (!s) return;
+        this._openSeq = (this._openSeq || 0) + 1;
         if (s.ctrl) {
             try { s.ctrl.abort(); } catch (e) { /* ignore */ }
         }
@@ -23702,6 +24060,8 @@ class FmFileManagerTable extends FmTable {
                 { type: 'separator' },
                 { id: 'copy', title: 'Copy', icon: 'bi-copy', shortcut: sc['copy'] },
                 { id: 'move', title: 'Move', icon: 'bi-arrow-right-square', shortcut: sc['move'] },
+                { id: 'bulk-rename', title: 'Bulk rename', icon: 'bi-input-cursor', shortcut: sc['bulk-rename'] },
+                { id: 'change-permissions', title: 'Change permissions', icon: 'bi-shield-lock', shortcut: sc['change-permissions'] },
                 { id: 'delete', title: 'Delete', icon: 'bi-trash', shortcut: sc['delete'] },
                 { type: 'separator' },
                 { id: 'copy-path', title: 'Copy path', icon: 'bi-clipboard', shortcut: sc['copy-path'] },
@@ -24022,6 +24382,8 @@ class FmFileManagerTable extends FmTable {
      * @param {Function} [onLoaded] - Called after the table has been updated
      */
     load(path, onLoaded) {
+        // Only the latest request may update the table: an older, slower response must not replace the folder just opened.
+        const seq = this._openSeq = (this._openSeq || 0) + 1;
         // Reloading the searched folder (Refresh, after delete / move…) runs the search again.
         if (this._search) {
             if (norm(path) === this._search.base) {
@@ -24042,6 +24404,7 @@ class FmFileManagerTable extends FmTable {
         requireAuthFetch(this._ajaxUrl + '?' + new URLSearchParams(openParams))
             .then(r => r.json())
             .then(data => {
+                if (seq !== this._openSeq) return;
                 if (data && data.status === 'invalid') {
                     this._invalidFolderMessage =
                         (data.msg && String(data.msg)) || 'This folder does not exist or cannot be opened.';
@@ -24080,6 +24443,7 @@ class FmFileManagerTable extends FmTable {
                 if (typeof onLoaded === 'function') onLoaded(resolved);
             })
             .catch((err) => {
+                if (seq !== this._openSeq) return;
                 console.error('Load folder failed', err);
                 this._pendingRestoreChildName = null;
                 this._pendingKeyboardAnchor = null;
@@ -25245,6 +25609,9 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
                 if (mainTable) {
                     if (mainTable.options.listPageSize !== config.listPageSize) mainTable._page = 0;
                     mainTable.options.listPageSize = config.listPageSize;
+                    mainTable.options.showActionsColumn = config.showActionsColumn !== false;
+                    mainTable.options.showLastModifiedColumn = config.showLastModifiedColumn !== false;
+                    mainTable.options.automaticGetFoldersSize = config.automaticGetFoldersSize === true;
                     mainTable.options.pageUpDownStep = config.pageUpDownStep;
                     mainTable.options.permissionsDisplay = config.permissionsDisplay;
                     mainTable.options.showImagePreviews = config.showImagePreviews === true;
@@ -25583,9 +25950,9 @@ window.addEventListener('hashchange', () => {
         execAvailable: typeof fm_exec_available !== 'undefined' ? fm_exec_available : true,
         sortBy: config.sortBy || 'name',
         sortDir: config.sortDir || 'asc',
-        showActionsColumn: config.showActionsColumn || true,
-        showLastModifiedColumn: config.showLastModifiedColumn || true,
-        automaticGetFoldersSize: config.automaticGetFoldersSize || false,
+        showActionsColumn: config.showActionsColumn !== false,
+        showLastModifiedColumn: config.showLastModifiedColumn !== false,
+        automaticGetFoldersSize: config.automaticGetFoldersSize === true,
         showImagePreviews: config.showImagePreviews === true,
         permissionsDisplay: normalizePermissionsDisplay(config.permissionsDisplay),
         pageUpDownStep: clampPageUpDownStep(config.pageUpDownStep),

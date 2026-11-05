@@ -2,6 +2,28 @@
 
 All notable changes to SoloFileManager are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.6.0] - 2026-11-04
+
+### Added
+
+- Find: "Contains text" searches inside files (a line contains the text, or a regular expression on one line; ignore case on by default, also for non-Latin letters in UTF-8). Each result shows the line number and the matching line with the text marked. Text files up to 10 MB are read; binary files (a NUL byte in the first 8 KB), linked files outside the root and folders are left out. A search stops after reading 1 GB of files and says so. Works the same on Windows and Linux (read in PHP; on Linux `find` still walks the folders)
+- Search results: Bulk rename and Change permissions work on items from different folders (toolbar and context menu). Bulk rename changes only the name, so each item stays in its folder; the preview shows the folder under each name, and duplicate new names are refused only within one folder. Every folder is checked before anything is renamed, so a conflict in one folder renames nothing; a selected folder and items inside it can be renamed together. The results refresh afterwards
+
+### Changed
+
+- Bulk rename and Change permissions accept items in subfolders of the request folder (needed for search results); every part of the path is validated and the full path must stay inside the root folder, like Copy, Move and Delete
+- Narrow windows: when the list gets too narrow for the file name, Perms, Type, Last modified and finally Actions are hidden one by one (Actions stay in the context menu and toolbar), so the Name column keeps about 220 px instead of a few characters
+
+### Fixed
+
+- The column headers were shifted against the rows by the width of the list's scrollbar (about 10 px); headers and rows are now aligned
+- Configuration → "Show row actions column" and "Show last modified column" had no effect (the columns were always shown); "Automatic get folders size" now applies without a reload
+- Opening folders quickly one after another (or right after closing search results) could show the earlier folder when its listing arrived last; only the latest request now updates the list
+
+### Security
+
+- Find: text inside files is read only from files inside the root (linked files outside it are not opened), with per-file and per-search read limits; Bulk rename and Change permissions validate every part of a result path like the other actions (see SECURITY.md)
+
 ## [1.5.0] - 2026-11-03
 
 ### Added
