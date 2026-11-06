@@ -6,7 +6,7 @@ Manage files directly from your browser — without installing WordPress, Larave
 
 ### One PHP file. No installation. No database.
 
-Current version: **1.6.0** — see [CHANGELOG.md](CHANGELOG.md)
+Current version: **1.7.0** — see [CHANGELOG.md](CHANGELOG.md)
 
 ## Why SoloFileManager?
 
@@ -15,6 +15,7 @@ Current version: **1.6.0** — see [CHANGELOG.md](CHANGELOG.md)
 - 🔧 Works on shared hosting, VPS and XAMPP
 - 📁 Upload, download, copy, move and rename files
 - 🔍 Find files and folders in all subfolders, by name or text inside files
+- 🔤 Convert text files to UTF-8 (or another encoding), one by one or a whole folder
 - 🗑️ Trash and restore
 - 📦 ZIP compression and extraction
 - 🔐 Built-in authentication
@@ -87,8 +88,8 @@ Current version: **1.6.0** — see [CHANGELOG.md](CHANGELOG.md)
             <br><sub>Change permissions for folders and files</sub>
         </td>
         <td width="50%" valign="top">
-            <img src="./screenshots/terminal.png" alt="Terminal" width="100%">
-            <br><sub>Optional terminal (off by default)</sub>
+            <img src="./screenshots/convert-encoding.png" alt="Convert encoding: old pages in Windows-1251, KOI8-R and Windows-1252 found in a folder, shown now and after converting to UTF-8" width="100%">
+            <br><sub>Convert encoding: find legacy files in a folder, preview, convert to UTF-8</sub>
         </td>
     </tr>
     <tr>
@@ -116,7 +117,10 @@ Current version: **1.6.0** — see [CHANGELOG.md](CHANGELOG.md)
             <img src="./screenshots/session-locked.png" alt="Session locked after idle time" width="100%">
             <br><sub>Session locked after idle time</sub>
         </td>
-        <td width="50%" valign="top"></td>
+        <td width="50%" valign="top">
+            <img src="./screenshots/terminal.png" alt="Terminal" width="100%">
+            <br><sub>Optional terminal (off by default)</sub>
+        </td>
     </tr>
 </table>
 
@@ -159,7 +163,7 @@ Current version: **1.6.0** — see [CHANGELOG.md](CHANGELOG.md)
 ## Features
 
 - Folder tree (sidebar) with bookmarks and trash
-- File/folder listing with sortable columns; large folders are shown in pages (100 items by default, set in Configuration → Display); in narrow windows less important columns are hidden so names stay readable
+- File/folder listing with sortable columns; large folders are shown in pages (100 items by default, set in Configuration → Display); optional Encoding column for text files (Configuration → Display, read in the background for the shown page); in narrow windows less important columns are hidden so names stay readable, and the toolbar keeps one line (buttons that do not fit are in a "More" menu)
 - Remembers the last opened folder in the browser: reopen without a URL hash and you land there again (hash in the URL still wins)
 - Optional session idle lock (off by default): lock after 15–120 minutes of idle time; unlock with the password without losing the current folder view. Long jobs keep the session alive
 - Optional IP allowlist (off by default): only listed IPs / CIDR ranges (IPv4 and IPv6) can open the file manager; everyone else gets 403 before the login page
@@ -168,9 +172,10 @@ Current version: **1.6.0** — see [CHANGELOG.md](CHANGELOG.md)
 - Copy / move with progress; drag and drop
 - Delete to Trash or delete forever. Trash works like the Windows Recycle Bin: a flat list showing each item's original name, the folder it came from, deletion date and size, with Restore (back to where it was, renamed to "name (restored)" if that name is taken) and Delete forever; Empty Trash (with confirm); item count on the Trash button, a reminder on Logout, and Server info shows how many items / how much space Trash holds; the `.trash` folder is removed as soon as it is empty
 - Filter the current folder listing by name (search field in the breadcrumb bar)
-- Find in the current folder and all subfolders by name (text, wildcard or regular expression), text inside files (with the matching line shown), type, size and modified date; results show where each item is and can be opened, downloaded, copied, moved, deleted, bulk renamed or have their permissions changed; Back returns to the results without searching again. Uses `find` on Linux / macOS when OS file ops are allowed, PHP otherwise
-- Compress / extract archives; entries that would land outside the root folder (links, `..`, absolute paths) are skipped and listed
+- Find in the current folder and all subfolders by name (text, wildcard or regular expression), text inside files of any encoding (Windows-1251, UTF-16… are detected; the matching line is shown), encoding (e.g. everything that is not UTF-8), type, size and modified date; results show where each item is and can be opened, downloaded, copied, moved, deleted, bulk renamed or have their permissions changed; Back returns to the results without searching again. Uses `find` on Linux / macOS when OS file ops are allowed, PHP otherwise
+- Compress / extract archives; big archives show files done and keep going when the hosting drops a long request (the dialog then waits for the result); entries that would land outside the root folder (links, `..`, absolute paths) are skipped and listed
 - Change permissions (chmod) for folders and files, including recursive 0755 / 0644 style fixes
+- Convert encoding of text files (selected files, search results, or every text file in a folder with a name mask and "only not UTF-8"): detects BOM, UTF-8, UTF-16 and guesses legacy encodings (Windows-1251, KOI8-R, CP866, Windows-1252, ARMSCII-8), shows the file before and after, converts to UTF-8 or another encoding with optional BOM and LF / CRLF line endings, replacing the file or saving a copy next to it. Needs the `iconv` or `mbstring` PHP extension
 - Upload (large files in parts, with retries on connection problems; asks Replace / Skip / Keep both when names already exist), get info, copy paths
 - Download files, or folders and multiple items as ZIP / TAR / TAR.GZ — the browser download starts immediately while the archive is built; failures show the real reason
 - Configuration popup (columns, permissions display, folder-size behavior, heavy file-ops mode)
@@ -220,7 +225,7 @@ The `tests/` folder is for development only (it is not included in release archi
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). Latest: **1.6.0** — Find by text inside files (with the matching line shown), Bulk rename and Change permissions on search results, aligned table columns and narrow-window layout.
+See [CHANGELOG.md](CHANGELOG.md). Latest: **1.7.0** — Convert encoding for files and whole folders, Find by encoding and by text in files of any encoding, an optional Encoding column, and popups that keep their height.
 
 ## License
 

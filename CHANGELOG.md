@@ -2,6 +2,34 @@
 
 All notable changes to SoloFileManager are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.7.0] - 2026-11-06
+
+### Added
+
+- Convert encoding (toolbar, context menu): converts text files to UTF-8 or another encoding. For selected files it shows each file's encoding right away; for a folder (right-click a folder, or nothing selected for the current one) it first scans for text files, with a name mask (e.g. `*.txt;*.php`), "Include subfolders" and "Only files that are not UTF-8", streamed with Stop, and a summary by encoding to filter on. Each file shows its detected encoding (BOM, UTF-8 and ASCII for sure; UTF-16 without BOM and legacy Windows-1251, KOI8-R, CP866, Windows-1252, ARMSCII-8 marked as a guess) and line endings; clicking a file shows its first lines now and after the conversion. Options: From (auto or a chosen encoding), To, Add BOM, line endings (keep / LF / CRLF), replace the file or save a copy next to it (`report.utf8.txt`). Files are converted in batches with progress and Stop; each file reports converted / already in this encoding / skipped / failed with the reason. Works on search results too (selected results, or all found files). Only encodings the server can convert are offered
+- Find: Encoding filter (Any / Not UTF-8 / one encoding); each result shows its detected encoding and line endings, so files in legacy encodings can be found and then converted
+- Optional Encoding column in the file list (Configuration → Display, off by default): the encoding of text files (by extension) on the shown page is read in the background with one request, kept in the browser until the file changes; other files show "—". With the column on, narrow lists hide Perms first, then Encoding. Get info shows a file's encoding and line endings too
+
+### Changed
+
+- Find, "Contains text": files that are not UTF-8 are read in their own encoding. The encoding is detected from the first 64 KB of each file (as in Convert encoding), lines of a legacy encoding (Windows-1251, KOI8-R, CP866, Windows-1252, ARMSCII-8…) are decoded before matching and UTF-16 files are searched too, so Cyrillic or Armenian words are found in old files and the matching line is shown as text instead of "?". Such results show the encoding next to their folder
+- Toolbar stays on one line: buttons that do not fit go into a "More" (⋯) menu at the end, the least used first (Duplicate, New folder from selection, Copy relative path, Open in new tab, terminal…), with their shortcuts and greyed when not available; it adapts when the window is resized. Every action has a priority, so new ones fit in the same way
+- Archive: the default name is the name of the current folder (at the root: the root folder's own name, e.g. `example.com.zip`) instead of `archive.zip`, with the date added when that file already exists. An archive name with another archive extension gets the right one (`site.zip` as TAR.GZ becomes `site.tar.gz`, not `site.zip.tar.gz`)
+- Archive progress: the dialog shows "N of M files" and the file being added (zip / tar report every file), and the progress line fills up instead of only moving. The compressing step shows its own percent: gzip of a `.tar.gz` made by the system `tar` now runs in PHP (zlib) and reports how much is done, and in PHP-only mode ZIP shows the percent of data compressed while the archive is written. In PHP-only mode TAR and TAR.GZ are written in one pass (with gzip on the fly) and count every file
+
+### Fixed
+
+- Archiving a big folder showed "Could not create archive." while the archive was still being built and then finished fine: zip / tar ran as one silent command for minutes, so the hosting proxy closed the connection. They now report every file and send a keep-alive every 5 s (also while gzip or ZipArchive is compressing); the job continues if the connection breaks anyway, and the dialog then waits for its result on the server instead of reporting an error. When both the system archiver and PHP fail, the message includes the archiver's own reason (e.g. "Disk quota exceeded")
+- Downloading a big file could show "Download failed" after about 15 s while the file was still downloading: on hostings where PHP's temp folder cannot be written (open_basedir, separate /tmp) the download status was never found. Status files now go to the first writable of the temp folder, upload_tmp_dir and the session folder, or else to a guarded `.fm-state` folder in the root (hidden like the other service folders); when no status can be kept the download is simply left to the browser. Server info shows where status files go
+- PHP-only TAR / TAR.GZ archives put the content of a selected folder at the top of the archive without the folder's name, and grew slower with every file added (each file rewrote the whole archive); a `.tar.gz` could also get the name of the temporary `.tar` (`name_1.tar.gz`) when a `.tar` with the same name existed
+- Configuration: the password needed for Server settings was at the bottom of the Server tab, so Apply seemed to do nothing when it was empty (the message was out of sight as well). It now appears pinned above the buttons as soon as a server setting is changed, on either tab; Apply without it, or with a wrong one, highlights the field, puts the cursor in it and shows the reason right under it
+- Bulk rename preview: a thin line under the column headers let the scrolled rows show through; the header is now solid
+- Get info and Server info no longer open with a "Loading…" line and then grow: they open once the info has arrived (normally well under a second), or with a loading area of about the final height when the server is slow
+
+### Security
+
+- Convert encoding reads and writes only files inside the root (links are skipped), writes through a temporary file renamed over the original, and never drops or replaces characters: a file that does not fit the source or target encoding is reported and left unchanged (see SECURITY.md)
+
 ## [1.6.0] - 2026-11-04
 
 ### Added

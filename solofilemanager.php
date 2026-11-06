@@ -8,7 +8,7 @@ declare(strict_types=1);
  */
 
 /** Product version (semver). Shown in UI / server info. */
-const SOLOFILEMANAGER_VERSION = '1.6.0';
+const SOLOFILEMANAGER_VERSION = '1.7.0';
 
 // Set max execution time to 1 day (86400 seconds)
 @set_time_limit(86400);
@@ -488,17 +488,22 @@ function fmUploadTmpDir(string $rootDir): string {
     return rtrim(normPath(safeRealpath($rootDir)), '/') . '/' . FM_UPLOAD_TMP_BASENAME;
 }
 
-/**
- * Create the temp folder with web-access guards. Returns its path, or null when it cannot be created.
- */
-function fmUploadTmpEnsure(string $rootDir): ?string {
-    $dir = fmUploadTmpDir($rootDir);
+/** Hidden folder under the root for status files when no temp folder of PHP is writable. */
+const FM_STATE_BASENAME = '.fm-state';
+
+/** Folders the file manager keeps at the root for itself: never listed, searched or archived as content. */
+function fmIsServiceName(string $name): bool {
+    return $name === FM_UPLOAD_TMP_BASENAME || $name === FM_STATE_BASENAME;
+}
+
+/** Create $dir with web-access guards (.htaccess deny + empty index.html). Returns false when it cannot be created. */
+function fmEnsureGuardedDir(string $dir, string $what): bool {
     if (!is_dir($dir) && !@mkdir($dir, 0755, true) && !is_dir($dir)) {
-        return null;
+        return false;
     }
     if (!is_file($dir . '/.htaccess')) {
         @file_put_contents($dir . '/.htaccess',
-            "# SoloFileManager unfinished uploads: must not be reachable from the web.\n" .
+            "# SoloFileManager " . $what . ": must not be reachable from the web.\n" .
             "<IfModule mod_authz_core.c>\n    Require all denied\n</IfModule>\n" .
             "<IfModule !mod_authz_core.c>\n    Order deny,allow\n    Deny from all\n</IfModule>\n"
         );
@@ -506,7 +511,59 @@ function fmUploadTmpEnsure(string $rootDir): ?string {
     if (!is_file($dir . '/index.html')) {
         @file_put_contents($dir . '/index.html', '');
     }
-    return $dir;
+    return true;
+}
+
+/** Whether a file can really be written in $dir (is_writable() is not reliable with open_basedir and some mounts). */
+function fmDirAcceptsFiles(string $dir): bool {
+    if ($dir === '' || !@is_dir($dir)) {
+        return false;
+    }
+    $probe = rtrim($dir, '/\\') . '/fm-probe-' . bin2hex(random_bytes(6));
+    if (@file_put_contents($probe, '1') !== 1) {
+        return false;
+    }
+    @unlink($probe);
+    return true;
+}
+
+/**
+ * Folder for status files of downloads and archive jobs (read back by other requests) and temp output of archivers:
+ * the env var SOLOFM_STATE_DIR ("none" turns status tracking off), else the first writable of PHP's temp folder,
+ * upload_tmp_dir and the session folder, else the guarded .fm-state folder under the root; null when none works.
+ */
+function fmStateDir(): ?string {
+    static $dir = false;
+    if ($dir !== false) {
+        return $dir;
+    }
+    global $ROOT_DIR;
+    $env = (string)getenv('SOLOFM_STATE_DIR');
+    if ($env === 'none') {
+        return $dir = null;
+    }
+    $session = (string)session_save_path();
+    $candidates = [$env, sys_get_temp_dir(), (string)ini_get('upload_tmp_dir'), $session !== '' ? substr($session, (int)strrpos(';' . $session, ';')) : ''];
+    foreach ($candidates as $c) {
+        if (fmDirAcceptsFiles($c)) {
+            return $dir = rtrim(str_replace('\\', '/', $c), '/');
+        }
+    }
+    if (is_string($ROOT_DIR) && $ROOT_DIR !== '') {
+        $own = rtrim(normPath(safeRealpath($ROOT_DIR)), '/') . '/' . FM_STATE_BASENAME;
+        if (fmEnsureGuardedDir($own, 'status files') && fmDirAcceptsFiles($own)) {
+            return $dir = $own;
+        }
+    }
+    return $dir = null;
+}
+
+/**
+ * Create the temp folder with web-access guards. Returns its path, or null when it cannot be created.
+ */
+function fmUploadTmpEnsure(string $rootDir): ?string {
+    $dir = fmUploadTmpDir($rootDir);
+    return fmEnsureGuardedDir($dir, 'unfinished uploads') ? $dir : null;
 }
 
 function fmUploadIdIsValid(string $id): bool {
@@ -2872,7 +2929,7 @@ function getFilesAndFoldersList(string $path, string $rootDir, array $excludeNam
         if ($hideTrash && $f === $tb) {
             continue;
         }
-        if ($isRoot && $f === FM_UPLOAD_TMP_BASENAME) {
+        if ($isRoot && fmIsServiceName($f)) {
             continue;
         }
         $full = $folder . '/' . $f;
@@ -2956,7 +3013,7 @@ function getFolderTree(string $path, string $rootDir, int $depth = 0, int $maxDe
             if ($f === fmTrashBasename() && !fmIsUnderTrashTree($path, $rootDir)) {
                 continue;
             }
-            if ($isRoot && $f === FM_UPLOAD_TMP_BASENAME) {
+            if ($isRoot && fmIsServiceName($f)) {
                 continue;
             }
             $full = $path . '/' . $f;
@@ -3589,6 +3646,7 @@ function fmSearchCriteria(array $in): array {
         'content_re_bytes' => null,
         'content_max_file' => FM_SEARCH_CONTENT_MAX_FILE_BYTES,
         'content_state'    => null,
+        'encoding'         => '',
     ];
     if (strlen($c['content']) > 500 || preg_match('/[\x00-\x08\x0a-\x1f]/', $c['content'])) {
         return $c + ['error' => 'The text to find in files is too long or contains control characters.'];
@@ -3607,6 +3665,16 @@ function fmSearchCriteria(array $in): array {
         $bytes = "\x01" . $body . "\x01" . $flags;
         $c['content_re_bytes'] = @preg_match($bytes, '') === false ? null : $bytes;
         $c['content_state'] = (object)['left' => FM_SEARCH_CONTENT_MAX_TOTAL_BYTES];
+    }
+    // Encoding filter: '' = off, 'text' = any text file (encoding scan), 'not_utf8', or one encoding name.
+    $enc = trim((string)($in['encoding'] ?? ''));
+    if ($enc !== '') {
+        $name = $enc === 'text' || $enc === 'not_utf8' ? $enc : fmEncodingName($enc);
+        if ($name === null) {
+            return $c + ['error' => 'This server cannot read the encoding “' . $enc . '”.'];
+        }
+        $c['encoding'] = $name;
+        $c['content_state'] = $c['content_state'] ?? (object)['left' => FM_SEARCH_CONTENT_MAX_TOTAL_BYTES];
     }
     if (strlen($c['name']) > 500 || preg_match('/[\x00-\x1f]/', $c['name'])) {
         return $c + ['error' => 'The name to find is too long or contains control characters.'];
@@ -3651,7 +3719,7 @@ function fmSearchNameMatches(array $c, string $name): bool {
 /** Names the listing never shows: excluded names everywhere, Trash and unfinished uploads at the root. */
 function fmSearchSkipName(string $name, bool $atRoot, array $exclude, string $trashBasename): bool {
     return in_array($name, $exclude, true)
-        || ($atRoot && ($name === $trashBasename || $name === FM_UPLOAD_TMP_BASENAME));
+        || ($atRoot && ($name === $trashBasename || fmIsServiceName($name)));
 }
 
 /**
@@ -3662,7 +3730,7 @@ function fmSearchEntry(array $c, string $full, string $rel, string $name, bool $
     if (($c['type'] === 'file' && $isDir) || ($c['type'] === 'folder' && !$isDir)) {
         return null;
     }
-    if ($isDir && ($c['size_min'] !== null || $c['size_max'] !== null || ($c['content'] ?? '') !== '')) {
+    if ($isDir && ($c['size_min'] !== null || $c['size_max'] !== null || ($c['content'] ?? '') !== '' || ($c['encoding'] ?? '') !== '')) {
         return null;
     }
     if (!fmSearchNameMatches($c, $name)) {
@@ -3685,6 +3753,14 @@ function fmSearchEntry(array $c, string $full, string $rel, string $name, bool $
             return null;
         }
     }
+    $encoding = null;
+    if (($c['encoding'] ?? '') !== '') {
+        $info = fmEncodingFileInfo($full, $rootDir, $c['content_state']->left);
+        if (isset($info['skip']) || !fmSearchEncodingMatches($c['encoding'], $info['encoding'])) {
+            return null;
+        }
+        $encoding = ['name' => $info['encoding'], 'how' => $info['how'], 'eol' => $info['eol']];
+    }
     $perms = @fileperms($full);
     $row = [
         'path'        => $rel,
@@ -3699,14 +3775,20 @@ function fmSearchEntry(array $c, string $full, string $rel, string $name, bool $
     if ($match !== null) {
         $row['match'] = $match;
     }
+    if ($encoding !== null) {
+        $row['encoding'] = $encoding;
+    }
     return $row + (fmLinkInfo($full, $rootDir) ?? []);
 }
 
 /**
  * First line of a text file that matches the content criteria: ['line' => N, 'text' => snippet, 'at' => offset
- * of the match in the snippet, 'len' => its length] (characters), or null. Files outside the root (through a link),
- * bigger than content_max_file or binary (a NUL byte in the first 8 KB) are not read. Every byte read is taken
- * from $budget; nothing is read once it is used up. Lines longer than 64 KB are checked in 64 KB parts.
+ * of the match in the snippet, 'len' => its length] (characters), plus 'encoding' => ['name', 'how'] for files that
+ * are not UTF-8, or null. The encoding is detected from the first 64 KB (fmDetectEncoding): lines of a legacy
+ * encoding (Windows-1251, KOI8-R…) are decoded to UTF-8 before matching, UTF-16 files are decoded whole; a line that
+ * does not decode is matched byte by byte. Files outside the root (through a link), bigger than content_max_file or
+ * binary are not read. Every byte read is taken from $budget; nothing is read once it is used up. Lines longer than
+ * 64 KB are checked in 64 KB parts.
  */
 function fmSearchContentMatch(array $c, string $full, string $rootDir, int &$budget): ?array {
     if ($budget <= 0 || !is_file($full) || !pathInsideRoot($full, $rootDir)) {
@@ -3720,10 +3802,43 @@ function fmSearchContentMatch(array $c, string $full, string $rootDir, int &$bud
     if ($h === false) {
         return null;
     }
-    $head = (string)fread($h, 8192);
-    if (strpos($head, "\0") !== false) {
+    $head = (string)fread($h, FM_ENCODING_SAMPLE_BYTES);
+    $d = fmDetectEncoding($head, $size > strlen($head));
+    $enc = $d['encoding'];
+    if ($enc === null) {
         $budget -= strlen($head);
         fclose($h);
+        return null;
+    }
+    $legacy = $enc !== 'UTF-8' && $enc !== 'ASCII';
+    $mark = $legacy ? ['encoding' => ['name' => $enc, 'how' => $d['how']]] : [];
+    $check = static function (string $text, int $lineNo, bool $decoded) use ($c, $enc, $legacy, $mark): ?array {
+        $utf8 = $decoded;
+        if (!$decoded && $legacy) {
+            $u = fmEncodingConvert($text, $enc, 'UTF-8');
+            if ($u !== null) {
+                $text = $u;
+                $utf8 = true;
+            }
+        }
+        $utf8 = $utf8 || preg_match('//u', $text) === 1;
+        $re = $utf8 ? $c['content_re'] : $c['content_re_bytes'];
+        if ($re === null || @preg_match($re, $text, $m, PREG_OFFSET_CAPTURE) !== 1) {
+            return null;
+        }
+        return ['line' => $lineNo] + fmSearchSnippet($text, (int)$m[0][1], strlen($m[0][0]), $utf8) + $mark;
+    };
+    if ($enc === 'UTF-16LE' || $enc === 'UTF-16BE') {
+        $data = $head . (string)stream_get_contents($h);
+        fclose($h);
+        $budget -= strlen($data);
+        $u = fmEncodingConvert(fmEncodingTrimPartial(substr($data, $d['bom']), $enc), $enc, 'UTF-8');
+        foreach ($u === null ? [] : (preg_split('/\r\n|\r|\n/', $u) ?: []) as $i => $line) {
+            $found = $check($line, $i + 1, true);
+            if ($found !== null) {
+                return $found;
+            }
+        }
         return null;
     }
     rewind($h);
@@ -3737,13 +3852,11 @@ function fmSearchContentMatch(array $c, string $full, string $rootDir, int &$bud
         }
         $inLongLine = substr($line, -1) !== "\n";
         $text = rtrim($line, "\r\n");
-        $utf8 = preg_match('//u', $text) === 1;
-        $re = $utf8 ? $c['content_re'] : $c['content_re_bytes'];
-        if ($re !== null && @preg_match($re, $text, $m, PREG_OFFSET_CAPTURE) === 1) {
-            $found = ['line' => $lineNo] + fmSearchSnippet($text, (int)$m[0][1], strlen($m[0][0]), $utf8);
-            break;
+        if ($lineNo === 1 && $d['bom'] > 0) {
+            $text = substr($text, $d['bom']);
         }
-        if ($budget <= 0) {
+        $found = $check($text, $lineNo, false);
+        if ($found !== null || $budget <= 0) {
             break;
         }
     }
@@ -3807,10 +3920,10 @@ function fmSearchSnippet(string $text, int $off, int $len, bool $utf8): array {
 }
 
 /**
- * PHP search below $baseDir. Links are listed but never followed.
+ * PHP search below $baseDir (only its own entries when $recursive is false). Links are listed but never followed.
  * $emit gets each matching row and returns false to stop; $tick runs about every 0.3 s and returns false to stop.
  */
-function fmSearchWalkPhp(string $baseDir, bool $atRoot, string $rootDir, array $c, array $exclude, callable $emit, callable $tick, int &$scanned): void {
+function fmSearchWalkPhp(string $baseDir, bool $atRoot, string $rootDir, array $c, array $exclude, callable $emit, callable $tick, int &$scanned, bool $recursive = true): void {
     $tb = fmTrashBasename();
     $isWin = PHP_OS_FAMILY === 'Windows';
     $stack = [[$baseDir, '']];
@@ -3833,7 +3946,7 @@ function fmSearchWalkPhp(string $baseDir, bool $atRoot, string $rootDir, array $
             if ($row !== null && !$emit($row)) {
                 return;
             }
-            if ($isDir && !is_link($full) && !($isWin && fmIsLinkPath($full))) {
+            if ($recursive && $isDir && !is_link($full) && !($isWin && fmIsLinkPath($full))) {
                 $stack[] = [$full, $r];
             }
             if (microtime(true) >= $next) {
@@ -3844,6 +3957,452 @@ function fmSearchWalkPhp(string $baseDir, bool $atRoot, string $rootDir, array $
             }
         }
     }
+}
+
+/** Convert encoding: bigger files are skipped. */
+const FM_ENCODING_MAX_FILE_BYTES = 20971520;
+/** Convert encoding: files per request. */
+const FM_ENCODING_MAX_FILES = 1000;
+/** Bytes read from the start of a file to detect its encoding. */
+const FM_ENCODING_SAMPLE_BYTES = 65536;
+
+/**
+ * Encodings offered for conversion that this server can convert (iconv or mbstring), in display order.
+ *
+ * @return string[]
+ */
+function fmEncodingList(): array {
+    static $list = null;
+    if ($list === null) {
+        $list = [];
+        foreach (['UTF-8', 'UTF-16LE', 'UTF-16BE', 'Windows-1251', 'KOI8-R', 'KOI8-U', 'CP866', 'ISO-8859-5', 'Windows-1252', 'ISO-8859-1',
+            'ISO-8859-15', 'Windows-1250', 'ISO-8859-2', 'ARMSCII-8', 'Windows-1253', 'Windows-1254', 'Windows-1257'] as $e) {
+            $probe = $e === 'UTF-16LE' ? "a\0" : ($e === 'UTF-16BE' ? "\0a" : 'a');
+            if (fmEncodingConvert($probe, $e, 'UTF-8') === 'a') {
+                $list[] = $e;
+            }
+        }
+    }
+    return $list;
+}
+
+/** The fmEncodingList() name for $name in any letter case, or null when the server cannot convert it. */
+function fmEncodingName(string $name): ?string {
+    foreach (fmEncodingList() as $e) {
+        if (strcasecmp($e, $name) === 0) {
+            return $e;
+        }
+    }
+    return null;
+}
+
+function fmIconvKnows(string $enc): bool {
+    static $known = [];
+    if (!isset($known[$enc])) {
+        $known[$enc] = function_exists('iconv') && @iconv($enc, 'UTF-8', '') !== false;
+    }
+    return $known[$enc];
+}
+
+function fmMbKnows(string $enc): bool {
+    static $known = [];
+    if (!isset($known[$enc])) {
+        try {
+            $known[$enc] = function_exists('mb_convert_encoding') && @mb_convert_encoding('a', 'UTF-8', $enc) !== false;
+        } catch (\Throwable $e) {
+            $known[$enc] = false;
+        }
+    }
+    return $known[$enc];
+}
+
+/**
+ * Convert $s strictly: null when $s is not valid in $from or a character does not exist in $to (nothing is dropped
+ * or replaced). iconv first; mbstring (checked by converting back) when iconv does not know one of the names.
+ */
+function fmEncodingConvert(string $s, string $from, string $to): ?string {
+    if ($s === '') {
+        return '';
+    }
+    if (strcasecmp($from, $to) === 0) {
+        return strcasecmp($from, 'UTF-8') !== 0 || preg_match('//u', $s) === 1 ? $s : null;
+    }
+    if (fmIconvKnows($from) && fmIconvKnows($to)) {
+        $r = @iconv($from, $to, $s);
+        return $r === false ? null : $r;
+    }
+    if (fmMbKnows($from) && fmMbKnows($to)) {
+        try {
+            if (!@mb_check_encoding($s, $from)) {
+                return null;
+            }
+            $r = @mb_convert_encoding($s, $to, $from);
+            return is_string($r) && @mb_convert_encoding($r, $from, $to) === $s ? $r : null;
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+    return null;
+}
+
+/**
+ * Encoding of a file from its first bytes: ['encoding' => name, 'ASCII' or null for binary, 'how' => bom|ascii|utf8|guess|binary,
+ * 'bom' => BOM length]. A BOM, plain ASCII and valid UTF-8 are certain; UTF-16 without a BOM and legacy single-byte
+ * encodings are guessed. $cut: the sample stops inside the file, so a character cut at its end is ignored.
+ */
+function fmDetectEncoding(string $s, bool $cut = false): array {
+    foreach (['UTF-8' => "\xEF\xBB\xBF", 'UTF-16LE' => "\xFF\xFE", 'UTF-16BE' => "\xFE\xFF"] as $enc => $bom) {
+        if (strncmp($s, $bom, strlen($bom)) === 0) {
+            return ['encoding' => $enc, 'how' => 'bom', 'bom' => strlen($bom)];
+        }
+    }
+    $binary = ['encoding' => null, 'how' => 'binary', 'bom' => 0];
+    if (strpos($s, "\0") !== false) {
+        // UTF-16 text without a BOM: ASCII characters (spaces, digits, line breaks) put a NUL on one side of each pair.
+        $n = min(strlen($s), 8192) & ~1;
+        $even = $odd = 0;
+        for ($i = 0; $i < $n; $i += 2) {
+            $even += $s[$i] === "\0" ? 1 : 0;
+            $odd += $s[$i + 1] === "\0" ? 1 : 0;
+        }
+        $pairs = max(1, $n / 2);
+        foreach (['UTF-16LE' => [$odd, $even], 'UTF-16BE' => [$even, $odd]] as $enc => [$many, $few]) {
+            if ($n < 64 || $many <= $pairs * 0.05 || $few >= $pairs * 0.01) {
+                continue;
+            }
+            $u = fmEncodingConvert(substr($s, 0, strlen($s) & ~1), $enc, 'UTF-8');
+            // Binary data may decode too, but then it is not mostly letters, digits, punctuation and spaces.
+            $chars = $u === null ? 0 : preg_match_all('/./su', $u);
+            if ($chars > 0 && preg_match_all('/[\p{L}\p{N}\p{P}\p{Zs}\t\r\n]/u', $u) >= $chars * 0.9) {
+                return ['encoding' => $enc, 'how' => 'guess', 'bom' => 0];
+            }
+        }
+        return $binary;
+    }
+    if (preg_match_all('/[\x01-\x08\x0E-\x1A\x1C-\x1F]/', $s) > strlen($s) / 100) {
+        return $binary;
+    }
+    if (!preg_match('/[\x80-\xFF]/', $s)) {
+        return ['encoding' => 'ASCII', 'how' => 'ascii', 'bom' => 0];
+    }
+    $t = $cut ? fmEncodingTrimPartial($s, 'UTF-8') : $s;
+    if (preg_match('//u', $t) === 1) {
+        return ['encoding' => 'UTF-8', 'how' => 'utf8', 'bom' => 0];
+    }
+    return ['encoding' => fmEncodingGuess($s), 'how' => 'guess', 'bom' => 0];
+}
+
+/** Legacy encoding of non-UTF-8 text: the candidate whose decoding looks most like real text. */
+function fmEncodingGuess(string $s): string {
+    $s = substr($s, 0, 16384);
+    $best = null;
+    $bestScore = 0.0;
+    foreach (['Windows-1251', 'KOI8-R', 'CP866', 'Windows-1252', 'ARMSCII-8'] as $enc) {
+        if (fmEncodingName($enc) === null) {
+            continue;
+        }
+        $u = fmEncodingConvert($s, $enc, 'UTF-8');
+        if ($u === null) {
+            continue;
+        }
+        $score = fmEncodingTextScore($u);
+        if ($best === null || $score > $bestScore) {
+            $best = $enc;
+            $bestScore = $score;
+        }
+    }
+    return $best ?? 'ISO-8859-1';
+}
+
+/**
+ * How much decoded text looks like a real language: frequent lowercase letters of Russian, Armenian and Western
+ * languages score most, capitals less, box drawing and control characters count against it, and so do letters of
+ * another alphabet glued to Latin letters ("Grьße") and long runs of accented Latin letters ("Ïðèâåò").
+ */
+function fmEncodingTextScore(string $u): float {
+    static $w = null;
+    if ($w === null) {
+        $w = [];
+        $set = static function (string $chars, float $v) use (&$w): void {
+            foreach (preg_split('//u', $chars, -1, PREG_SPLIT_NO_EMPTY) ?: [] as $ch) {
+                $w[$ch] = $v;
+            }
+        };
+        $set('абвгдежзийклмнопрстуфхцчшщъыьэюяёіїєґў', 2);
+        $set('оеаинтсрвлкмдпу', 3);
+        $set('АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯЁІЇЄҐЎ', 0.5);
+        $set('աբգդեզէըթժիլխծկհձղճմյնշոչպջռսվտրցւփքօֆև', 2);
+        $set('աեիոնրսվտլկմ', 3);
+        $set('ԱԲԳԴԵԶԷԸԹԺԻԼԽԾԿՀՁՂՃՄՅՆՇՈՉՊՋՌՍՎՏՐՑՒՓՔՕՖ', 0.5);
+        $set('՚՛՜՝՞՟։', 1);
+        $set('àáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿœšß', 1.5);
+        $set('éèàçüöäñóáíêô', 3);
+        $set('ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞŒŠŸ', 0.3);
+        $set("«»„“”‘’–—…№€°©®™\u{00A0}", 1);
+    }
+    preg_match_all('/[^\x00-\x7F]/u', $u, $m);
+    $score = 0.0;
+    foreach ($m[0] as $ch) {
+        if (isset($w[$ch])) {
+            $score += $w[$ch];
+            continue;
+        }
+        $b = array_values(unpack('C*', $ch) ?: []);
+        $cp = count($b) === 2 ? (($b[0] & 0x1F) << 6) | ($b[1] & 0x3F)
+            : (count($b) === 3 ? (($b[0] & 0x0F) << 12) | (($b[1] & 0x3F) << 6) | ($b[2] & 0x3F) : 0x10000);
+        if ($cp < 0xA0) {
+            $score -= 4;
+        } elseif ($cp >= 0x2500 && $cp <= 0x259F) {
+            $score -= 3;
+        } else {
+            $score -= 1;
+        }
+    }
+    $score -= 4 * preg_match_all('/[A-Za-z][\x{0400}-\x{04FF}\x{0530}-\x{058F}]|[\x{0400}-\x{04FF}\x{0530}-\x{058F}][A-Za-z]/u', $u);
+    if (preg_match_all('/[\x{00C0}-\x{00FF}]{3,}/u', $u, $runs)) {
+        foreach ($runs[0] as $run) {
+            $score -= 3 * (strlen($run) / 2 - 2);
+        }
+    }
+    return $score;
+}
+
+/** Line endings of decoded text: lf, crlf, cr, mixed or none. */
+function fmDetectEol(string $s): string {
+    $crlf = substr_count($s, "\r\n");
+    $kinds = array_filter(['crlf' => $crlf, 'lf' => substr_count($s, "\n") - $crlf, 'cr' => substr_count($s, "\r") - $crlf]);
+    return count($kinds) === 0 ? 'none' : (count($kinds) > 1 ? 'mixed' : (string)array_key_first($kinds));
+}
+
+/** $s (UTF-8) with line endings changed to $eol (lf / crlf); keep leaves it as it is. */
+function fmEolConvert(string $s, string $eol): string {
+    if ($eol === 'lf') {
+        return (string)preg_replace('/\r\n?/', "\n", $s);
+    }
+    if ($eol === 'crlf') {
+        return (string)preg_replace('/\r\n?|\n/', "\r\n", $s);
+    }
+    return $s;
+}
+
+function fmEncodingBom(string $enc): string {
+    return ['UTF-8' => "\xEF\xBB\xBF", 'UTF-16LE' => "\xFF\xFE", 'UTF-16BE' => "\xFE\xFF"][$enc] ?? '';
+}
+
+function fmEncodingStripBom(string $s, string $enc): string {
+    $bom = fmEncodingBom($enc);
+    return $bom !== '' && strncmp($s, $bom, strlen($bom)) === 0 ? substr($s, strlen($bom)) : $s;
+}
+
+/** $s without a character cut at its end (a sample that stops inside a file). */
+function fmEncodingTrimPartial(string $s, string $enc): string {
+    if ($enc === 'UTF-8' && preg_match('//u', $s) !== 1) {
+        return (string)preg_replace('/[\xC0-\xFF][\x80-\xBF]*$/', '', $s);
+    }
+    if ($enc === 'UTF-16LE' || $enc === 'UTF-16BE') {
+        return substr($s, 0, strlen($s) & ~1);
+    }
+    return $s;
+}
+
+/** Free name for a converted copy next to $name: report.txt -> report.utf8.txt, then "report.utf8 (1).txt". */
+function fmEncodingCopyName(string $dir, string $name, string $to): string {
+    $suffix = strtolower((string)preg_replace(['/^windows-/i', '/[^a-z0-9]+/i'], ['cp', ''], $to));
+    $dot = strrpos($name, '.');
+    $base = $dot !== false && $dot > 0 ? substr($name, 0, $dot) : $name;
+    $ext = $dot !== false && $dot > 0 ? substr($name, $dot) : '';
+    $candidate = $base . '.' . $suffix . $ext;
+    for ($i = 1; file_exists($dir . '/' . $candidate) && $i < 1000; $i++) {
+        $candidate = $base . '.' . $suffix . ' (' . $i . ')' . $ext;
+    }
+    return $candidate;
+}
+
+/**
+ * Encoding details of one file: ['size', 'encoding', 'how', 'eol'] or ['skip' => link|not_found|too_big|binary].
+ * Links are skipped (a link would be replaced by a file, and its target may be outside the root). The sample read
+ * is taken from $budget when given.
+ */
+function fmEncodingFileInfo(string $full, string $rootDir, ?int &$budget = null): array {
+    if ($budget !== null && $budget <= 0) {
+        return ['skip' => 'budget'];
+    }
+    if (fmIsLinkPath($full)) {
+        return ['skip' => 'link'];
+    }
+    if (!is_file($full) || !pathInsideRoot($full, $rootDir)) {
+        return ['skip' => 'not_found'];
+    }
+    $size = (int)@filesize($full);
+    if ($size > FM_ENCODING_MAX_FILE_BYTES) {
+        return ['size' => $size, 'skip' => 'too_big'];
+    }
+    $sample = (string)@file_get_contents($full, false, null, 0, FM_ENCODING_SAMPLE_BYTES);
+    if ($budget !== null) {
+        $budget -= strlen($sample);
+    }
+    $d = fmDetectEncoding($sample, $size > strlen($sample));
+    if ($d['encoding'] === null) {
+        return ['size' => $size, 'skip' => 'binary'];
+    }
+    $text = $sample;
+    if ($d['encoding'] === 'UTF-16LE' || $d['encoding'] === 'UTF-16BE') {
+        $text = (string)fmEncodingConvert(fmEncodingTrimPartial(substr($sample, $d['bom']), $d['encoding']), $d['encoding'], 'UTF-8');
+    }
+    return ['size' => $size, 'encoding' => $d['encoding'], 'how' => $d['how'], 'eol' => fmDetectEol($text)];
+}
+
+/**
+ * First lines of a file as it reads now (as UTF-8, other bytes shown as "?") and after decoding it from $from
+ * ('auto' = detected); 'after' is null when the file is not valid in that encoding, 'unmappable' tells that some
+ * characters do not exist in $to. 'size_after' is the size once converted with $eol and $bom (estimated from the
+ * first 64 KB for bigger files: 'size_approx').
+ */
+function fmEncodingPreview(string $full, string $rootDir, string $from, string $to, string $eol = 'keep', bool $bom = false): array {
+    $info = fmEncodingFileInfo($full, $rootDir);
+    if (isset($info['skip'])) {
+        return ['skip' => $info['skip']];
+    }
+    $sample = (string)@file_get_contents($full, false, null, 0, FM_ENCODING_SAMPLE_BYTES);
+    $cut = $info['size'] > strlen($sample);
+    $src = $from === 'auto' ? $info['encoding'] : $from;
+    $src = $src === 'ASCII' ? 'UTF-8' : $src;
+    $lines = static function (string $t): array {
+        $t = (string)preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', '', $t);
+        $out = [];
+        foreach (array_slice(preg_split('/\r\n|\r|\n/', $t) ?: [], 0, 20) as $l) {
+            $out[] = strlen($l) > 600 && preg_match('/^.{0,300}/us', $l, $m) ? $m[0] . '…' : $l;
+        }
+        return $out;
+    };
+    $now = $cut ? fmEncodingTrimPartial($sample, 'UTF-8') : $sample;
+    if (preg_match('//u', $now) !== 1) {
+        $now = (string)preg_replace('/[\x80-\xFF]/', '?', $now);
+    }
+    $stripped = fmEncodingStripBom($sample, $src);
+    $body = $cut ? fmEncodingTrimPartial($stripped, $src) : $stripped;
+    $after = fmEncodingConvert($body, $src, 'UTF-8');
+    $out = $after === null ? null : fmEncodingConvert(fmEolConvert($after, $eol), 'UTF-8', $to);
+    $sizeAfter = null;
+    if ($out !== null) {
+        $bomLen = $bom ? strlen(fmEncodingBom($to)) : 0;
+        $sizeAfter = $cut
+            ? (int)round(($info['size'] - (strlen($sample) - strlen($stripped))) * strlen($out) / max(1, strlen($body))) + $bomLen
+            : strlen($out) + $bomLen;
+    }
+    return [
+        'from'        => $src,
+        'detected'    => $info['encoding'],
+        'how'         => $info['how'],
+        'eol'         => $info['eol'],
+        'size'        => $info['size'],
+        'size_after'  => $sizeAfter,
+        'size_approx' => $cut,
+        'now'         => $lines($now),
+        'after'       => $after === null ? null : $lines($after),
+        'unmappable'  => $after !== null && $out === null,
+    ];
+}
+
+/**
+ * Convert one file: decode from $from ('auto' = detected), change line endings, encode to $to (+ BOM), then replace
+ * the file or write a copy next to it. Written through a temp file in the same folder and renamed, so a failure
+ * leaves the original as it was. Returns ['status' => converted|already|skipped|failed, 'from', 'how', 'reason', 'new_name'].
+ */
+function fmEncodingConvertFile(string $full, string $rootDir, string $from, string $to, bool $bom, string $eol, string $mode): array {
+    $info = fmEncodingFileInfo($full, $rootDir);
+    if (isset($info['skip'])) {
+        return ['status' => 'skipped', 'reason' => $info['skip']];
+    }
+    $src = $from === 'auto' ? $info['encoding'] : $from;
+    $src = $src === 'ASCII' ? 'UTF-8' : $src;
+    $res = ['from' => $src, 'how' => $from === 'auto' ? $info['how'] : 'chosen'];
+    $data = @file_get_contents($full);
+    if ($data === false) {
+        return $res + ['status' => 'failed', 'reason' => 'could not read the file'];
+    }
+    $utf8 = fmEncodingConvert(fmEncodingStripBom($data, $src), $src, 'UTF-8');
+    if ($utf8 === null) {
+        return $res + ['status' => 'failed', 'reason' => 'the file is not valid ' . $src];
+    }
+    $out = fmEncodingConvert(fmEolConvert($utf8, $eol), 'UTF-8', $to);
+    if ($out === null) {
+        return $res + ['status' => 'failed', 'reason' => 'some characters do not exist in ' . $to];
+    }
+    if ($bom) {
+        $out = fmEncodingBom($to) . $out;
+    }
+    if ($out === $data) {
+        return $res + ['status' => 'already'];
+    }
+    $dir = dirname($full);
+    $dest = $mode === 'copy' ? $dir . '/' . fmEncodingCopyName($dir, basename($full), $to) : $full;
+    $tmp = $dir . '/.fm-conv-' . bin2hex(random_bytes(6)) . '.tmp';
+    if (@file_put_contents($tmp, $out) !== strlen($out)) {
+        @unlink($tmp);
+        return $res + ['status' => 'failed', 'reason' => 'could not write in the folder'];
+    }
+    $perms = @fileperms($full);
+    if ($perms !== false) {
+        @chmod($tmp, $perms & 0777);
+    }
+    if (!@rename($tmp, $dest)) {
+        @unlink($tmp);
+        return $res + ['status' => 'failed', 'reason' => 'could not replace the file'];
+    }
+    return $res + ['status' => 'converted'] + ($mode === 'copy' ? ['new_name' => basename($dest)] : []);
+}
+
+/** Find / scan encoding filter: 'text' = any text file, 'not_utf8' = neither UTF-8 nor ASCII, or one encoding (UTF-8 includes ASCII). */
+function fmSearchEncodingMatches(string $want, string $got): bool {
+    if ($want === 'text') {
+        return true;
+    }
+    if ($want === 'not_utf8') {
+        return $got !== 'UTF-8' && $got !== 'ASCII';
+    }
+    return $want === $got || ($want === 'UTF-8' && $got === 'ASCII');
+}
+
+/**
+ * Search criteria for the encoding scan: text files whose name matches one of the wildcard masks ("*.txt;*.php",
+ * empty or "*" = all, letter case ignored), only those not in UTF-8 / ASCII when $notUtf8.
+ */
+function fmEncodingScanCriteria(string $mask, bool $notUtf8): array {
+    $masks = array_values(array_filter(array_map('trim', explode(';', $mask)), static fn($m) => $m !== '' && $m !== '*'));
+    return fmSearchCriteria([
+        'type'     => 'file',
+        'name'     => $masks ? '^(?:' . implode('|', array_map('fmSearchGlobToRegex', $masks)) . ')$' : '',
+        'match'    => 'regex',
+        'icase'    => '1',
+        'encoding' => $notUtf8 ? 'not_utf8' : 'text',
+    ]);
+}
+
+/** Folder of the request ("in", relative to the root), or null when it is not a folder inside the root. */
+function fmRequestFolder(string $rootDir): ?string {
+    $dirIn = (string)($_POST['in'] ?? '');
+    $dir = safeRealpath($dirIn !== '' ? $rootDir . '/' . trim($dirIn, '/') : $rootDir);
+    return pathInsideRoot($dir, $rootDir) && is_dir($dir) ? $dir : null;
+}
+
+/** Start an NDJSON response without output buffering; returns a function that sends one line. */
+function fmNdjsonBegin(): callable {
+    ignore_user_abort(true);
+    while (ob_get_level()) {
+        @ob_end_flush();
+    }
+    header('Content-Type: application/x-ndjson');
+    header('Cache-Control: no-cache');
+    header('X-Accel-Buffering: no');
+    fm_ob_implicit_flush_enable();
+    return static function (array $payload): void {
+        echo json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE) . "\n";
+        if (ob_get_level()) {
+            ob_flush();
+        }
+        flush();
+    };
 }
 
 /**
@@ -3857,7 +4416,8 @@ function fmSearchFindArgv(string $baseDir, bool $atRoot, array $c): array {
     $argv = ['find', $baseDir, '-mindepth', '1'];
     if ($atRoot) {
         $b = $glob(rtrim($baseDir, '/'));
-        array_push($argv, '(', '-path', $b . '/' . $glob(fmTrashBasename()), '-o', '-path', $b . '/' . FM_UPLOAD_TMP_BASENAME, ')', '-prune', '-o');
+        array_push($argv, '(', '-path', $b . '/' . $glob(fmTrashBasename()), '-o', '-path', $b . '/' . FM_UPLOAD_TMP_BASENAME,
+            '-o', '-path', $b . '/' . FM_STATE_BASENAME, ')', '-prune', '-o');
     }
     // find's case folding depends on the locale, so ignore-case pre-filtering is limited to ASCII names.
     $name = $c['name'];
@@ -3865,8 +4425,8 @@ function fmSearchFindArgv(string $baseDir, bool $atRoot, array $c): array {
         $pattern = $c['match'] === 'contains' ? '*' . $glob($name) . '*' : addcslashes($name, '\\[]');
         array_push($argv, $c['icase'] ? '-iname' : '-name', $pattern);
     }
-    // Content is read from files only; links stay in (PHP reads a linked file when it is inside the root).
-    if (($c['content'] ?? '') !== '') {
+    // Content and encoding are read from files only; links stay in (PHP decides about a linked file).
+    if (($c['content'] ?? '') !== '' || ($c['encoding'] ?? '') !== '') {
         array_push($argv, '(', '-type', 'f', '-o', '-type', 'l', ')');
     }
     $argv[] = '-print0';
@@ -4405,16 +4965,19 @@ final class FmDlStatus {
         return (bool)preg_match('/^[a-f0-9]{16,64}$/', $token);
     }
 
+    /** Status file of $token, or '' when there is no folder to keep it (see fmStateDir). */
     public static function path(string $token): string {
-        return sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'fm-dlstat-' . $token . '.json';
+        $dir = fmStateDir();
+        return $dir === null ? '' : $dir . '/fm-dlstat-' . $token . '.json';
     }
 
     /**
-     * Start tracking the current request (no-op when the request has no valid dl_token).
+     * Start tracking the current request (no-op when the request has no valid dl_token or no status folder).
+     * Used by downloads and by archive jobs (the client polls download-status when the stream breaks).
      */
     public static function init(string $name): void {
         $token = (string)($_POST['dl_token'] ?? $_GET['dl_token'] ?? '');
-        if (!self::tokenIsValid($token)) {
+        if (!self::tokenIsValid($token) || self::path($token) === '') {
             return;
         }
         self::cleanupOld();
@@ -4444,6 +5007,22 @@ final class FmDlStatus {
 
     public static function progress(int $bytes): void {
         self::$data['bytes'] = $bytes;
+        if (microtime(true) - self::$lastWrite >= 1.0) {
+            self::write();
+        }
+    }
+
+    /** Archive jobs: items done so far; also keeps the heartbeat fresh (written at most once a second). */
+    public static function items(int $n): void {
+        self::$data['items'] = $n;
+        if (microtime(true) - self::$lastWrite >= 1.0) {
+            self::write();
+        }
+    }
+
+    /** Archive jobs: percent of the compressing step (null: not in that step). */
+    public static function pct(?int $pct): void {
+        self::$data['pct'] = $pct;
         if (microtime(true) - self::$lastWrite >= 1.0) {
             self::write();
         }
@@ -4519,7 +5098,7 @@ final class FmDlStatus {
             self::aborted();
             return;
         }
-        self::fail('The download stopped unexpectedly on the server.');
+        self::fail('The server stopped before finishing.');
     }
 
     /**
@@ -4529,6 +5108,9 @@ final class FmDlStatus {
      */
     public static function read(string $token): array {
         $file = self::path($token);
+        if ($file === '') {
+            return ['state' => 'untracked'];
+        }
         if (!is_file($file)) {
             return ['state' => 'pending'];
         }
@@ -4544,12 +5126,136 @@ final class FmDlStatus {
 
     private static function cleanupOld(): void {
         $old = time() - 3600;
-        foreach (glob(sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'fm-dlstat-*.json') ?: [] as $f) {
+        $dir = (string)fmStateDir();
+        foreach (array_merge(glob($dir . '/fm-dlstat-*') ?: [], glob($dir . '/fm-arcout-*') ?: []) as $f) {
             if ((int)@filemtime($f) < $old) {
                 @unlink($f);
             }
         }
     }
+}
+
+/**
+ * File an archiver reported in one output line ("  adding: a/b.txt (deflated 50%)" from zip, "a/b.txt" from tar -v,
+ * "a a/b.txt" from bsdtar -v), or null for folders, messages and empty lines.
+ */
+function fmArchiverOutputFile(string $line): ?string {
+    $line = trim($line);
+    if ($line === '' || preg_match('/^(zip|tar|gzip|bsdtar)(\s+(warning|error))?\s*:/i', $line)) {
+        return null;
+    }
+    if (preg_match('/^(?:adding|updating):\s+(.+?)(?:\s+\((?:stored|deflated|bzipped)\b[^)]*\))?$/', $line, $m)) {
+        $name = $m[1];
+    } else {
+        $name = (string)preg_replace('/^a\s+/', '', $line);
+    }
+    return substr($name, -1) === '/' || substr($name, -1) === '\\' ? null : $name;
+}
+
+/**
+ * gzip $src into $dst with zlib in PHP, so the progress is known: $onProgress(bytes read, total bytes) runs after
+ * every 1 MB. A partly written $dst is removed on failure.
+ */
+function fmGzipFileWithProgress(string $src, string $dst, callable $onProgress, int $level = 6): void {
+    $total = (int)@filesize($src);
+    $in = @fopen($src, 'rb');
+    $out = $in ? @gzopen($dst, 'wb' . $level) : false;
+    if (!$in || !$out) {
+        if ($in) {
+            fclose($in);
+        }
+        throw new RuntimeException('cannot open ' . basename($out ? $src : $dst) . ' for gzip');
+    }
+    $done = 0;
+    $ok = true;
+    while (!feof($in)) {
+        $chunk = fread($in, 1048576);
+        if ($chunk === false) {
+            $ok = false;
+            break;
+        }
+        if ($chunk === '') {
+            continue;
+        }
+        if (gzwrite($out, $chunk) !== strlen($chunk)) {
+            $ok = false;
+            break;
+        }
+        $done += strlen($chunk);
+        $onProgress($done, $total);
+    }
+    fclose($in);
+    $ok = gzclose($out) && $ok;
+    if (!$ok) {
+        @unlink($dst);
+        throw new RuntimeException('could not write ' . basename($dst) . ' (disk full?)');
+    }
+}
+
+/**
+ * Run an archiver command and follow it: $onLine gets each new output line, $tick runs about 4 times a second.
+ * Output (stdout + stderr) goes to a temp file that is read while the command runs: stream_select() does not work
+ * on process pipes on Windows. Without proc_open() the command runs with exec() (no progress). Returns [exit code,
+ * last lines of output].
+ *
+ * @return array{0: int, 1: string}
+ */
+function fmRunArchiver(string $cmd, callable $onLine, callable $tick): array {
+    $out = (fmStateDir() ?? rtrim(sys_get_temp_dir(), '/\\')) . '/fm-arcout-' . bin2hex(random_bytes(8)) . '.log';
+    $proc = function_exists('proc_open')
+        ? @proc_open($cmd . ' > ' . escapeshellarg($out) . ' 2>&1', [0 => ['file', PHP_OS_FAMILY === 'Windows' ? 'NUL' : '/dev/null', 'r']], $pipes)
+        : false;
+    if (!is_resource($proc)) {
+        $lines = [];
+        $code = 1;
+        @exec($cmd . ' 2>&1', $lines, $code);
+        foreach ($lines as $l) {
+            $onLine((string)$l);
+        }
+        return [(int)$code, implode("\n", array_slice($lines, -20))];
+    }
+    $pos = 0;
+    $buf = '';
+    $tail = [];
+    $read = static function () use ($out, &$pos, &$buf, &$tail, $onLine): void {
+        clearstatcache(true, $out);
+        $size = @filesize($out);
+        if ($size === false || $size <= $pos || ($h = @fopen($out, 'rb')) === false) {
+            return;
+        }
+        fseek($h, $pos);
+        $chunk = (string)fread($h, $size - $pos);
+        fclose($h);
+        $pos += strlen($chunk);
+        $buf .= $chunk;
+        while (($p = strpos($buf, "\n")) !== false) {
+            $line = rtrim(substr($buf, 0, $p), "\r");
+            $buf = (string)substr($buf, $p + 1);
+            $tail[] = $line;
+            if (count($tail) > 20) {
+                array_shift($tail);
+            }
+            $onLine($line);
+        }
+    };
+    while (true) {
+        $st = proc_get_status($proc);
+        $read();
+        if (!$st['running']) {
+            $code = (int)$st['exitcode'];
+            break;
+        }
+        $tick();
+        usleep(250000);
+    }
+    $read();
+    if (trim($buf) !== '') {
+        $onLine(rtrim($buf, "\r"));
+        $tail[] = $buf;
+    }
+    proc_close($proc);
+    @unlink($out);
+    return [$code, implode("\n", $tail)];
 }
 
 /**
@@ -4601,11 +5307,15 @@ final class FmStreamOut {
     private $sent = 0;
     /** @var resource|object|null */
     private $gzip = null;
+    /** @var resource|null When set, the archive goes into this file instead of the browser */
+    private $file = null;
 
-    public function __construct(bool $gzip) {
+    /** @param resource|null $file */
+    public function __construct(bool $gzip, $file = null) {
         if ($gzip) {
             $this->gzip = deflate_init(ZLIB_ENCODING_GZIP, ['level' => 6]);
         }
+        $this->file = $file;
     }
 
     public function position(): int {
@@ -4633,6 +5343,13 @@ final class FmStreamOut {
 
     private function flush(): void {
         if ($this->buf === '') {
+            return;
+        }
+        if ($this->file !== null) {
+            if (@fwrite($this->file, $this->buf) !== strlen($this->buf)) {
+                throw new RuntimeException('could not write the archive (disk full?)');
+            }
+            $this->buf = '';
             return;
         }
         echo $this->buf;
@@ -4939,11 +5656,11 @@ function fmTarWriteHeader(FmStreamOut $out, string $name, int $mode, int $size, 
 }
 
 /**
- * Stream a tar of $dir/$names (gzip, if any, is applied by FmStreamOut).
+ * Stream a tar of $dir/$names (gzip, if any, is applied by FmStreamOut). $onFile($rel) runs after each file.
  *
  * @param string[] $names
  */
-function fmStreamTar(string $dir, array $names, FmStreamOut $out): void {
+function fmStreamTar(string $dir, array $names, FmStreamOut $out, ?callable $onFile = null): void {
     foreach (fmArchiveWalk($dir, $names) as [$abs, $rel, $isDir]) {
         $mtime = (int)(@filemtime($abs) ?: time());
         $perms = @fileperms($abs);
@@ -4975,6 +5692,9 @@ function fmStreamTar(string $dir, array $names, FmStreamOut $out): void {
             }
         }
         $out->write(str_repeat("\0", (512 - $size % 512) % 512));
+        if ($onFile !== null) {
+            $onFile($rel);
+        }
     }
     $out->write(str_repeat("\0", 1024));
 }
@@ -5435,6 +6155,9 @@ if (isset($_GET['action']) && $_GET['action'] === 'get-info' && isset($_GET['pat
         'extension'   => $ext,
         'permissions' => $permissions
     ] + ($link ?? []);
+    if (!$isDir && !$outside) {
+        $out['encoding'] = fmEncodingFileInfo($link !== null ? $linkPath : $path, $ROOT_DIR);
+    }
     jsonOut($out);
 }
 
@@ -5459,6 +6182,8 @@ if (isset($_GET['action']) && $_GET['action'] === 'get-server-info') {
         'post_max_size'        => (string)ini_get('post_max_size'),
         'timezone'             => date_default_timezone_get(),
         'root_path'            => $ROOT_DIR,
+        'state_dir'            => fmStateDir(),
+        'temp_dir'             => sys_get_temp_dir(),
         'disk_free_bytes'      => $rootFree !== false ? $rootFree : null,
         'disk_total_bytes'     => $rootTotal !== false ? $rootTotal : null,
         'server_time'          => date('Y-m-d H:i:s'),
@@ -5959,20 +6684,90 @@ if (isset($_POST['action']) && $_POST['action'] === 'compress' && isset($_POST['
     $dir = safeRealpath($dir);
     $type = (string)$_POST['archive_type'];
 
-    // Stream responses are expected by the frontend compress UI.
+    // Stream responses are expected by the frontend compress UI. A big archive takes minutes: keep going when the
+    // browser or a proxy drops the connection, and tell the progress to the status file (dl_token) so the page can
+    // still learn the result.
+    @set_time_limit(0);
+    ignore_user_abort(true);
+    if (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
     while (ob_get_level()) { @ob_end_flush(); }
     header('Content-Type: application/x-ndjson');
     header('Cache-Control: no-cache');
+    header('X-Accel-Buffering: no');
     @fm_ob_implicit_flush_enable();
+    FmDlStatus::init((string)$_POST['archive_name']);
 
-    $send = function (array $payload) {
+    $lastSent = microtime(true);
+    $started = microtime(true);
+    $send = function (array $payload) use (&$lastSent) {
         echo json_encode($payload, JSON_UNESCAPED_SLASHES) . "\n";
         @flush();
+        $lastSent = microtime(true);
     };
     $sendError = function (string $msg) use ($send) {
+        FmDlStatus::fail($msg);
         $send(['error' => $msg]);
         $send(['done' => true]);
         exit;
+    };
+    $sendDone = function (int $n) use ($send) {
+        FmDlStatus::items($n);
+        FmDlStatus::done();
+        $send(['n' => $n, 'name' => '']);
+        $send(['done' => true]);
+        exit;
+    };
+    // Shell archivers: every file they report counts as progress; nothing reported for 5 s sends a "tick", so
+    // hosting proxies never see an idle connection.
+    $processed = 0;
+    $lastN = 0.0;
+    $onArchiverLine = function (string $line) use (&$processed, &$lastN, $send) {
+        $file = fmArchiverOutputFile($line);
+        if ($file === null) {
+            return;
+        }
+        $processed++;
+        FmDlStatus::items($processed);
+        if (microtime(true) - $lastN >= 0.25) {
+            $lastN = microtime(true);
+            $send(['n' => $processed, 'name' => $file]);
+        }
+    };
+    $tick = function () use (&$processed, &$lastSent, $started, $send) {
+        FmDlStatus::items($processed);
+        if (microtime(true) - $lastSent >= 5) {
+            $send(['tick' => (int)(microtime(true) - $started)]);
+        }
+    };
+    // The compressing step (gzip, ZipArchive::close) reports a percent at most twice a second.
+    $lastPctAt = 0.0;
+    $sendPct = function (int $pct, string $msg) use (&$lastPctAt, $send) {
+        $pct = max(0, min(100, $pct));
+        FmDlStatus::pct($pct);
+        if (microtime(true) - $lastPctAt >= 0.5 || $pct === 100) {
+            $lastPctAt = microtime(true);
+            $send(['phase' => 'compressing', 'pct' => $pct, 'msg' => $msg]);
+        }
+    };
+    $runArchiver = function (string $cmd, string $what) use ($onArchiverLine, $tick) {
+        [$code, $tail] = fmRunArchiver($cmd, $onArchiverLine, $tick);
+        if ($code !== 0) {
+            throw new RuntimeException($what . ' failed: ' . trim($tail));
+        }
+    };
+    // gzip a finished .tar: in PHP (exact percent) when zlib is there, else with the gzip command.
+    $gzipTar = function (string $tarPath, string $gzPath) use ($sendPct, $runArchiver) {
+        if (function_exists('gzopen')) {
+            $sendPct(0, 'Compressing with gzip…');
+            fmGzipFileWithProgress($tarPath, $gzPath, static function (int $done, int $all) use ($sendPct) {
+                $sendPct($all > 0 ? (int)floor($done * 100 / $all) : 100, 'Compressing with gzip…');
+            });
+            @unlink($tarPath);
+            return;
+        }
+        $runArchiver('gzip -f ' . escapeshellarg($tarPath), 'gzip');
     };
 
     if (!pathInsideRoot($dir, $ROOT_DIR)) $sendError('Invalid path');
@@ -5987,9 +6782,10 @@ if (isset($_POST['action']) && $_POST['action'] === 'compress' && isset($_POST['
     if ($baseName === '') $sendError('Archive name is required');
 
     $ext = ['zip' => '.zip', 'tar' => '.tar', 'gzip' => '.tar.gz'][$type];
-    if (substr($baseName, -strlen($ext)) !== $ext) {
-        $baseName .= $ext;
-    }
+    // "site.zip" sent for a TAR.GZ becomes "site.tar.gz", not "site.zip.tar.gz".
+    $baseName = (string)preg_replace('/\.(zip|tar\.gz|tgz|tar)$/i', '', $baseName);
+    if ($baseName === '') $sendError('Archive name is required');
+    $baseName .= $ext;
 
     $destPath = $dir . '/' . $baseName;
 
@@ -6034,7 +6830,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'compress' && isset($_POST['
     $tryShell         = fmFileOpsTryShell();
     $allowPhpFallback = fmFileOpsAllowPhpFallback();
 
-    $processed = 0;
     $estForProgress = $total > 0 ? $total : max(count($names), 1);
     $send(array_merge(['total' => $total, 'n' => 0, 'name' => ''], fmStreamProgressMeta($estForProgress, !$tryShell)));
 
@@ -6054,17 +6849,9 @@ if (isset($_POST['action']) && $_POST['action'] === 'compress' && isset($_POST['
                         $itemsEsc .= ' ' . escapeshellarg($n);
                     }
 
-                    // Single command for speed (progress becomes start/end).
-                    $cmd = 'cd ' . $dirEsc . ' && zip -r -q ' . $destEsc . $itemsEsc . ' 2>&1';
-                    exec($cmd, $out2, $ret2);
-                    if ($ret2 !== 0) {
-                        throw new RuntimeException('zip failed: ' . trim(implode("\n", (array)$out2)));
-                    }
-
-                    $processed = $total;
-                    $send(['n' => $processed, 'name' => '']);
-                    $send(['done' => true]);
-                    exit;
+                    // One command; zip lists every file it adds, which is the progress.
+                    $runArchiver('cd ' . $dirEsc . ' && zip -r ' . $destEsc . $itemsEsc, 'zip');
+                    $sendDone(max($processed, $total));
                 }
             }
 
@@ -6092,26 +6879,12 @@ if (isset($_POST['action']) && $_POST['action'] === 'compress' && isset($_POST['
                         $itemsEsc .= ' ' . escapeshellarg($n);
                     }
 
-                    // Single command for speed (progress becomes start/end).
-                    $cmd = 'cd ' . $dirEsc . ' && tar -cf ' . $tarEsc . $itemsEsc . ' 2>&1';
-                    exec($cmd, $out2, $ret2);
-                    if ($ret2 !== 0) {
-                        throw new RuntimeException('tar failed: ' . trim(implode("\n", (array)$out2)));
-                    }
-
-                    $processed = $total;
-
+                    // One command; tar -v lists every file, which is the progress.
+                    $runArchiver('cd ' . $dirEsc . ' && tar -cvf ' . $tarEsc . $itemsEsc, 'tar');
                     if ($type === 'gzip') {
-                        $cmd = 'gzip -f ' . $tarEsc . ' 2>&1';
-                        exec($cmd, $out3, $ret3);
-                        if ($ret3 !== 0) {
-                            throw new RuntimeException('gzip failed: ' . trim(implode("\n", (array)$out3)));
-                        }
+                        $gzipTar($tarPath, $destPath);
                     }
-
-                    $send(['n' => $processed, 'name' => '']);
-                    $send(['done' => true]);
-                    exit;
+                    $sendDone(max($processed, $total));
                 }
             }
         }
@@ -6135,21 +6908,9 @@ if (isset($_POST['action']) && $_POST['action'] === 'compress' && isset($_POST['
                         $itemsEsc .= ' ' . escapeshellarg($n);
                     }
 
-                    if ($type === 'tar') {
-                        $cmd = 'cd ' . $dirEsc . ' && tar -cf ' . $tarEsc . $itemsEsc . ' 2>&1';
-                    } else {
-                        // Create .tar.gz directly.
-                        $cmd = 'cd ' . $dirEsc . ' && tar -czf ' . $tarEsc . $itemsEsc . ' 2>&1';
-                    }
-                    exec($cmd, $out2, $ret2);
-                    if ($ret2 !== 0) {
-                        throw new RuntimeException('tar failed: ' . trim(implode("\n", (array)$out2)));
-                    }
-
-                    $processed = $total;
-                    $send(['n' => $processed, 'name' => '']);
-                    $send(['done' => true]);
-                    exit;
+                    // .tar.gz is written directly with -z.
+                    $runArchiver('cd ' . $dirEsc . ' && tar ' . ($type === 'tar' ? '-cvf ' : '-czvf ') . $tarEsc . $itemsEsc, 'tar');
+                    $sendDone(max($processed, $total));
                 }
             }
 
@@ -6166,15 +6927,8 @@ if (isset($_POST['action']) && $_POST['action'] === 'compress' && isset($_POST['
                     foreach ($names as $n) {
                         $itemsEsc .= ' ' . escapeshellarg($n);
                     }
-                    $cmd = 'cd ' . $dirEsc . ' && tar -a -c -f ' . $tarEsc . $itemsEsc . ' 2>&1';
-                    exec($cmd, $out2, $ret2);
-                    if ($ret2 !== 0) {
-                        throw new RuntimeException('tar failed: ' . trim(implode("\n", (array)$out2)));
-                    }
-                    $processed = $total;
-                    $send(['n' => $processed, 'name' => '']);
-                    $send(['done' => true]);
-                    exit;
+                    $runArchiver('cd ' . $dirEsc . ' && tar -a -c -v -f ' . $tarEsc . $itemsEsc, 'tar');
+                    $sendDone(max($processed, $total));
                 }
 
                 exec('powershell -NoProfile -NonInteractive -Command "exit 0" 2>&1', $out, $ret);
@@ -6197,11 +6951,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'compress' && isset($_POST['
                             '[System.IO.Compression.ZipFile]::CreateFromDirectory(' .
                             '\'' . $srcPs . '\',' .
                             '\'' . $destPs . '\')';
-                        $cmd = 'powershell -NoProfile -NonInteractive -Command ' . escapeshellarg($psScript) . ' 2>&1';
-                        exec($cmd, $out2, $ret2);
-                        if ($ret2 !== 0) {
-                            throw new RuntimeException('ZipFile.CreateFromDirectory failed: ' . trim(implode("\n", (array)$out2)));
-                        }
+                        $runArchiver('powershell -NoProfile -NonInteractive -Command ' . escapeshellarg($psScript), 'ZipFile.CreateFromDirectory');
                     } else {
                         $psDest = '"' . addslashes($destWin) . '"';
                         $paths = [];
@@ -6211,27 +6961,29 @@ if (isset($_POST['action']) && $_POST['action'] === 'compress' && isset($_POST['
                             $paths[] = '"' . addslashes($fullWin) . '"';
                         }
                         $psPaths = implode(',', $paths);
-                        $cmd = 'powershell -NoProfile -NonInteractive -Command "Compress-Archive -Path ' . $psPaths . ' -DestinationPath ' . $psDest . ' -Force -CompressionLevel Fastest" 2>&1';
-                        exec($cmd, $out2, $ret2);
-                        if ($ret2 !== 0) {
-                            throw new RuntimeException('Compress-Archive failed: ' . trim(implode("\n", (array)$out2)));
-                        }
+                        $runArchiver('powershell -NoProfile -NonInteractive -Command "Compress-Archive -Path ' . $psPaths . ' -DestinationPath ' . $psDest . ' -Force -CompressionLevel Fastest"', 'Compress-Archive');
                     }
-
-                    $processed = $total;
-                    $send(['n' => $processed, 'name' => '']);
-                    $send(['done' => true]);
-                    exit;
+                    $sendDone(max($processed, $total));
                 }
             }
         }
     } catch (Throwable $e) {
         if ($shellAttempted) {
             @unlink($destPath);
+            // The .tar of a failed "tar, then gzip" must not be picked up by the PHP fallback.
+            if (isset($tarPath) && is_string($tarPath) && $tarPath !== $destPath) {
+                @unlink($tarPath);
+            }
         }
         if (!$allowPhpFallback) {
             $sendError('Archive failed (OS only): ' . $e->getMessage());
         }
+        // Its last line usually tells why (e.g. "Cannot write: Disk quota exceeded"); kept for the final message.
+        $shellLines = array_values(array_filter(array_map('trim', explode("\n", $e->getMessage())), 'strlen'));
+        $shellError = $shellLines ? (string)end($shellLines) : '';
+        $send(['phase' => 'php', 'msg' => 'The system archiver failed, building the archive in PHP…', 'warning' => $shellError]);
+        $processed = 0;
+        FmDlStatus::pct(null);
     }
 
     if ($allowPhpFallback) {
@@ -6245,6 +6997,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'compress' && isset($_POST['
             $progressMinInterval = 0.2; // seconds
             $progressEvery = 250; // entries
             $sendProgress = function () use ($send, &$processed, &$lastProgressAt, $progressEvery, $progressMinInterval) {
+                FmDlStatus::items($processed);
                 $now = microtime(true);
                 $timeOk = ($now - $lastProgressAt) >= $progressMinInterval;
                 $countOk = ($progressEvery > 0) && ($processed % $progressEvery === 0);
@@ -6260,10 +7013,13 @@ if (isset($_POST['action']) && $_POST['action'] === 'compress' && isset($_POST['
                     throw new RuntimeException('Could not create archive');
                 }
                 $send(['phase' => 'adding', 'msg' => 'Adding files and folders structure…']);
+                // Size of each entry in the order added: close() reports entries done, the percent shown is bytes done.
+                $entrySizes = [];
                 foreach ($names as $n) {
                     $full = $dir . '/' . $n;
                     if (is_file($full)) {
                         $zip->addFile($full, $n);
+                        $entrySizes[] = (int)@filesize($full);
                         $processed++;
                         $sendProgress();
                     } elseif (is_dir($full)) {
@@ -6277,10 +7033,11 @@ if (isset($_POST['action']) && $_POST['action'] === 'compress' && isset($_POST['
 
                             if ($fi->isDir()) {
                                 $zip->addEmptyDir($local);
-                            } else {
-                                $zip->addFile($path, $local);
+                                $entrySizes[] = 0;
+                                continue;
                             }
-
+                            $zip->addFile($path, $local);
+                            $entrySizes[] = (int)$fi->getSize();
                             $processed++;
                             $sendProgress();
                         }
@@ -6289,72 +7046,58 @@ if (isset($_POST['action']) && $_POST['action'] === 'compress' && isset($_POST['
 
                 $send(['n' => $processed, 'name' => '']);
                 $send(['phase' => 'compressing', 'msg' => 'Archiving (this may take a while)…']);
+                // close() does the compressing: keep the connection and the status alive meanwhile (PHP 8.0+).
+                if (method_exists($zip, 'registerProgressCallback')) {
+                    $bytesBefore = [];
+                    $sum = 0;
+                    foreach ($entrySizes as $size) {
+                        $bytesBefore[] = $sum;
+                        $sum += $size;
+                    }
+                    $entryCount = count($entrySizes);
+                    $zip->registerProgressCallback(0.01, function ($rate) use ($sendPct, $entrySizes, $bytesBefore, $sum, $entryCount) {
+                        $pos = max(0.0, min(1.0, (float)$rate)) * $entryCount;
+                        $i = (int)floor($pos);
+                        if ($sum <= 0 || $i >= $entryCount) {
+                            $sendPct((int)floor((float)$rate * 100), 'Compressing…');
+                            return;
+                        }
+                        $bytes = $bytesBefore[$i] + ($pos - $i) * $entrySizes[$i];
+                        $sendPct((int)floor($bytes * 100 / $sum), 'Compressing…');
+                    });
+                }
                 $zip->close();
                 $send(['n' => $processed, 'name' => '']);
             } else {
-                // We need to ensure that if a tar file with the same name already exists, we do not accidentally overwrite important data.
-                // For gzip, we create an intermediate .tar file, but if .tar already exists, try to find a unique name by appending suffixes.
-                if ($type === 'gzip') {
-                    $baseTar = $dir . '/' . preg_replace('/\.tar\.gz$/i', '', $baseName) . '.tar';
-                    $tarPath = $baseTar;
-                    $i = 1;
-                    while (file_exists($tarPath) && $i < 1000) { // Avoid infinite loops
-                        $tarPath = $dir . '/' . preg_replace('/\.tar\.gz$/i', '', $baseName) . "_{$i}.tar";
-                        $i++;
-                    }
-                    if (file_exists($tarPath)) {
-                        throw new RuntimeException('Could not create .tar file for gzip: a unique tar archive could not be found.');
-                    }
-                } else {
-                    $tarPath = $destPath;
+                // One pass: tar entries are written (and gzipped) straight into the archive file.
+                if ($type === 'gzip' && !function_exists('deflate_init')) {
+                    throw new RuntimeException('the zlib extension is needed for .tar.gz');
                 }
-
-                if (file_exists($tarPath)) @unlink($tarPath);
-
-                $phar = new PharData($tarPath);
-                $send(['phase' => 'adding', 'msg' => 'Adding files and folders structure…']);
-
-                foreach ($names as $n) {
-                    $full = $dir . '/' . $n;
-                    if (is_file($full)) {
-                        $phar->addFile($full, $n);
+                $send(['phase' => 'adding', 'msg' => $type === 'gzip' ? 'Writing and compressing files…' : 'Writing files…']);
+                $fh = @fopen($destPath, 'wb');
+                if ($fh === false) {
+                    throw new RuntimeException('cannot create ' . basename($destPath));
+                }
+                $phpArchiveStarted = true;
+                try {
+                    $out = new FmStreamOut($type === 'gzip', $fh);
+                    fmStreamTar($dir, $names, $out, static function () use (&$processed, $sendProgress) {
                         $processed++;
                         $sendProgress();
-                    } elseif (is_dir($full)) {
-                        if (is_dir($full)) {
-                            $phar->buildFromDirectory($full);
-                            $rii = new RecursiveIteratorIterator(
-                                new RecursiveDirectoryIterator($full, RecursiveDirectoryIterator::SKIP_DOTS)
-                            );
-                            foreach ($rii as $fi) {
-                                $path = $fi->getPathname();
-                                $local = $n . '/' . substr($path, strlen($full) + 1);
-                                $local = str_replace('\\', '/', $local);
-                                $processed++;
-                                $sendProgress();
-                            }
-                        }
-                    }
+                    });
+                    $out->finish();
+                } finally {
+                    fclose($fh);
                 }
                 $send(['n' => $processed]);
-
-                if ($type === 'gzip') {
-                    $send(['phase' => 'compressing', 'msg' => 'Writing GZIP (this may take a while)…']);
-                    $phar->compress(Phar::GZ);
-                    @unlink($tarPath);
-                }
-                if ($type === 'tar') {
-                    sleep(1);
-                    // PharData writes TAR entries during the loop; finalization can still take time.
-                    $send(['phase' => 'compressing', 'msg' => 'Finalizing TAR archive (this may take a while)…']);
-                    sleep(3);
-                }
-
             }
 
-            $send(['done' => true]);
+            $sendDone($processed);
         } catch (Throwable $e) {
-            $sendError('Could not create archive: ' . $e->getMessage());
+            if (!empty($phpArchiveStarted)) {
+                @unlink($destPath);
+            }
+            $sendError('Could not create archive: ' . $e->getMessage() . (isset($shellError) && $shellError !== '' ? ' (system archiver: ' . $shellError . ')' : ''));
         }
         exit;
     }
@@ -7278,6 +8021,140 @@ if (isset($_POST['action']) && $_POST['action'] === 'chmod' && isset($_POST['in'
     ]);
 }
 
+if (isset($_POST['action']) && in_array($_POST['action'], ['encoding-info', 'encoding-preview', 'encoding-convert'], true)) {
+    $dir = fmRequestFolder($ROOT_DIR);
+    if ($dir === null) {
+        jsonOut(['status' => 'error', 'msg' => 'Invalid folder']);
+    }
+    $from = (string)($_POST['from'] ?? 'auto');
+    $from = $from === 'auto' ? 'auto' : fmEncodingName($from);
+    $to = fmEncodingName((string)($_POST['to'] ?? 'UTF-8'));
+    if ($_POST['action'] !== 'encoding-info' && ($from === null || $to === null)) {
+        jsonOut(['status' => 'error', 'msg' => 'This server cannot convert this encoding.']);
+    }
+    $eol = in_array($_POST['eol'] ?? 'keep', ['keep', 'lf', 'crlf'], true) ? (string)($_POST['eol'] ?? 'keep') : 'keep';
+    $mode = ($_POST['mode'] ?? 'replace') === 'copy' ? 'copy' : 'replace';
+    $bom = (string)($_POST['bom'] ?? '0') === '1';
+    if ($_POST['action'] === 'encoding-preview') {
+        $name = fmRequestItemName($_POST['name'] ?? '');
+        if ($name === null) {
+            jsonOut(['status' => 'error', 'msg' => 'Invalid name']);
+        }
+        jsonOut(['status' => 'success'] + fmEncodingPreview($dir . '/' . $name, $ROOT_DIR, $from, $to, $eol, $bom));
+    }
+    $names = isset($_POST['names']) && is_array($_POST['names']) ? $_POST['names'] : [];
+    if (count($names) > FM_ENCODING_MAX_FILES) {
+        jsonOut(['status' => 'error', 'msg' => 'Too many files at once (at most ' . FM_ENCODING_MAX_FILES . ').']);
+    }
+    $files = [];
+    foreach ($names as $raw) {
+        $name = fmRequestItemName($raw);
+        if ($name === null) {
+            $files[] = ['name' => basename(str_replace('\\', '/', (string)$raw)), 'skip' => 'invalid', 'status' => 'skipped', 'reason' => 'invalid'];
+            continue;
+        }
+        $full = $dir . '/' . $name;
+        $files[] = ['name' => $name] + ($_POST['action'] === 'encoding-info'
+            ? fmEncodingFileInfo($full, $ROOT_DIR)
+            : fmEncodingConvertFile($full, $ROOT_DIR, $from, $to, $bom, $eol, $mode));
+    }
+    jsonOut(['status' => 'success', 'files' => $files] + ($_POST['action'] === 'encoding-info' ? ['encodings' => fmEncodingList()] : []));
+}
+
+if (isset($_POST['action']) && $_POST['action'] === 'encoding-scan') {
+    $dir = fmRequestFolder($ROOT_DIR);
+    if ($dir === null) {
+        jsonOut(['status' => 'error', 'msg' => 'This folder does not exist or is outside the file manager root.']);
+    }
+    if (fmIsUnderTrashTree($dir, $ROOT_DIR)) {
+        jsonOut(['status' => 'error', 'msg' => 'Converting encodings is not available in Trash.']);
+    }
+    // Folders to scan: names[] below "in" (links are not followed, as in Find), or "in" itself.
+    $folders = [];
+    foreach (isset($_POST['names']) && is_array($_POST['names']) ? $_POST['names'] : [] as $raw) {
+        $name = fmRequestItemName($raw);
+        if ($name === null) {
+            jsonOut(['status' => 'error', 'msg' => 'Invalid name']);
+        }
+        $full = $dir . '/' . $name;
+        if (is_dir($full) && !fmIsLinkPath($full) && pathInsideRoot($full, $ROOT_DIR)) {
+            $folders[$name] = $full;
+        }
+    }
+    if (!isset($_POST['names'])) {
+        $folders[''] = $dir;
+    }
+    $crit = fmEncodingScanCriteria((string)($_POST['mask'] ?? ''), (string)($_POST['not_utf8'] ?? '1') === '1');
+    if (isset($crit['error'])) {
+        jsonOut(['status' => 'error', 'msg' => $crit['error']]);
+    }
+    $recursive = (string)($_POST['recursive'] ?? '1') !== '0';
+
+    $send = fmNdjsonBegin();
+    $exclude = array_merge($EXCLUDE_NAMES, [$thisFileName]);
+    $started = microtime(true);
+    $batch = [];
+    $count = 0;
+    $scanned = 0;
+    $reason = null;
+    $flushBatch = static function () use (&$batch, $send): void {
+        if ($batch) {
+            $send(['items' => $batch]);
+            $batch = [];
+        }
+    };
+    $tick = static function () use (&$scanned, &$reason, $started, $send, $flushBatch, $crit): bool {
+        $flushBatch();
+        $send(['scanned' => $scanned]);
+        if (connection_aborted()) {
+            $reason = 'aborted';
+            return false;
+        }
+        if (microtime(true) - $started > FM_SEARCH_MAX_SECONDS) {
+            $reason = 'time';
+            return false;
+        }
+        if ($crit['content_state']->left <= 0) {
+            $reason = 'content_limit';
+            return false;
+        }
+        return true;
+    };
+    $send(['start' => true, 'engine' => 'php']);
+    foreach ($folders as $prefix => $folder) {
+        $emit = static function (array $row) use (&$batch, &$count, &$reason, $flushBatch, $prefix): bool {
+            $row['path'] = $prefix === '' ? $row['path'] : $prefix . '/' . $row['path'];
+            $batch[] = $row;
+            $count++;
+            if (count($batch) >= 200) {
+                $flushBatch();
+            }
+            if ($count >= FM_SEARCH_MAX_RESULTS) {
+                $reason = 'limit';
+                return false;
+            }
+            return true;
+        };
+        fmSearchWalkPhp($folder, fmIsRootFolder($folder, $ROOT_DIR), $ROOT_DIR, $crit, $exclude, $emit, $tick, $scanned, $recursive);
+        if ($reason !== null) {
+            break;
+        }
+    }
+    if ($reason === null && $crit['content_state']->left <= 0) {
+        $reason = 'content_limit';
+    }
+    $flushBatch();
+    $send([
+        'done'      => true,
+        'count'     => $count,
+        'scanned'   => $scanned,
+        'truncated' => in_array($reason, ['limit', 'time', 'content_limit'], true),
+        'reason'    => $reason,
+        'seconds'   => round(microtime(true) - $started, 2),
+    ]);
+    exit;
+}
+
 if (isset($_POST['action']) && $_POST['action'] === 'search') {
     $dirIn = (string)($_POST['in'] ?? '');
     $baseDir = safeRealpath($dirIn !== '' ? $ROOT_DIR . '/' . trim($dirIn, '/') : $ROOT_DIR);
@@ -7297,21 +8174,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'search') {
         jsonOut(['status' => 'error', 'msg' => 'File ops mode is OS-only but exec() / proc_open() is disabled. Set $FM_FILE_OPS_MODE to "auto" or "php".']);
     }
 
-    ignore_user_abort(true);
-    while (ob_get_level()) {
-        @ob_end_flush();
-    }
-    header('Content-Type: application/x-ndjson');
-    header('Cache-Control: no-cache');
-    header('X-Accel-Buffering: no');
-    fm_ob_implicit_flush_enable();
-    $send = static function (array $payload): void {
-        echo json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE) . "\n";
-        if (ob_get_level()) {
-            ob_flush();
-        }
-        flush();
-    };
+    $send = fmNdjsonBegin();
 
     $exclude = array_merge($EXCLUDE_NAMES, [$thisFileName]);
     $atRoot = fmIsRootFolder($baseDir, $ROOT_DIR);
@@ -8270,6 +9133,16 @@ html:has(.fm-table-wrapper) body {
  * shrink to a few characters. Hide the less important columns one by one to keep Name at about 220 px.
  * Trash has a wider Actions column (+32 px).
  */
+/* With the optional Encoding column (108 px, turned on by the user) Name may go down to about 190 px; then Perms
+   goes first, then Encoding. */
+@container fm-list (max-width: 930px) {
+    .fm-table--with-encoding th.fm-table-col-permissions,
+    .fm-table--with-encoding td.fm-table-col-permissions { display: none; }
+}
+@container fm-list (max-width: 850px) {
+    .fm-table th.fm-table-col-encoding,
+    .fm-table td.fm-table-col-encoding { display: none; }
+}
 @container fm-list (max-width: 852px) {
     .fm-table th.fm-table-col-permissions,
     .fm-table td.fm-table-col-permissions { display: none; }
@@ -8963,6 +9836,11 @@ html:has(.fm-table-wrapper) body {
     animation: none;
     width: 0%;
     transition: width 0.2s linear;
+}
+
+.fm-progress-wrap--determinate .fm-progress-bar {
+    animation: none;
+    transition: width 0.3s linear;
 }
 
 .fm-copy-move-progress-wrap.fm-progress-indeterminate .fm-progress-bar {
@@ -9851,9 +10729,11 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     margin-top: 0.35rem;
 }
 
+/* Separate borders: with collapsed ones the sticky header's bottom line scrolls away and rows show through it. */
 .fm-bulk-rename-popup .fm-br-preview {
     width: 100%;
-    border-collapse: collapse;
+    border-collapse: separate;
+    border-spacing: 0;
     font-size: 0.8125rem;
     line-height: 1.35;
 }
@@ -9869,6 +10749,8 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
 .fm-bulk-rename-popup .fm-br-preview th {
     position: sticky;
     top: 0;
+    border-bottom: 0;
+    box-shadow: inset 0 -1px 0 #dee2e6;
     background: #f8f9fa;
     font-weight: 600;
     font-size: 0.75rem;
@@ -10186,10 +11068,59 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     width: 100%;
     min-width: 0;
 }
+/* Pinned to the bottom of the scrolling content (its bottom padding is 22px), right above the buttons. */
+.fm-popup-content .fm-cfg-pass-bar {
+    position: sticky;
+    bottom: -22px;
+    z-index: 1;
+    margin: 16px -18px -22px;
+    padding: 10px 18px 12px;
+    background: #fff;
+    border-top: 1px solid #e3e3e3;
+    box-shadow: 0 -4px 8px rgba(0, 0, 0, .06);
+}
+.fm-popup-content .fm-cfg-pass-bar[hidden] {
+    display: none;
+}
+.fm-popup-content .fm-cfg-pass-bar .fm-cfg-fileops-pass {
+    margin-top: 0;
+}
+.fm-popup-content .fm-cfg-pass-bar .fm-error {
+    margin: 6px 0 0;
+}
+.fm-input.fm-input--invalid,
+.fm-input.fm-input--invalid:focus {
+    border-color: #d9534f;
+    box-shadow: 0 0 0 3px rgba(217, 83, 79, .3);
+    outline: 0;
+}
 
 .fm-info-loading {
     padding: 1.5rem 0;
     color: var(--muted-text, #6c757d);
+}
+
+/* Shown only when the info takes longer than 600 ms: about the height of the finished table. */
+.fm-info-loading--file,
+.fm-info-loading--folder,
+.fm-info-loading--server {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    box-sizing: border-box;
+}
+
+.fm-info-loading--file {
+    min-height: 297px;
+}
+
+.fm-info-loading--folder {
+    min-height: 329px;
+}
+
+.fm-info-loading--server {
+    min-height: 760px;
 }
 
 .fm-error-text {
@@ -10220,10 +11151,12 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
 }
 
 /* File Manager Table */
+/* One line: buttons that do not fit go into the "More" menu (FmFileManagerTable#_fitToolbar). */
 .fm-table-toolbar {
     display: flex;
     align-items: center;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
+    overflow: hidden;
     flex-shrink: 0;
     padding: 6px 11px;
     border-bottom: 1px solid #fff;
@@ -10247,6 +11180,20 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
 
 .fm-table-action-btn:first-child {
     margin-left: 0;
+}
+
+.fm-table-action-btn,
+.fm-table-action-separator {
+    flex-shrink: 0;
+}
+
+.fm-table-toolbar .fm-toolbar-hidden {
+    display: none;
+}
+
+.fm-context-menu-item--disabled {
+    opacity: .45;
+    cursor: default;
 }
 
 .fm-table-action-btn:hover:not(.disabled) {
@@ -10812,6 +11759,31 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
 .fm-table td.fm-table-col-mtime {
     width: 148px;
     text-align: right;
+}
+
+.fm-table th.fm-table-col-encoding,
+.fm-table td.fm-table-col-encoding {
+    width: 108px;
+    overflow: hidden;
+    text-align: right;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.fm-table .fm-enc-cell {
+    font-size: 12px;
+}
+
+.fm-table .fm-enc-cell--none {
+    color: #999;
+}
+
+.fm-table .fm-enc-cell--guess {
+    font-style: italic;
+}
+
+.fm-table tbody tr.fm-table-row-selected .fm-enc-cell--none {
+    color: rgba(255, 255, 255, .7);
 }
 
 .fm-table th.fm-table-col-permissions,
@@ -11453,6 +12425,320 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     font-size: 12px;
 }
 
+.fm-convert-encoding-popup select {
+    padding: 6px;
+    border: 1px solid #dee2e6;
+    border-radius: 5px;
+    background: #fff;
+    font-size: 13px;
+}
+
+.fm-convert-encoding-popup .fm-enc-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+    font-size: 13px;
+}
+
+.fm-convert-encoding-popup .fm-enc-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    cursor: pointer;
+}
+
+.fm-convert-encoding-popup .fm-enc-scan-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: 8px 16px;
+}
+
+.fm-convert-encoding-popup .fm-enc-mask-label {
+    flex: 1 1 260px;
+}
+
+.fm-convert-encoding-popup .fm-enc-scan-btn {
+    margin-left: auto;
+}
+
+/* Every part of this dialog keeps its height while results come and go, so the centred dialog never jumps. */
+.fm-convert-encoding-popup .fm-enc-status-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    height: 26px;
+    margin: 6px 0 4px;
+}
+
+.fm-convert-encoding-popup .fm-enc-status {
+    flex: 1;
+    min-width: 0;
+    margin: 0;
+    overflow: hidden;
+    font-size: 12px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.fm-convert-encoding-popup .fm-enc-status--error {
+    color: #b02a37;
+}
+
+.fm-convert-encoding-popup .fm-enc-status--warn {
+    color: #8a5a00;
+}
+
+.fm-convert-encoding-popup .fm-enc-summary {
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 6px;
+    height: 26px;
+    margin-bottom: 6px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: thin;
+}
+
+.fm-convert-encoding-popup .fm-enc-chip {
+    flex-shrink: 0;
+    padding: 2px 9px;
+    white-space: nowrap;
+    border: 1px solid rgba(0, 0, 0, .15);
+    border-radius: 10px;
+    background: #fff;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.fm-convert-encoding-popup .fm-enc-chip--on {
+    border-color: var(--main-color);
+    background: var(--main-color);
+    color: #fff;
+}
+
+.fm-convert-encoding-popup .fm-enc-chip-skip {
+    flex-shrink: 0;
+    white-space: nowrap;
+    font-size: 12px;
+    color: #777;
+}
+
+/* Popups are at most 90vh high: the file list and the preview share the height left above ~740px. */
+.fm-convert-encoding-popup .fm-enc-list-wrap {
+    height: clamp(166px, calc(176px + (90vh - 740px) * .7), 520px);
+    overflow: auto;
+    border: 1px solid rgba(0, 0, 0, .1);
+    border-radius: 4px;
+}
+
+/* Separate borders: with collapsed ones the sticky header's bottom line scrolls away and rows show through it. */
+.fm-convert-encoding-popup .fm-enc-list {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    font-size: 12px;
+}
+
+.fm-convert-encoding-popup .fm-enc-list th,
+.fm-convert-encoding-popup .fm-enc-list td {
+    padding: 3px 6px;
+    border-bottom: 1px solid rgba(0, 0, 0, .06);
+    text-align: left;
+    white-space: nowrap;
+}
+
+.fm-convert-encoding-popup .fm-enc-list th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    border-bottom: 0;
+    box-shadow: inset 0 -1px 0 #dee2e6;
+    background: #f8f9fa;
+    font-weight: 600;
+}
+
+.fm-convert-encoding-popup .fm-enc-list tbody tr[data-i] {
+    cursor: pointer;
+}
+
+.fm-convert-encoding-popup .fm-enc-list tbody tr[data-i]:hover td {
+    background: rgba(0, 0, 0, .03);
+}
+
+.fm-convert-encoding-popup .fm-enc-list tr.fm-enc-row--current td {
+    background: rgba(0, 0, 0, .07);
+}
+
+.fm-convert-encoding-popup .fm-enc-row--skip td {
+    color: #999;
+}
+
+.fm-convert-encoding-popup .fm-enc-col-check {
+    width: 1%;
+}
+
+.fm-convert-encoding-popup .fm-enc-col-size {
+    text-align: right !important;
+}
+
+.fm-convert-encoding-popup .fm-enc-name span {
+    display: block;
+    max-width: 330px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.fm-convert-encoding-popup .fm-enc-more td {
+    color: #777;
+    font-style: italic;
+    cursor: default;
+}
+
+.fm-convert-encoding-popup .fm-enc-empty td {
+    height: calc(clamp(166px, calc(176px + (90vh - 740px) * .7), 520px) - 36px);
+    border-bottom: 0;
+    text-align: center;
+}
+
+.fm-convert-encoding-popup .fm-enc-result--ok {
+    color: #1e7e34;
+}
+
+.fm-convert-encoding-popup .fm-enc-result--fail {
+    color: #b02a37;
+}
+
+.fm-convert-encoding-popup .fm-enc-result--skip {
+    color: #777;
+}
+
+.fm-convert-encoding-popup .fm-enc-direction {
+    height: 20px;
+    margin: 10px 0 4px;
+    overflow: hidden;
+    font-size: 13px;
+    line-height: 20px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.fm-convert-encoding-popup .fm-enc-preview {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+}
+
+/* "Convert 13 files from Windows-1251 to UTF-16LE" must not wrap: the button row keeps its height. */
+.fm-convert-encoding-popup .fm-popup-primary-btn .fm-popup-btn-label {
+    display: block;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.fm-convert-encoding-popup .fm-enc-preview > div {
+    min-width: 0;
+}
+
+.fm-convert-encoding-popup .fm-enc-preview-title {
+    margin-bottom: 3px;
+    overflow: hidden;
+    font-size: 12px;
+    font-weight: 600;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.fm-convert-encoding-popup .fm-enc-preview pre {
+    height: clamp(90px, calc(96px + (90vh - 740px) * .3), 260px);
+    margin: 0;
+    padding: 6px;
+    overflow: auto;
+    border: 1px solid rgba(0, 0, 0, .1);
+    border-radius: 4px;
+    background: #f8f9fa;
+    font-size: 12px;
+    white-space: pre;
+}
+
+.fm-convert-encoding-popup .fm-enc-preview-note {
+    display: -webkit-box;
+    height: 2.7em;
+    margin: 4px 0 0;
+    overflow: hidden;
+    font-size: 12px;
+    line-height: 1.35;
+    color: #555;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+}
+
+.fm-convert-encoding-popup .fm-enc-preview-note--warn {
+    color: #8a5a00;
+}
+
+.fm-convert-encoding-popup .fm-enc-preview-note--err {
+    color: #b02a37;
+}
+
+.fm-convert-encoding-popup .fm-enc-settings {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 8px 12px;
+    margin-top: 10px;
+}
+
+.fm-convert-encoding-popup .fm-enc-bom-label {
+    grid-column: 1 / -1;
+}
+
+.fm-convert-encoding-popup .fm-enc-progress {
+    display: flex;
+    flex: 0 0 40%;
+    align-items: center;
+    gap: 8px;
+}
+
+.fm-convert-encoding-popup .fm-enc-progress .fm-search-bar-btn {
+    padding-top: 1px;
+    padding-bottom: 1px;
+}
+
+.fm-convert-encoding-popup .fm-enc-progress[hidden] {
+    display: none;
+}
+
+.fm-convert-encoding-popup .fm-enc-progress-bar {
+    flex: 1;
+    height: 6px;
+    overflow: hidden;
+    border-radius: 3px;
+    background: rgba(0, 0, 0, .08);
+}
+
+.fm-convert-encoding-popup .fm-enc-progress-bar span {
+    display: block;
+    width: 0;
+    height: 100%;
+    background: var(--main-color);
+    transition: width 200ms;
+}
+
+@media (max-width: 720px) {
+    .fm-convert-encoding-popup .fm-enc-settings {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .fm-convert-encoding-popup .fm-enc-preview {
+        grid-template-columns: 1fr;
+    }
+}
+
 .fm-table-empty-actions {
     display: flex;
     justify-content: center;
@@ -11789,6 +13075,8 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
         const fm_php_upload_max_filesize = <?php echo json_encode((string)ini_get('upload_max_filesize')); ?>;
         const fm_php_post_max_size = <?php echo json_encode((string)ini_get('post_max_size')); ?>;
         const fm_csrf_token = <?php echo json_encode($csrfToken); ?>;
+        /** Encodings this server can convert (Convert encoding, Find → Encoding). */
+        const fm_encodings = <?php echo json_encode(fmEncodingList()); ?>;
         /**
          * fetch() options for a POST to this script; the server rejects POSTs without the CSRF header.
          * @param {FormData} body
@@ -12849,6 +14137,32 @@ class FmPopup {
     }
 
     /**
+     * Show when `ready` settles, or after `delayMs` if it takes longer: a normal answer opens the popup already
+     * filled instead of growing from a loading line (centred popups jump when their height changes).
+     * @param {Promise<*>} ready
+     * @param {number} [delayMs=600] - Covers a normal request (about 350 ms on XAMPP for Windows)
+     * @returns {void}
+     */
+    showWhenReady(ready, delayMs = 600) {
+        let shown = false;
+        const open = () => {
+            if (shown) return;
+            shown = true;
+            FmPopup.prototype.show.call(this);
+        };
+        const timer = setTimeout(() => {
+            open();
+            // Opened with the loading area: never shrink below it when the real content arrives.
+            const content = this.el && this.el.querySelector('.fm-popup-content');
+            if (content) content.style.minHeight = content.offsetHeight + 'px';
+        }, delayMs);
+        Promise.resolve(ready).catch(() => {}).then(() => {
+            clearTimeout(timer);
+            open();
+        });
+    }
+
+    /**
      * Hide the popup (with fade-out delay)
      * @returns {void}
      */
@@ -13413,11 +14727,18 @@ class FmDownloadTracker {
         if (this._finished) return;
         const st = d.state;
         const waited = Date.now() - this._startedAt;
+        // No status file on this server (no writable temp folder): the browser shows the download itself.
+        if (st === 'untracked') {
+            this._stop();
+            return;
+        }
         if (!st || st === 'pending' || st === 'unknown') {
             if (this._emptyErrorPage && waited > 3000) {
                 this._fail('The server returned an error without details. Check the PHP / web server error log.');
-            } else if (st !== 'unknown' && waited > 15000) {
-                this._fail('The server did not start the download of "' + this._label + '". The request may have been blocked or timed out before it reached the file manager.');
+            } else if (waited > 15000) {
+                // Errors of the server arrive as a page in the iframe (handled above). Without one the download most
+                // likely runs but its status cannot be read (e.g. separate temp folders): stop following it quietly.
+                this._stop();
             } else {
                 this._schedule(1000);
             }
@@ -13474,6 +14795,12 @@ class FmDownloadTracker {
         const iframe = this._iframe;
         window.setTimeout(() => iframe.remove(), 60000);
     }
+
+    /** Stop following without a message; the iframe stays, the download in it may still be running. */
+    _stop() {
+        this._finished = true;
+        window.clearTimeout(this._timer);
+    }
 }
 
 /**
@@ -13504,9 +14831,10 @@ class FmSearchPopup extends FmPopup {
         const { whereLabel, initial, onSubmit, ...rest } = options;
         const f = Object.assign({
             name: '', match: 'contains', icase: true, type: 'any',
-            content: '', contentMatch: 'contains', contentIcase: true,
+            content: '', contentMatch: 'contains', contentIcase: true, encoding: '',
             sizeMin: '', sizeMinUnit: 'MB', sizeMax: '', sizeMaxUnit: 'MB', dateFrom: '', dateTo: '',
         }, initial || {});
+        const encs = typeof fm_encodings !== 'undefined' && Array.isArray(fm_encodings) ? fm_encodings : [];
         const esc = FmPopup.escapeHtml;
         const attr = FmPopup.escapeAttr;
         const opt = (v, label, cur) => `<option value="${v}"${v === cur ? ' selected' : ''}>${label}</option>`;
@@ -13539,7 +14867,11 @@ class FmSearchPopup extends FmPopup {
                 '<div class="fm-find-grid">' +
                 '<label class="fm-find-field"><span>Type</span><select class="fm-find-type">' +
                 opt('any', 'Files and folders', f.type) + opt('file', 'Files only', f.type) + opt('folder', 'Folders only', f.type) +
-                '</select></label><span></span>' +
+                '</select></label>' +
+                '<label class="fm-find-field"><span>Encoding</span><select class="fm-find-encoding">' +
+                opt('', 'Any', f.encoding) + opt('not_utf8', 'Not UTF-8 (legacy encodings)', f.encoding) +
+                encs.map((e) => opt(attr(e), esc(e), f.encoding)).join('') +
+                '</select></label>' +
                 '<label class="fm-find-field"><span>Size from</span><span class="fm-find-size">' +
                 '<input type="number" min="0" step="any" class="fm-find-size-min" value="' + attr(f.sizeMin) + '">' +
                 '<select class="fm-find-size-min-unit" aria-label="Unit">' + units(f.sizeMinUnit) + '</select></span></label>' +
@@ -13549,7 +14881,7 @@ class FmSearchPopup extends FmPopup {
                 '<label class="fm-find-field"><span>Modified from</span><input type="date" class="fm-find-date-from" value="' + attr(f.dateFrom) + '"></label>' +
                 '<label class="fm-find-field"><span>Modified until</span><input type="date" class="fm-find-date-to" value="' + attr(f.dateTo) + '"></label>' +
                 '</div>' +
-                '<p class="fm-hint fm-find-note">A size limit or text inside files leaves folders out. Text is searched in text files up to 10 MB; binary files are skipped. The search stops after 5,000 results.</p>' +
+                '<p class="fm-hint fm-find-note">A size limit, text inside files or an encoding leaves folders out. Text and encodings are read from text files (up to 10 MB for text, 20 MB for encodings), in their own encoding (Windows-1251, UTF-16… are detected); binary files are skipped. The search stops after 5,000 results.</p>' +
                 '<p class="fm-error" data-err style="display:none"></p>',
             buttons: [
                 { label: 'Cancel', close: true },
@@ -13578,6 +14910,7 @@ class FmSearchPopup extends FmPopup {
             content:     q('[name="fm-find-content"]').value,
             contentMatch: q('.fm-find-content-match').value,
             contentIcase: q('.fm-find-content-icase').checked,
+            encoding:    q('.fm-find-encoding').value,
             type:        q('.fm-find-type').value,
             sizeMin:     q('.fm-find-size-min').value.trim(),
             sizeMinUnit: q('.fm-find-size-min-unit').value,
@@ -13632,7 +14965,7 @@ class FmSearchPopup extends FmPopup {
         }
         const post = {
             name: f.name, match: f.match, icase: f.icase ? '1' : '0', type: f.type,
-            content: f.content, content_match: f.contentMatch, content_icase: f.contentIcase ? '1' : '0',
+            content: f.content, content_match: f.contentMatch, content_icase: f.contentIcase ? '1' : '0', encoding: f.encoding,
             size_min: sizeMin, size_max: sizeMax, mtime_from: from, mtime_to: until,
         };
         this.hideAndDestroy();
@@ -14583,82 +15916,8 @@ class FmCompressPopup extends FmPopup {
             }));
 
             this.hideAndDestroy();
-            const archiveBusyMsg = '<p class="mt-0">The server is building your archive. Large folders may take a while.</p>';
-            const busyPopup = new FmIndeterminateProgressPopup({ title: 'Archive', messageHtml: archiveBusyMsg });
+            const busyPopup = FmCompressPopup._busyPopup();
             busyPopup.show();
-
-            const runJob = (jobArchiveName, jobNames) => new Promise((resolve) => {
-                let finished = false;
-
-                const streamCompress = (totalForUi) => {
-                    const form = new FormData();
-                    form.append('action',       'compress');
-                    form.append('in',           this._pathIn());
-                    form.append('archive_name', jobArchiveName);
-                    form.append('archive_type', type);
-                    form.append('total',        String(totalForUi || 0));
-                    form.append('overwrite',    allowOverwrite ? '1' : '0');
-                    jobNames.forEach(n => form.append('names[]', n));
-
-                    fetch(this._ajaxUrl, fmPostInit(form))
-                        .then(response => {
-                            if (!response.ok)   throw new Error('HTTP ' + response.status);
-                            if (!response.body) throw new Error('No response body');
-                            const reader  = response.body.getReader();
-                            const decoder = new TextDecoder();
-                            let buffer = '';
-
-                            const handleLine = (line) => {
-                                line = (line || '').trim();
-                                if (!line) return;
-                                let data;
-                                try { data = JSON.parse(line); } catch (e) { return; }
-                                if (data.error) {
-                                    if (!finished) {
-                                        finished = true;
-                                        busyPopup.hideAndDestroy();
-                                        fmUserNotice({ title: 'Archive', message: data.error });
-                                        resolve(false);
-                                    }
-                                    return;
-                                }
-                                if (data.done && !finished) { finished = true; resolve(true); }
-                            };
-
-                            const pump = () => reader.read().then(res => {
-                                if (res.done) { if (buffer) handleLine(buffer); return; }
-                                buffer += decoder.decode(res.value, { stream: true });
-                                const lines = buffer.split('\n');
-                                buffer = lines.pop() || '';
-                                lines.forEach(handleLine);
-                                return pump();
-                            });
-                            return pump();
-                        })
-                        .catch(() => {
-                            if (!finished) {
-                                finished = true;
-                                busyPopup.hideAndDestroy();
-                                fmUserNotice({ title: 'Archive', message: 'Could not create archive.' });
-                                resolve(false);
-                            }
-                        });
-                };
-
-                const pathInJob    = this._pathIn();
-                const countFormJob = new FormData();
-                countFormJob.append('action', 'get-files-and-folders-count');
-                countFormJob.append('mode',   'files');
-                countFormJob.append('in',     pathInJob);
-                jobNames.forEach(n => countFormJob.append('names[]', n));
-                fetch(this._ajaxUrl, fmPostInit(countFormJob))
-                    .then(r => r.json())
-                    .then(countData => {
-                        const total = (countData.status === 'success' && typeof countData.total === 'number') ? countData.total : jobNames.length;
-                        streamCompress(total);
-                    })
-                    .catch(() => streamCompress(jobNames.length));
-            });
 
             let idx = 0;
             const onDone = this._onSuccess;
@@ -14670,7 +15929,16 @@ class FmCompressPopup extends FmPopup {
                     return;
                 }
                 const job = jobs[idx++];
-                runJob(job.archiveName, [job.itemName]).then(ok => { if (ok) nextJob(); });
+                FmCompressPopup._setBusyText(busyPopup, 'Archive ' + idx + ' of ' + jobs.length + ': ' + job.archiveName);
+                this._runCompressJob(busyPopup, job.archiveName, [job.itemName], type, allowOverwrite).then((r) => {
+                    if (r.ok) {
+                        nextJob();
+                        return;
+                    }
+                    busyPopup.hideAndDestroy();
+                    fmUserNotice({ title: 'Archive', message: r.error });
+                    if (r.unknown && onDone) onDone([]);
+                });
             };
             nextJob();
             return;
@@ -14690,79 +15958,161 @@ class FmCompressPopup extends FmPopup {
 
         this.hideAndDestroy();
 
-        const archiveBusyMsg = '<p class="mt-0">The server is building your archive. Large folders may take a while.</p>';
-        const busyPopup = new FmIndeterminateProgressPopup({ title: 'Archive', messageHtml: archiveBusyMsg });
+        const busyPopup = FmCompressPopup._busyPopup();
         busyPopup.show();
+        const onSuccessCb = this._onSuccess;
+        this._runCompressJob(busyPopup, archiveNameForRequest, names, type, allowOverwrite).then((r) => {
+            busyPopup.hideAndDestroy();
+            if (r.ok) {
+                if (onSuccessCb) onSuccessCb([withArchiveExt(archiveNameForRequest)]);
+                return;
+            }
+            fmUserNotice({ title: 'Archive', message: r.error });
+            // The archive may still have been finished: show the folder as it is now.
+            if (r.unknown && onSuccessCb) onSuccessCb([withArchiveExt(archiveNameForRequest)]);
+        });
+    }
 
-        const startStream = (total) => {
-            let finished  = false;
-            const onSuccessCb = this._onSuccess;
+    /** Progress popup for archive jobs: a message line and a progress line under it. */
+    static _busyPopup() {
+        return new FmIndeterminateProgressPopup({
+            title: 'Archive',
+            messageHtml: '<p class="mt-0 fm-archive-busy-text">The server is building your archive. Large folders may take a while.</p>' +
+                '<p class="mt-0 fm-archive-busy-progress">&nbsp;</p>',
+        });
+    }
 
-            const form = new FormData();
-            form.append('action',       'compress');
-            form.append('in',           this._pathIn());
-            form.append('archive_name', archiveNameForRequest);
-            form.append('archive_type', type);
-            form.append('total',        String(total));
-            form.append('overwrite',    allowOverwrite ? '1' : '0');
-            names.forEach(n => form.append('names[]', n));
+    static _setBusyText(popup, text, progress) {
+        const el = popup && popup.el;
+        if (!el) return;
+        const t = el.querySelector('.fm-archive-busy-text');
+        const p = el.querySelector('.fm-archive-busy-progress');
+        if (t && text != null) t.textContent = text;
+        if (p && progress != null) p.textContent = progress || '\u00a0';
+    }
 
-            fetch(this._ajaxUrl, fmPostInit(form))
-                .then(response => {
-                    if (!response.ok)   throw new Error('HTTP ' + response.status);
-                    if (!response.body) throw new Error('No response body');
-                    const reader  = response.body.getReader();
-                    const decoder = new TextDecoder();
-                    let buffer = '';
+    /** Fill the progress line to pct (0–100); null brings back the moving (unknown progress) line. */
+    static _setBusyBar(popup, pct) {
+        const wrap = popup && popup.el && popup.el.querySelector('.fm-progress-wrap');
+        const bar = wrap && wrap.querySelector('.fm-progress-bar');
+        if (!bar) return;
+        const known = typeof pct === 'number' && isFinite(pct);
+        wrap.classList.toggle('fm-progress-wrap--determinate', known);
+        bar.style.width = known ? Math.max(0, Math.min(100, pct)) + '%' : '';
+    }
 
-                    const handleLine = (line) => {
-                        line = (line || '').trim();
-                        if (!line) return;
-                        let data;
-                        try { data = JSON.parse(line); } catch (e) { return; }
-                        if (data.error && !finished) {
-                            finished = true;
-                            busyPopup.hideAndDestroy();
-                            fmUserNotice({ title: 'Archive', message: data.error });
-                        }
-                        if (data.done && !finished) {
-                            finished = true;
-                            busyPopup.hideAndDestroy();
-                            if (onSuccessCb) onSuccessCb([withArchiveExt(archiveNameForRequest)]);
-                        }
-                    };
+    /**
+     * Count the files, then run one compress request and follow its NDJSON progress (n, name, tick, phase, error,
+     * done). Building a big archive takes minutes and hosting proxies may drop the connection meanwhile; the job
+     * keeps running on the server, so the result is then read from download-status (dl_token) instead.
+     * @returns {Promise<{ok: boolean, error?: string, unknown?: boolean}>}
+     */
+    async _runCompressJob(busyPopup, archiveName, names, type, allowOverwrite) {
+        let total = names.length;
+        try {
+            const cf = new FormData();
+            cf.append('action', 'get-files-and-folders-count');
+            cf.append('mode', 'files');
+            cf.append('in', this._pathIn());
+            names.forEach((n) => cf.append('names[]', n));
+            const c = await fetch(this._ajaxUrl, fmPostInit(cf)).then((r) => r.json());
+            if (c && c.status === 'success') total = typeof c.files === 'number' ? c.files : (typeof c.total === 'number' ? c.total : total);
+        } catch (e) { /* the server counts nothing then; progress shows files done only */ }
 
-                    const pump = () => reader.read().then(res => {
-                        if (res.done) { if (buffer) handleLine(buffer); return; }
-                        buffer += decoder.decode(res.value, { stream: true });
-                        const lines = buffer.split('\n');
-                        buffer = lines.pop() || '';
-                        lines.forEach(handleLine);
-                        return pump();
-                    }).catch(() => {
-                        if (!finished) { finished = true; busyPopup.hideAndDestroy(); fmUserNotice({ title: 'Archive', message: 'Could not create archive.' }); }
-                    });
-                    return pump();
-                })
-                .catch(() => {
-                    if (!finished) { finished = true; busyPopup.hideAndDestroy(); fmUserNotice({ title: 'Archive', message: 'Could not create archive.' }); }
-                });
+        const bytes = new Uint8Array(16);
+        window.crypto.getRandomValues(bytes);
+        const token = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+        const form = new FormData();
+        form.append('action', 'compress');
+        form.append('in', this._pathIn());
+        form.append('archive_name', archiveName);
+        form.append('archive_type', type);
+        form.append('total', String(total));
+        form.append('overwrite', allowOverwrite ? '1' : '0');
+        form.append('dl_token', token);
+        names.forEach((n) => form.append('names[]', n));
+
+        const progressText = (n, name) => {
+            const count = total > 0 ? Number(n).toLocaleString() + ' of ' + total.toLocaleString() + ' files' : Number(n).toLocaleString() + ' files';
+            return count + (name ? ' · ' + (name.length > 60 ? '…' + name.slice(-59) : name) : '');
         };
+        // Files done fill the line while files are added; the compressing step (gzip, PHP zip) fills it again by its percent.
+        const showFiles = (n, name) => {
+            FmCompressPopup._setBusyText(busyPopup, null, progressText(n, name));
+            FmCompressPopup._setBusyBar(busyPopup, total > 0 ? Math.min(100, n * 100 / total) : null);
+        };
+        const showPct = (pct, msg) => {
+            FmCompressPopup._setBusyText(busyPopup, msg || 'Compressing…', pct + '% compressed');
+            FmCompressPopup._setBusyBar(busyPopup, pct);
+        };
+        let result = null;
+        try {
+            const response = await fetch(this._ajaxUrl, fmPostInit(form));
+            if (!response.ok) {
+                return { ok: false, error: 'Could not create archive (the server answered HTTP ' + response.status + ').' };
+            }
+            if (!response.body) throw new Error('no body');
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            const handleLine = (line) => {
+                if (result || !line.trim()) return;
+                let d;
+                try { d = JSON.parse(line); } catch (e) { return; }
+                if (d.error) result = { ok: false, error: String(d.error) };
+                else if (d.done) result = { ok: true };
+                else if (typeof d.pct === 'number') showPct(d.pct, d.msg);
+                else if (typeof d.n === 'number' && d.n > 0) showFiles(d.n, d.name || '');
+                else if (d.msg) FmCompressPopup._setBusyText(busyPopup, d.msg);
+            };
+            for (;;) {
+                const { value, done } = await reader.read();
+                if (value) {
+                    buffer += decoder.decode(value, { stream: !done });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop() || '';
+                    lines.forEach(handleLine);
+                }
+                if (done) {
+                    handleLine(buffer);
+                    break;
+                }
+                if (result) break;
+            }
+        } catch (e) { /* dropped connection: ask the server below */ }
+        if (result) return result;
 
-        const pathIn    = this._pathIn();
-        const countForm = new FormData();
-        countForm.append('action', 'get-files-and-folders-count');
-        countForm.append('mode',   'files');
-        countForm.append('in',     pathIn);
-        names.forEach(n => countForm.append('names[]', n));
-
-        fetch(this._ajaxUrl, fmPostInit(countForm))
-            .then(r => r.json())
-            .then(countData => {
-                const total = (countData.status === 'success' && typeof countData.total === 'number') ? countData.total : names.length;
-                startStream(total);
-            })
-            .catch(() => startStream(names.length));
+        // The connection ended before "done" or "error": follow the job on the server.
+        FmCompressPopup._setBusyText(busyPopup, 'The connection was interrupted, but the server is still building the archive. Waiting for it to finish…');
+        const unknown = {
+            ok: false, unknown: true,
+            error: 'The connection to the server was lost while the archive was being built, and its result cannot be checked on this server. It may still be finishing: refresh the folder in a minute to see whether the archive is there.',
+        };
+        const startedWaiting = Date.now();
+        let failures = 0;
+        for (;;) {
+            await new Promise((r) => setTimeout(r, 2000));
+            let d = null;
+            try {
+                d = await requireAuthFetch(this._ajaxUrl + '?' + new URLSearchParams({ action: 'download-status', token })).then((r) => r.json());
+                failures = 0;
+            } catch (e) {
+                if (++failures >= 10) return unknown;
+                continue;
+            }
+            const st = d && d.state;
+            if (st === 'done') return { ok: true };
+            if (st === 'error') return { ok: false, error: String(d.error || 'Could not create archive.') };
+            if (st === 'aborted') return { ok: false, error: 'The archive was not finished: the server stopped the job.' };
+            if (st === 'untracked' || ((st === 'pending' || st === 'unknown') && Date.now() - startedWaiting > 30000)) return unknown;
+            if (st === 'preparing' || st === 'streaming') {
+                if (typeof d.pct === 'number') showPct(d.pct, 'The connection was interrupted, but the server is still compressing the archive…');
+                else if (typeof d.items === 'number' && d.items > 0) showFiles(d.items, '');
+                if (typeof d.now === 'number' && typeof d.heartbeat === 'number' && d.now - d.heartbeat > 120) {
+                    return { ok: false, error: 'Archiving stopped on the server (no progress for 2 minutes; a hosting time limit may have stopped it). The archive may be incomplete.' };
+                }
+            }
+        }
     }
 }
 
@@ -15058,16 +16408,16 @@ class FmGetInfoPopup extends FmPopup {
      * @param {string} options.fullPath - Absolute path of the item
      * @param {string} options.rootDir  - Root directory path (used for the counts request)
      * @param {string} options.ajaxUrl  - Backend endpoint URL
+     * @param {boolean} [options.isFolder] - Folder info has more rows: the loading area is made as tall
      */
     constructor(options = {}) {
-        const { fullPath, rootDir, ajaxUrl, ...rest } = options;
+        const { fullPath, rootDir, ajaxUrl, isFolder = false, ...rest } = options;
 
         super({
             title:    'Info',
-            content:  '<div class="fm-info-loading ta-c"><span class="fm-spinner"></span> Loading\u2026</div>',
+            content:  '<div class="fm-info-loading fm-info-loading--' + (isFolder ? 'folder' : 'file') + ' ta-c"><span class="fm-spinner"></span> Loading\u2026</div>',
             buttons:  [{ label: 'OK', primary: true, close: true }],
             maxWidth: '480px',
-            onAfterShow() { this._fetchAndRender(); },
             ...rest
         });
 
@@ -15076,8 +16426,14 @@ class FmGetInfoPopup extends FmPopup {
         this._ajaxUrl  = ajaxUrl;
     }
 
+    /** @override Opens once the info is loaded (or after 300 ms with a loading area of about the final height). */
+    show() {
+        this.showWhenReady(this._fetchAndRender());
+    }
+
+    /** @returns {Promise<void>} Resolves when the content is rendered. */
     _fetchAndRender() {
-        requireAuthFetch(this._ajaxUrl + '?' + new URLSearchParams({ action: 'get-info', path: this._fullPath }))
+        return requireAuthFetch(this._ajaxUrl + '?' + new URLSearchParams({ action: 'get-info', path: this._fullPath }))
             .then(r => r.json())
             .then(data => {
                 if (data.status !== 'success') {
@@ -15171,6 +16527,9 @@ class FmGetInfoPopup extends FmPopup {
 
         rows.push(['Modified',    FmPopup.escapeHtml(data.modified    || '\u2014'), '']);
         rows.push(['Permissions', FmPopup.escapeHtml(data.permissions || '\u2014'), '']);
+        if (data.encoding) {
+            rows.push(['Encoding', FmPopup.escapeHtml(FmFileManagerTable.encodingText(data.encoding, true)), '']);
+        }
 
         const rowsHtml = rows.map(([label, value, tdAttr]) =>
             `<tr><th>${FmPopup.escapeHtml(label)}</th><td${tdAttr}>${value}</td></tr>`
@@ -15229,17 +16588,22 @@ class FmServerInfoPopup extends FmPopup {
         const { ajaxUrl, ...rest } = options;
         super({
             title:    'Server info',
-            content:  '<div class="fm-info-loading ta-c"><span class="fm-spinner"></span> Loading\u2026</div>',
+            content:  '<div class="fm-info-loading fm-info-loading--server ta-c"><span class="fm-spinner"></span> Loading\u2026</div>',
             buttons:  [{ label: 'OK', primary: true, close: true }],
             maxWidth: '620px',
-            onAfterShow() { this._fetchAndRender(); },
             ...rest
         });
         this._ajaxUrl = ajaxUrl;
     }
 
+    /** @override Opens once the info is loaded (or after 300 ms with a loading area of about the final height). */
+    show() {
+        this.showWhenReady(this._fetchAndRender());
+    }
+
+    /** @returns {Promise<void>} Resolves when the content is rendered. */
     _fetchAndRender() {
-        requireAuthFetch(this._ajaxUrl + '?' + new URLSearchParams({ action: 'get-server-info' }))
+        return requireAuthFetch(this._ajaxUrl + '?' + new URLSearchParams({ action: 'get-server-info' }))
             .then(r => r.json())
             .then(data => {
                 if (data.status !== 'success') {
@@ -15347,6 +16711,7 @@ class FmServerInfoPopup extends FmPopup {
             ['Upload max filesize',   esc(data.upload_max_filesize)],
             ['Post max size',         esc(data.post_max_size)],
             ['File manager root',     esc(data.root_path)],
+            ['Status files',          FmServerInfoPopup._stateDirLine(data)],
             ['Disk (root volume)',    diskLine],
             ['Trash',                 '<span class="fm-info-trash"><span class="fm-spinner"></span> Counting\u2026</span>'],
         ];
@@ -15393,6 +16758,23 @@ class FmServerInfoPopup extends FmPopup {
             return FmPopup.escapeHtml(n + ' minutes (lock after idle; long jobs keep the session alive)');
         }
         return FmPopup.escapeHtml('Off');
+    }
+
+    /**
+     * Where download / archive status files go: PHP's temp folder, another writable folder, or none (then a broken
+     * connection cannot be followed up).
+     * @param {Object} data - get-server-info answer
+     * @returns {string} HTML
+     */
+    static _stateDirLine(data) {
+        const esc = FmPopup.escapeHtml;
+        const dir = data.state_dir ? String(data.state_dir).replace(/\\/g, '/') : '';
+        const tmp = data.temp_dir ? String(data.temp_dir).replace(/\\/g, '/').replace(/\/$/, '') : '';
+        if (!dir) {
+            return '<span class="fm-info-danger">' + esc('None writable (temp folder ' + (tmp || '?') + ' is not usable): ' +
+                'download and archive progress cannot be followed when a connection breaks') + '</span>';
+        }
+        return esc(dir) + (tmp && dir !== tmp ? esc(' (PHP temp folder ' + tmp + ' is not writable)') : '');
     }
 
     static _diskLine(free, total) {
@@ -18627,6 +20009,675 @@ class FmChmodPopup extends FmPopup {
 }
 
 /**
+ * Convert encoding of text files: the selected files, or the text files found in folders (scan with a name mask,
+ * subfolders and "only not UTF-8"). Shows the detected encoding of each file, the chosen file now and after, and
+ * converts the checked files in batches.
+ */
+class FmConvertEncodingPopup extends FmPopup {
+    static STORAGE_KEY = 'fm_convert_encoding_popup_1';
+    static BATCH = 200;
+    static MAX_ROWS = 500;
+    static SKIP_TEXT = {
+        binary: 'binary file', too_big: 'larger than 20 MB', link: 'link, not converted', not_found: 'not found',
+        invalid: 'invalid name', budget: 'not read (read limit reached)',
+    };
+    static EOL_TEXT = { lf: 'LF', crlf: 'CRLF', cr: 'CR', mixed: 'Mixed', none: '—' };
+
+    /**
+     * @param {Object} options
+     * @param {string} options.currentPath
+     * @param {string} options.rootDir
+     * @param {string} options.ajaxUrl
+     * @param {string[]} [options.files] - Paths of files below currentPath
+     * @param {string[]} [options.folders] - Paths of folders below currentPath to scan
+     * @param {boolean} [options.folderMode] - Scan the folders (currentPath itself when folders is empty)
+     * @param {(changed: boolean) => void} [options.onDone] - Called when the dialog closes
+     */
+    constructor(options = {}) {
+        const { currentPath, rootDir, ajaxUrl, files = [], folders = [], folderMode = false, onDone, ...rest } = options;
+        const esc = FmPopup.escapeHtml;
+        const rel = currentPath === rootDir ? '' : currentPath.slice(rootDir.length + 1);
+        let where = folders.length ? folders.map((f) => '/' + [rel, f].filter(Boolean).join('/')).join(', ') : '/' + rel;
+        if (where.length > 120) where = where.slice(0, 117) + '…';
+        const encs = typeof fm_encodings !== 'undefined' && Array.isArray(fm_encodings) && fm_encodings.length ? fm_encodings : ['UTF-8'];
+        const opt = (v, label) => `<option value="${FmPopup.escapeAttr(v)}">${esc(label)}</option>`;
+        const scanHtml = folderMode
+            ? '<div class="fm-enc-scan">' +
+                '<p class="fm-hint mt-0">Text files in <strong>' + esc(where) + '</strong>' +
+                (files.length ? ' and ' + files.length + ' selected file' + (files.length === 1 ? '' : 's') : '') +
+                '. Binary files and links are left out.</p>' +
+                '<div class="fm-enc-scan-row">' +
+                '<label class="fm-enc-field fm-enc-mask-label"><span>File names</span><input type="text" class="fm-input fm-enc-mask" autocomplete="off" placeholder="All files, or e.g. *.txt;*.php;*.html"></label>' +
+                '<label class="fm-enc-check"><input type="checkbox" class="fm-enc-recursive" checked> Include subfolders</label>' +
+                '<label class="fm-enc-check"><input type="checkbox" class="fm-enc-not-utf8" checked> Only files that are not UTF-8</label>' +
+                '<button type="button" class="fm-search-bar-btn fm-enc-scan-btn"></button>' +
+                '</div></div>'
+            : '';
+        const content =
+            '<div class="fm-enc">' + scanHtml +
+            '<div class="fm-enc-status-row"><p class="fm-enc-status" role="status"></p>' +
+            '<div class="fm-enc-progress" hidden><div class="fm-enc-progress-bar"><span></span></div>' +
+            '<button type="button" class="fm-search-bar-btn fm-enc-stop-btn"><i class="bi bi-stop-circle" aria-hidden="true"></i> Stop</button></div></div>' +
+            '<div class="fm-enc-summary"></div>' +
+            '<div class="fm-enc-list-wrap"><table class="fm-enc-list"><thead><tr>' +
+            '<th class="fm-enc-col-check"><input type="checkbox" class="fm-enc-all" checked aria-label="Check all files"></th>' +
+            '<th>File</th><th>Encoding</th><th>Line endings</th><th class="fm-enc-col-size">Size</th><th>Result</th>' +
+            '</tr></thead><tbody class="fm-enc-tbody"></tbody></table></div>' +
+            '<p class="fm-enc-direction"></p>' +
+            '<div class="fm-enc-preview">' +
+            '<div><div class="fm-enc-preview-title fm-enc-now-title">Now — how most programs show it</div><pre class="fm-enc-now"></pre></div>' +
+            '<div><div class="fm-enc-preview-title fm-enc-after-title">After converting</div><pre class="fm-enc-after"></pre></div>' +
+            '</div>' +
+            '<p class="fm-enc-preview-note"></p>' +
+            '<div class="fm-enc-settings">' +
+            '<label class="fm-enc-field"><span>From</span><select class="fm-enc-from" title="Auto: the encoding detected for each file">' + opt('auto', 'Auto-detect') + encs.map((e) => opt(e, e)).join('') + '</select></label>' +
+            '<label class="fm-enc-field"><span>To</span><select class="fm-enc-to">' + encs.map((e) => opt(e, e)).join('') + '</select></label>' +
+            '<label class="fm-enc-field"><span>Line endings</span><select class="fm-enc-eol">' + opt('keep', 'Keep as they are') + opt('lf', 'LF (Linux, macOS)') + opt('crlf', 'CRLF (Windows)') + '</select></label>' +
+            '<label class="fm-enc-field"><span>Save</span><select class="fm-enc-mode">' + opt('replace', 'Replace the file') + opt('copy', 'Save a copy next to it') + '</select></label>' +
+            '<label class="fm-enc-check fm-enc-bom-label"><input type="checkbox" class="fm-enc-bom"> Add BOM (byte order mark; some Windows programs need it)</label>' +
+            '</div>' +
+            '</div>';
+        super({
+            title: 'Convert encoding',
+            className: 'fm-convert-encoding-popup',
+            maxWidth: '900px',
+            content,
+            buttons: [
+                { label: 'Close', close: true },
+                { label: 'Convert', primary: true, close: false, onClick: () => this._convert() },
+            ],
+            onAfterShow: () => this._init(),
+            onAfterHide: () => {
+                this._stopScan();
+                this._stop = true;
+                if (this._onDone) this._onDone(this._changed);
+            },
+            ...rest,
+        });
+        this._rel = rel;
+        this._ajaxUrl = ajaxUrl || '';
+        this._initialFiles = files.slice();
+        this._folders = folders.slice();
+        this._folderMode = !!folderMode;
+        this._onDone = typeof onDone === 'function' ? onDone : null;
+        /** @type {{name: string, size?: number, encoding?: string, how?: string, eol?: string, skip?: string, checked: boolean, initial: boolean, result?: Object}[]} */
+        this._files = [];
+        this._byName = new Map();
+        this._filter = '';
+        this._previewName = null;
+        this._previewSeq = 0;
+        this._changed = false;
+        this._busy = false;
+        this._stop = false;
+        this._scanCtrl = null;
+        this._scan = { running: false, stopped: false, done: null, error: '', scanned: 0 };
+        this._statusText = '';
+        this._errorText = '';
+        this._renderTimer = null;
+    }
+
+    _q(sel) {
+        return this.el ? this.el.querySelector(sel) : null;
+    }
+
+    _init() {
+        this._restoreState();
+        const on = (sel, ev, fn) => { const n = this._q(sel); if (n) n.addEventListener(ev, fn); };
+        on('.fm-enc-from', 'change', () => { this._persist(); this._render(); this._loadPreview(); });
+        on('.fm-enc-to', 'change', () => { this._syncBom(); this._persist(); this._render(); this._loadPreview(); });
+        ['.fm-enc-eol', '.fm-enc-bom'].forEach((sel) => on(sel, 'change', () => { this._persist(); this._loadPreview(); }));
+        ['.fm-enc-mode', '.fm-enc-recursive', '.fm-enc-not-utf8'].forEach((sel) => on(sel, 'change', () => this._persist()));
+        on('.fm-enc-scan-btn', 'click', () => (this._scanCtrl ? this._stopScan() : this._runScan()));
+        on('.fm-enc-mask', 'keydown', (e) => {
+            if (e.key === 'Enter' && !e.ctrlKey && !e.metaKey) {
+                e.preventDefault();
+                e.stopPropagation();
+                this._runScan();
+            }
+        });
+        on('.fm-enc-stop-btn', 'click', () => { this._stop = true; });
+        on('.fm-enc-all', 'change', (e) => {
+            const want = !!e.target.checked;
+            this._visibleFiles().forEach((f) => { if (!f.skip) f.checked = want; });
+            this._render();
+        });
+        on('.fm-enc-summary', 'click', (e) => {
+            const chip = e.target.closest('[data-enc-filter]');
+            if (!chip) return;
+            this._filter = chip.getAttribute('data-enc-filter') || '';
+            this._render();
+        });
+        on('.fm-enc-tbody', 'click', (e) => {
+            const tr = e.target.closest('tr[data-i]');
+            if (!tr) return;
+            const f = this._files[Number(tr.getAttribute('data-i'))];
+            if (!f) return;
+            if (e.target.matches('input[type=checkbox]')) {
+                f.checked = !!e.target.checked;
+                this._render();
+                return;
+            }
+            this._loadPreview(f.name);
+        });
+        this._syncBom();
+        this._syncScanBtn();
+        this._render();
+        const start = this._initialFiles.length ? this._loadInfo(this._initialFiles) : Promise.resolve();
+        start.then(() => {
+            if (this._folderMode) {
+                this._runScan();
+            } else {
+                this._previewFirst();
+            }
+        });
+    }
+
+    _settings() {
+        const v = (sel, d) => { const n = this._q(sel); return n ? n.value : d; };
+        const c = (sel, d) => { const n = this._q(sel); return n ? !!n.checked : d; };
+        return {
+            from: v('.fm-enc-from', 'auto'), to: v('.fm-enc-to', 'UTF-8'), eol: v('.fm-enc-eol', 'keep'),
+            mode: v('.fm-enc-mode', 'replace'), bom: c('.fm-enc-bom', false),
+            mask: v('.fm-enc-mask', ''), recursive: c('.fm-enc-recursive', true), notUtf8: c('.fm-enc-not-utf8', true),
+        };
+    }
+
+    _persist() {
+        try { localStorage.setItem(FmConvertEncodingPopup.STORAGE_KEY, JSON.stringify(this._settings())); } catch (e) { /* ignore */ }
+    }
+
+    _restoreState() {
+        let d = {};
+        try { d = JSON.parse(localStorage.getItem(FmConvertEncodingPopup.STORAGE_KEY) || '{}') || {}; } catch (e) { d = {}; }
+        const setSel = (sel, val) => {
+            const n = this._q(sel);
+            if (n && typeof val === 'string' && [...n.options].some((o) => o.value === val)) n.value = val;
+        };
+        const setChk = (sel, val) => { const n = this._q(sel); if (n && typeof val === 'boolean') n.checked = val; };
+        setSel('.fm-enc-from', d.from);
+        setSel('.fm-enc-to', d.to);
+        setSel('.fm-enc-eol', d.eol);
+        setSel('.fm-enc-mode', d.mode);
+        setChk('.fm-enc-bom', d.bom);
+        setChk('.fm-enc-recursive', d.recursive);
+        setChk('.fm-enc-not-utf8', d.notUtf8);
+        const mask = this._q('.fm-enc-mask');
+        if (mask && typeof d.mask === 'string') mask.value = d.mask;
+    }
+
+    /** BOM only exists for UTF-8 and UTF-16. */
+    _syncBom() {
+        const box = this._q('.fm-enc-bom');
+        if (!box) return;
+        const ok = /^UTF-/i.test(this._settings().to);
+        box.disabled = !ok;
+        if (!ok) box.checked = false;
+    }
+
+    _syncScanBtn() {
+        const b = this._q('.fm-enc-scan-btn');
+        if (!b) return;
+        b.innerHTML = this._scanCtrl
+            ? '<i class="bi bi-stop-circle" aria-hidden="true"></i> Stop'
+            : '<i class="bi bi-search" aria-hidden="true"></i> Scan';
+        b.disabled = this._busy;
+    }
+
+    /**
+     * @param {Object<string, string|string[]>} fields
+     * @param {AbortSignal} [signal]
+     * @returns {Promise<Response>}
+     */
+    _request(fields, signal) {
+        const form = new FormData();
+        Object.keys(fields).forEach((k) => (Array.isArray(fields[k]) ? fields[k] : [fields[k]]).forEach((x) => form.append(k, x)));
+        const init = fmPostInit(form);
+        if (signal) init.signal = signal;
+        return typeof requireAuthFetch === 'function' ? requireAuthFetch(this._ajaxUrl, init) : fetch(this._ajaxUrl, init);
+    }
+
+    _post(fields) {
+        return this._request(fields).then((r) => r.json());
+    }
+
+    _addFiles(list, initial) {
+        list.forEach((f) => {
+            if (!f || !f.name || this._byName.has(f.name)) return;
+            const item = { ...f, checked: !f.skip, initial: !!initial };
+            this._byName.set(item.name, item);
+            this._files.push(item);
+        });
+    }
+
+    /** Details of the given files, 1,000 per request (the server limit). */
+    async _loadInfo(names) {
+        this._statusText = 'Reading ' + names.length.toLocaleString() + ' file' + (names.length === 1 ? '' : 's') + '…';
+        this._render();
+        for (let i = 0; i < names.length && this.el; i += 1000) {
+            try {
+                const data = await this._post({ action: 'encoding-info', in: this._rel, 'names[]': names.slice(i, i + 1000) });
+                if (!data || data.status !== 'success' || !Array.isArray(data.files)) {
+                    this._showError((data && data.msg) || 'Could not read the files.');
+                    break;
+                }
+                this._addFiles(data.files, true);
+            } catch (e) {
+                this._showError('Request failed.');
+                break;
+            }
+            this._render();
+        }
+        this._statusText = '';
+        this._render();
+    }
+
+    _runScan() {
+        if (this._busy || !this._folderMode) return;
+        this._stopScan();
+        this._persist();
+        this._files = this._files.filter((f) => f.initial);
+        this._byName = new Map(this._files.map((f) => [f.name, f]));
+        if (this._previewName && !this._byName.has(this._previewName)) this._clearPreview();
+        this._filter = '';
+        this._statusText = '';
+        this._errorText = '';
+        this._scan = { running: true, stopped: false, done: null, error: '', scanned: 0 };
+        const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        this._scanCtrl = ctrl || true;
+        this._syncScanBtn();
+        this._render();
+        const s = this._settings();
+        const fields = {
+            action: 'encoding-scan', in: this._rel, mask: s.mask,
+            recursive: s.recursive ? '1' : '0', not_utf8: s.notUtf8 ? '1' : '0',
+        };
+        if (this._folders.length) fields['names[]'] = this._folders;
+        const scan = this._scan;
+        const onLine = (line) => {
+            if (!line.trim()) return;
+            let m;
+            try { m = JSON.parse(line); } catch (e) { return; }
+            if (Array.isArray(m.items)) {
+                this._addFiles(m.items.map((it) => ({
+                    name: it.path, size: it.size,
+                    encoding: it.encoding ? it.encoding.name : '', how: it.encoding ? it.encoding.how : '', eol: it.encoding ? it.encoding.eol : '',
+                })), false);
+            }
+            if (typeof m.scanned === 'number') scan.scanned = m.scanned;
+            if (m.error) scan.error = m.error;
+            if (m.done) scan.done = m;
+        };
+        this._request(fields, ctrl ? ctrl.signal : undefined)
+            .then(async (r) => {
+                if ((r.headers.get('Content-Type') || '').indexOf('ndjson') < 0 || !r.body) {
+                    const data = await r.json().catch(() => null);
+                    scan.error = (data && data.msg) || 'The scan failed.';
+                    return;
+                }
+                const reader = r.body.getReader();
+                const decoder = new TextDecoder();
+                let buf = '';
+                for (;;) {
+                    const { value, done } = await reader.read();
+                    if (this._scan !== scan) {
+                        try { reader.cancel(); } catch (e) { /* ignore */ }
+                        return;
+                    }
+                    if (value) {
+                        buf += decoder.decode(value, { stream: !done });
+                        const lines = buf.split('\n');
+                        buf = lines.pop() || '';
+                        lines.forEach(onLine);
+                    }
+                    if (done) {
+                        if (buf) onLine(buf);
+                        break;
+                    }
+                    this._renderSoon();
+                }
+                if (!scan.done && !scan.error) scan.error = 'The scan ended unexpectedly (connection or server error).';
+            })
+            .catch((err) => {
+                if (!scan.stopped && !(err && err.name === 'AbortError')) scan.error = 'The scan failed (network or session error).';
+            })
+            .then(() => {
+                scan.running = false;
+                if (this._scan !== scan) return;
+                this._scanCtrl = null;
+                this._syncScanBtn();
+                this._render();
+                if (!this._previewName || !this._byName.has(this._previewName)) this._previewFirst();
+            });
+    }
+
+    _stopScan() {
+        if (!this._scanCtrl) return;
+        this._scan.stopped = true;
+        if (this._scanCtrl !== true) {
+            try { this._scanCtrl.abort(); } catch (e) { /* ignore */ }
+        }
+        this._scanCtrl = null;
+        this._syncScanBtn();
+    }
+
+    _visibleFiles() {
+        return this._filter ? this._files.filter((f) => f.encoding === this._filter) : this._files;
+    }
+
+    _renderSoon() {
+        if (this._renderTimer) return;
+        this._renderTimer = setTimeout(() => {
+            this._renderTimer = null;
+            this._render();
+        }, 300);
+    }
+
+    _encodingText(f) {
+        if (f.skip) return '';
+        const name = f.encoding === 'ASCII' ? 'ASCII (fits UTF-8)' : (f.encoding || '');
+        return name + (f.how === 'bom' ? ' · BOM' : '') + (f.how === 'guess' ? ' (guess)' : '');
+    }
+
+    _resultHtml(f) {
+        const esc = FmPopup.escapeHtml;
+        if (f.skip) return '<span class="fm-enc-result--skip">Skipped: ' + esc(FmConvertEncodingPopup.SKIP_TEXT[f.skip] || f.skip) + '</span>';
+        const r = f.result;
+        if (!r) return '';
+        if (r.status === 'converted') {
+            return '<span class="fm-enc-result--ok"><i class="bi bi-check-lg" aria-hidden="true"></i> Converted' +
+                (r.new_name ? ' to ' + esc(r.new_name) : '') + (r.from ? ' from ' + esc(r.from) : '') + '</span>';
+        }
+        if (r.status === 'already') return '<span class="fm-enc-result--skip">Already in this encoding</span>';
+        if (r.status === 'skipped') return '<span class="fm-enc-result--skip">Skipped: ' + esc(FmConvertEncodingPopup.SKIP_TEXT[r.reason] || r.reason || '') + '</span>';
+        return '<span class="fm-enc-result--fail">Failed: ' + esc(r.reason || 'unknown error') + '</span>';
+    }
+
+    _render() {
+        if (!this.el) return;
+        const esc = FmPopup.escapeHtml;
+        const tbody = this._q('.fm-enc-tbody');
+        const vis = this._visibleFiles();
+        const shown = vis.slice(0, FmConvertEncodingPopup.MAX_ROWS);
+        let html = '';
+        shown.forEach((f) => {
+            const i = this._files.indexOf(f);
+            const cls = (f.name === this._previewName ? ' fm-enc-row--current' : '') + (f.skip ? ' fm-enc-row--skip' : '');
+            const size = typeof f.size === 'number' ? FmFileManagerTable.bytesToSize(f.size) : '';
+            html += `<tr data-i="${i}" class="${cls.trim()}">` +
+                `<td class="fm-enc-col-check"><input type="checkbox"${f.checked ? ' checked' : ''}${f.skip ? ' disabled' : ''} aria-label="Convert ${FmPopup.escapeAttr(f.name)}"></td>` +
+                `<td class="fm-enc-name"><span title="${FmPopup.escapeAttr(f.name)}">${esc(f.name)}</span></td>` +
+                `<td>${esc(this._encodingText(f))}</td>` +
+                `<td>${esc(f.skip ? '' : (FmConvertEncodingPopup.EOL_TEXT[f.eol] || ''))}</td>` +
+                `<td class="fm-enc-col-size">${esc(size)}</td>` +
+                `<td class="fm-enc-result">${this._resultHtml(f)}</td></tr>`;
+        });
+        if (vis.length > shown.length) {
+            html += '<tr class="fm-enc-more"><td colspan="6">… and ' + (vis.length - shown.length).toLocaleString() +
+                ' more files (checked as shown in the summary; they are converted too)</td></tr>';
+        }
+        if (!vis.length) {
+            html = '<tr class="fm-enc-more fm-enc-empty"><td colspan="6">' + (this._scan.running ? 'Scanning…' : 'No files to convert.') + '</td></tr>';
+        }
+        if (tbody) tbody.innerHTML = html;
+
+        const counts = new Map();
+        let skipped = 0;
+        this._files.forEach((f) => {
+            if (f.skip) { skipped += 1; return; }
+            const c = counts.get(f.encoding) || { n: 0, guess: false };
+            c.n += 1;
+            c.guess = c.guess || f.how === 'guess';
+            counts.set(f.encoding, c);
+        });
+        const chip = (val, label) => `<button type="button" class="fm-enc-chip${this._filter === val ? ' fm-enc-chip--on' : ''}" data-enc-filter="${FmPopup.escapeAttr(val)}">${esc(label)}</button>`;
+        let sum = counts.size > 1 || this._filter ? chip('', 'All: ' + (this._files.length - skipped).toLocaleString()) : '';
+        counts.forEach((c, enc) => { sum += chip(enc, (enc === 'ASCII' ? 'ASCII' : enc) + (c.guess ? ' (guess)' : '') + ': ' + c.n.toLocaleString()); });
+        if (skipped) sum += '<span class="fm-enc-chip-skip">Skipped: ' + skipped.toLocaleString() + '</span>';
+        const summary = this._q('.fm-enc-summary');
+        if (summary) summary.innerHTML = sum;
+
+        const all = this._q('.fm-enc-all');
+        const usable = vis.filter((f) => !f.skip);
+        if (all) {
+            all.checked = usable.length > 0 && usable.every((f) => f.checked);
+            all.indeterminate = usable.some((f) => f.checked) && !all.checked;
+        }
+        const primary = this._q('.fm-popup-primary-btn');
+        if (primary) {
+            const n = usable.filter((f) => f.checked).length;
+            const s = this._settings();
+            primary.disabled = this._busy || !!this._scanCtrl || n === 0;
+            const label = primary.querySelector('.fm-popup-btn-label');
+            if (label) {
+                label.textContent = n === 0 ? 'Convert'
+                    : 'Convert ' + n.toLocaleString() + ' file' + (n === 1 ? '' : 's') + (s.from !== 'auto' ? ' from ' + s.from : '') + ' to ' + s.to;
+                label.title = label.textContent;
+            }
+        }
+        this._renderStatus();
+    }
+
+    _renderStatus() {
+        const el = this._q('.fm-enc-status');
+        if (!el) return;
+        const s = this._scan;
+        const n = this._files.filter((f) => !f.skip).length.toLocaleString();
+        let text = this._errorText || this._statusText;
+        let cls = this._errorText ? 'fm-enc-status--error' : '';
+        if (!text) {
+            if (!this._folderMode) {
+                text = n + ' selected file' + (n === '1' ? '' : 's') + '. Click a file to see it before and after.';
+            } else if (s.error) {
+                text = s.error;
+                cls = 'fm-enc-status--error';
+            } else if (s.running) {
+                text = 'Scanning… ' + n + ' found' + (s.scanned ? ', ' + s.scanned.toLocaleString() + ' checked' : '');
+            } else if (s.stopped) {
+                text = 'Stopped — ' + n + ' found. The list may be incomplete.';
+                cls = 'fm-enc-status--warn';
+            } else if (s.done && s.done.reason === 'limit') {
+                text = 'Showing the first ' + n + ' files. Narrow the scan (file names, folder) to see the rest.';
+                cls = 'fm-enc-status--warn';
+            } else if (s.done && (s.done.reason === 'time' || s.done.reason === 'content_limit')) {
+                text = 'The scan was stopped by its time or read limit — ' + n + ' found. Narrow the scan to see the rest.';
+                cls = 'fm-enc-status--warn';
+            } else if (s.done) {
+                const notUtf8 = this._settings().notUtf8;
+                text = n === '0'
+                    ? (notUtf8 ? 'No files that are not UTF-8 were found.' : 'No text files were found.')
+                    : n + ' file' + (n === '1' ? '' : 's') + ' found in ' + s.done.seconds + ' s. Click a file to see it before and after.';
+            }
+        }
+        el.textContent = text || '';
+        el.title = text || '';
+        el.className = 'fm-enc-status' + (cls ? ' ' + cls : '');
+    }
+
+    /** Errors use the status line, so the dialog keeps its height. */
+    _showError(msg) {
+        this._errorText = msg || '';
+        this._renderStatus();
+    }
+
+    _previewFirst() {
+        const f = this._visibleFiles().find((x) => !x.skip);
+        if (f) this._loadPreview(f.name);
+    }
+
+    /** Empty preview (the shown file is no longer in the list). */
+    _clearPreview() {
+        this._previewName = null;
+        this._previewSeq += 1;
+        ['.fm-enc-now', '.fm-enc-after', '.fm-enc-preview-note', '.fm-enc-direction'].forEach((sel) => {
+            const n = this._q(sel);
+            if (n) {
+                n.textContent = '';
+                n.title = '';
+            }
+        });
+        const title = this._q('.fm-enc-after-title');
+        if (title) title.textContent = 'After converting';
+    }
+
+    /**
+     * "report.txt: Windows-1251 (guessed) → UTF-8 · 3.5 KiB → 6.1 KiB · LF → CRLF" above the preview.
+     * @param {string} name
+     * @param {Object} data - encoding-preview answer
+     * @param {Object} s - settings
+     */
+    _renderDirection(name, data, s) {
+        const el = this._q('.fm-enc-direction');
+        if (!el) return;
+        const size = (b) => FmFileManagerTable.bytesToSize(Number(b) || 0);
+        const from = s.from === 'auto'
+            ? (data.detected === 'ASCII' ? 'ASCII' : data.from) + (data.how === 'guess' ? ' (guessed)' : (data.how === 'bom' ? ' (BOM)' : ''))
+            : data.from;
+        const parts = [from + ' → ' + s.to + (s.bom ? ' with BOM' : '')];
+        if (data.size_after !== null && data.size_after !== undefined) {
+            parts.push(size(data.size) + ' → ' + (data.size_approx ? '≈ ' : '') + size(data.size_after));
+        }
+        const eol = FmConvertEncodingPopup.EOL_TEXT;
+        if (s.eol !== 'keep' && data.eol !== s.eol && data.eol !== 'none') {
+            parts.push((eol[data.eol] || data.eol) + ' → ' + eol[s.eol]);
+        }
+        const text = parts.join(' · ');
+        el.innerHTML = '<strong>' + FmPopup.escapeHtml(name) + ':</strong> ' + FmPopup.escapeHtml(text);
+        el.title = name + ': ' + text;
+    }
+
+    _loadPreview(name) {
+        const f = this._byName.get(name || this._previewName || '');
+        const now = this._q('.fm-enc-now');
+        const after = this._q('.fm-enc-after');
+        const note = this._q('.fm-enc-preview-note');
+        const title = this._q('.fm-enc-after-title');
+        const setNote = (text, kind) => {
+            if (!note) return;
+            note.textContent = text || '';
+            note.title = text || '';
+            note.className = 'fm-enc-preview-note' + (kind ? ' fm-enc-preview-note--' + kind : '');
+        };
+        const direction = this._q('.fm-enc-direction');
+        if (!f || f.skip) {
+            if (now) now.textContent = '';
+            if (after) after.textContent = '';
+            if (direction) direction.textContent = '';
+            setNote(f ? 'Skipped: ' + (FmConvertEncodingPopup.SKIP_TEXT[f.skip] || f.skip) : '');
+            return;
+        }
+        this._previewName = f.name;
+        this._render();
+        const s = this._settings();
+        const seq = ++this._previewSeq;
+        setNote('Loading…');
+        this._post({
+            action: 'encoding-preview', in: this._rel, name: f.name, from: s.from, to: s.to, eol: s.eol, bom: s.bom ? '1' : '0',
+        })
+            .then((data) => {
+                if (seq !== this._previewSeq || !this.el) return;
+                if (!data || data.status !== 'success') {
+                    setNote((data && data.msg) || 'Could not read the file.', 'err');
+                    return;
+                }
+                if (data.skip) {
+                    if (now) now.textContent = '';
+                    if (after) after.textContent = '';
+                    if (direction) direction.textContent = '';
+                    setNote('Skipped: ' + (FmConvertEncodingPopup.SKIP_TEXT[data.skip] || data.skip), 'warn');
+                    return;
+                }
+                if (now) now.textContent = (data.now || []).join('\n');
+                if (after) after.textContent = Array.isArray(data.after) ? data.after.join('\n') : '';
+                if (title) title.textContent = 'After converting to ' + s.to;
+                this._renderDirection(f.name, data, s);
+                if (data.after === null) {
+                    setNote('This file is not valid ' + data.from + '. Choose another “From” encoding.', 'err');
+                } else if (data.unmappable) {
+                    setNote('Some characters of this file do not exist in ' + s.to + ', so it would fail. Choose another “To” encoding.', 'err');
+                } else if (data.detected === 'ASCII' && data.size_after === data.size) {
+                    setNote('Nothing changes: this file has only ASCII characters, which are the same in ' + (s.to === 'UTF-8' ? 'UTF-8' : 'UTF-8 and ' + s.to) + '.');
+                } else if (data.from === 'UTF-8') {
+                    setNote('The text stays the same; only the bytes change' + (s.to === 'UTF-8' ? ' (BOM, line endings).' : ' (UTF-8 → ' + s.to + ').'));
+                } else if (s.from === 'auto' && data.how === 'guess') {
+                    setNote('The encoding was guessed. If the text on the right looks wrong, choose another “From” encoding.', 'warn');
+                } else {
+                    setNote('');
+                }
+            })
+            .catch(() => {
+                if (seq === this._previewSeq) setNote('Request failed.', 'err');
+            });
+    }
+
+    async _convert() {
+        if (this._busy || this._scanCtrl) return;
+        const list = this._visibleFiles().filter((f) => f.checked && !f.skip);
+        if (!list.length) {
+            this._showError('Check at least one file.');
+            return;
+        }
+        this._showError('');
+        const s = this._settings();
+        this._busy = true;
+        this._stop = false;
+        this._syncScanBtn();
+        const progress = this._q('.fm-enc-progress');
+        const bar = this._q('.fm-enc-progress-bar span');
+        if (progress) progress.hidden = false;
+        const tally = { converted: 0, already: 0, skipped: 0, failed: 0 };
+        let done = 0;
+        let failedRequest = '';
+        const step = FmConvertEncodingPopup.BATCH;
+        for (let i = 0; i < list.length && !this._stop; i += step) {
+            const batch = list.slice(i, i + step);
+            this._statusText = 'Converting… ' + done.toLocaleString() + ' of ' + list.length.toLocaleString();
+            this._render();
+            let data = null;
+            try {
+                data = await this._post({
+                    action: 'encoding-convert', in: this._rel, 'names[]': batch.map((f) => f.name),
+                    from: s.from, to: s.to, bom: s.bom ? '1' : '0', eol: s.eol, mode: s.mode,
+                });
+            } catch (e) {
+                data = null;
+            }
+            if (!data || data.status !== 'success' || !Array.isArray(data.files)) {
+                failedRequest = (data && data.msg) || 'Request failed.';
+                break;
+            }
+            data.files.forEach((r, k) => {
+                const f = batch[k];
+                if (!f) return;
+                f.result = r;
+                tally[r.status] = (tally[r.status] || 0) + 1;
+                if (r.status === 'converted') {
+                    this._changed = true;
+                    if (s.mode === 'replace') {
+                        f.encoding = s.to;
+                        f.how = 'converted';
+                    }
+                }
+            });
+            done += batch.length;
+            if (bar) bar.style.width = Math.round((done / list.length) * 100) + '%';
+        }
+        this._busy = false;
+        if (progress) progress.hidden = true;
+        if (bar) bar.style.width = '0';
+        const parts = ['Converted ' + tally.converted.toLocaleString()];
+        if (tally.already) parts.push('already in ' + s.to + ': ' + tally.already.toLocaleString());
+        if (tally.skipped) parts.push('skipped ' + tally.skipped.toLocaleString());
+        if (tally.failed) parts.push('failed ' + tally.failed.toLocaleString() + ' (see Result)');
+        const rest = list.length - done;
+        this._statusText = parts.join(' · ') + (rest > 0 ? ' — ' + rest.toLocaleString() + ' not processed' + (this._stop ? ' (stopped)' : '') : '') + '.';
+        if (failedRequest) this._showError(failedRequest);
+        this._syncScanBtn();
+        this._render();
+        if (this._previewName) this._loadPreview(this._previewName);
+    }
+}
+
+/**
  * Bulk rename: find/replace, prefix/suffix, optional counter; preview table; server two-phase rename.
  */
 class FmBulkRenamePopup extends FmPopup {
@@ -20545,32 +22596,34 @@ class FmTable {
  */
 class FmFileManagerTable extends FmTable {
     /**
-     * The actions for the table.
+     * The actions for the table. `priority` decides which toolbar buttons stay when the row is too narrow:
+     * 4 goes into the "More" menu first, 1 last (new actions: pick a priority, the order of buttons stays as here).
      * @type {Object[]}
      */
     static ACTIONS = [
-        { id: 'create-new-folder', icon: 'bi-folder-plus',         title: 'Create new folder', needSelection: false },
-        { id: 'create-new-file',   icon: 'bi-file-earmark-plus',   title: 'Create new file',   needSelection: false },
-        { id: 'delete',            icon: 'bi-trash',               title: 'Delete',            needSelection: true,  separatorBefore: true },
-        { id: 'restore-trashed',   icon: 'bi-arrow-counterclockwise', title: 'Restore',       needSelection: true,  separatorBefore: true },
-        { id: 'copy',              icon: 'bi-copy',                title: 'Copy',              needSelection: true,  separatorBefore: true },
-        { id: 'move',              icon: 'bi-arrow-right-square',  title: 'Move',              needSelection: true },
-        { id: 'duplicate',       icon: 'bi-files',               title: 'Duplicate',         needSelection: true },
-        { id: 'new-folder-from-selection', icon: 'bi-folder-symlink', title: 'New folder from selection', needSelection: true },
-        { id: 'copy-path',       icon: 'bi-clipboard',           title: 'Copy path',         needSelection: true,  separatorBefore: true },
-        { id: 'copy-relative-path', icon: 'bi-clipboard2',       title: 'Copy relative path', needSelection: true },
-        { id: 'rename',            icon: 'bi-input-cursor-text',   title: 'Rename',            needSelection: true,  singleOnly: true, separatorBefore: true },
-        { id: 'bulk-rename',       icon: 'bi-input-cursor',        title: 'Bulk rename',       needSelection: true },
-        { id: 'get-info',          icon: 'bi-info-circle',         title: 'Get info',          needSelection: true,  singleOnly: true },
-        { id: 'change-permissions', icon: 'bi-shield-lock',        title: 'Change permissions', needSelection: true },
-        { id: 'compress',          icon: 'bi-arrows-collapse',     title: 'Archive',           needSelection: true,  separatorBefore: true },
-        { id: 'extract',           icon: 'bi-arrows-expand',       title: 'Extract',           needSelection: true,  requiresArchive: true },
-        { id: 'refresh',           icon: 'bi-arrow-clockwise',     title: 'Refresh',           needSelection: false, separatorBefore: true },
-        { id: 'find',              icon: 'bi-search',              title: 'Find',              needSelection: false },
-        { id: 'upload',            icon: 'bi-upload',              title: 'Upload',            needSelection: false, separatorBefore: true },
-        { id: 'download',          icon: 'bi-download',            title: FM_DOWNLOAD_ACTION_TITLE, needSelection: true },
-        { id: 'open-in-new-tab',   icon: 'bi-box-arrow-up-right',  title: 'Open in new tab',       needSelection: true, singleOnly: true },
-        { id: 'terminal-here',     icon: 'bi-terminal',            title: 'Open terminal here',    needSelection: false, singleOnly: true },
+        { id: 'create-new-folder', icon: 'bi-folder-plus',         title: 'Create new folder', needSelection: false, priority: 1 },
+        { id: 'create-new-file',   icon: 'bi-file-earmark-plus',   title: 'Create new file',   needSelection: false, priority: 1 },
+        { id: 'delete',            icon: 'bi-trash',               title: 'Delete',            needSelection: true,  separatorBefore: true, priority: 1 },
+        { id: 'restore-trashed',   icon: 'bi-arrow-counterclockwise', title: 'Restore',       needSelection: true,  separatorBefore: true, priority: 1 },
+        { id: 'copy',              icon: 'bi-copy',                title: 'Copy',              needSelection: true,  separatorBefore: true, priority: 2 },
+        { id: 'move',              icon: 'bi-arrow-right-square',  title: 'Move',              needSelection: true,  priority: 2 },
+        { id: 'duplicate',       icon: 'bi-files',               title: 'Duplicate',         needSelection: true,  priority: 4 },
+        { id: 'new-folder-from-selection', icon: 'bi-folder-symlink', title: 'New folder from selection', needSelection: true, priority: 4 },
+        { id: 'copy-path',       icon: 'bi-clipboard',           title: 'Copy path',         needSelection: true,  separatorBefore: true, priority: 3 },
+        { id: 'copy-relative-path', icon: 'bi-clipboard2',       title: 'Copy relative path', needSelection: true, priority: 4 },
+        { id: 'rename',            icon: 'bi-input-cursor-text',   title: 'Rename',            needSelection: true,  singleOnly: true, separatorBefore: true, priority: 2 },
+        { id: 'bulk-rename',       icon: 'bi-input-cursor',        title: 'Bulk rename',       needSelection: true,  priority: 3 },
+        { id: 'get-info',          icon: 'bi-info-circle',         title: 'Get info',          needSelection: true,  singleOnly: true, priority: 2 },
+        { id: 'change-permissions', icon: 'bi-shield-lock',        title: 'Change permissions', needSelection: true, priority: 3 },
+        { id: 'convert-encoding',  icon: 'bi-translate',           title: 'Convert encoding',  needSelection: false, priority: 3 },
+        { id: 'compress',          icon: 'bi-arrows-collapse',     title: 'Archive',           needSelection: true,  separatorBefore: true, priority: 2 },
+        { id: 'extract',           icon: 'bi-arrows-expand',       title: 'Extract',           needSelection: true,  requiresArchive: true, priority: 2 },
+        { id: 'refresh',           icon: 'bi-arrow-clockwise',     title: 'Refresh',           needSelection: false, separatorBefore: true, priority: 1 },
+        { id: 'find',              icon: 'bi-search',              title: 'Find',              needSelection: false, priority: 1 },
+        { id: 'upload',            icon: 'bi-upload',              title: 'Upload',            needSelection: false, separatorBefore: true, priority: 1 },
+        { id: 'download',          icon: 'bi-download',            title: FM_DOWNLOAD_ACTION_TITLE, needSelection: true, priority: 1 },
+        { id: 'open-in-new-tab',   icon: 'bi-box-arrow-up-right',  title: 'Open in new tab',       needSelection: true, singleOnly: true, priority: 4 },
+        { id: 'terminal-here',     icon: 'bi-terminal',            title: 'Open terminal here',    needSelection: false, singleOnly: true, priority: 4 },
     ];
 
     /** Beyond this many crumbs, middle segments collapse to an ellipsis until expanded. */
@@ -20623,14 +22676,14 @@ class FmFileManagerTable extends FmTable {
      */
     static SEARCH_VIEW_ACTIONS = new Set([
         'find', 'refresh', 'close-search', 'open', 'open-location', 'open-in-new-tab', 'download',
-        'copy', 'move', 'delete', 'bulk-rename', 'change-permissions', 'copy-path', 'copy-relative-path', 'get-info',
-        'select-none', 'invert-selection',
+        'copy', 'move', 'delete', 'bulk-rename', 'change-permissions', 'convert-encoding', 'copy-path', 'copy-relative-path',
+        'get-info', 'select-none', 'invert-selection',
     ]);
 
     /** Actions that may change files: kept search results are searched again when shown after one of them. */
     static SEARCH_DIRTY_ACTIONS = new Set([
         'create-new-folder', 'create-new-file', 'delete', 'restore-trashed', 'empty-trash', 'copy', 'move',
-        'duplicate', 'new-folder-from-selection', 'rename', 'bulk-rename', 'change-permissions', 'compress',
+        'duplicate', 'new-folder-from-selection', 'rename', 'bulk-rename', 'change-permissions', 'convert-encoding', 'compress',
         'extract', 'upload', 'terminal-here',
     ]);
 
@@ -20873,6 +22926,9 @@ class FmFileManagerTable extends FmTable {
               headerSuffix: '<button type="button" class="fm-table-size-all-btn" title="Calculate size for all folders"><i class="bi bi-arrow-clockwise"></i></button>' },
             { key: 'type', label: 'Type', sortable: true, className: 'fm-table-col-type fm-table-type' },
         ];
+        if (config.showEncodingColumn) {
+            cols.push({ key: 'encoding', label: 'Encoding', sortable: false, className: 'fm-table-col-encoding' });
+        }
         if (config.showLastModifiedColumn) {
             cols.push({ key: 'mtime', label: 'Last modified', sortable: true, className: 'fm-table-col-mtime fm-table-mtime' });
         }
@@ -20904,7 +22960,7 @@ class FmFileManagerTable extends FmTable {
     constructor(container, rows, options = {}) {
         const sc      = FmFileManagerTable.ACTION_TOOLTIP_SHORTCUT;
         const actions = FmFileManagerTable.ACTIONS.filter(a =>
-            ['create-new-folder', 'create-new-file', 'rename', 'bulk-rename', 'delete', 'restore-trashed', 'copy', 'move', 'duplicate', 'new-folder-from-selection', 'copy-path', 'copy-relative-path', 'get-info', 'change-permissions', 'compress', 'extract', 'refresh', 'download', 'open-in-new-tab', 'terminal-here', 'upload'].includes(a.id)
+            ['create-new-folder', 'create-new-file', 'rename', 'bulk-rename', 'delete', 'restore-trashed', 'copy', 'move', 'duplicate', 'new-folder-from-selection', 'copy-path', 'copy-relative-path', 'get-info', 'change-permissions', 'convert-encoding', 'compress', 'extract', 'refresh', 'download', 'open-in-new-tab', 'terminal-here', 'upload'].includes(a.id)
         ).map(a => {
             const shortcut = sc[a.id];
             return shortcut ? { ...a, shortcut } : a;
@@ -20963,6 +23019,10 @@ class FmFileManagerTable extends FmTable {
 
         this.options.showActionsColumn = options.showActionsColumn !== false;
         this.options.showLastModifiedColumn = options.showLastModifiedColumn !== false;
+        this.options.showEncodingColumn = options.showEncodingColumn === true;
+        /** Encoding column: detected encodings by path + size + mtime, and those being fetched. */
+        this._encCache = new Map();
+        this._encPending = new Set();
         this.options.automaticGetFoldersSize = options.automaticGetFoldersSize === true;
         this.options.permissionsDisplay = ['octal', 'symbolic', 'both'].includes(options.permissionsDisplay)
             ? options.permissionsDisplay
@@ -21348,7 +23408,7 @@ class FmFileManagerTable extends FmTable {
             return [
                 { ...byId['restore-trashed'], separatorBefore: false },
                 { ...byId['delete'], title: 'Delete forever', separatorBefore: false },
-                { id: 'empty-trash', icon: 'bi-trash3', title: 'Empty Trash', needSelection: false, separatorBefore: true },
+                { id: 'empty-trash', icon: 'bi-trash3', title: 'Empty Trash', needSelection: false, separatorBefore: true, priority: 1 },
                 { ...byId['refresh'], separatorBefore: true },
             ].map(withShortcut);
         }
@@ -21357,13 +23417,14 @@ class FmFileManagerTable extends FmTable {
             return [
                 { ...byId['find'], title: 'New search', separatorBefore: false },
                 { ...byId['refresh'], title: 'Search again', separatorBefore: false },
-                { id: 'close-search', icon: 'bi-x-lg', title: 'Close search results', needSelection: false },
-                { id: 'open-location', icon: 'bi-folder-symlink', title: 'Open containing folder', needSelection: true, singleOnly: true, separatorBefore: true },
+                { id: 'close-search', icon: 'bi-x-lg', title: 'Close search results', needSelection: false, priority: 1 },
+                { id: 'open-location', icon: 'bi-folder-symlink', title: 'Open containing folder', needSelection: true, singleOnly: true, separatorBefore: true, priority: 2 },
                 { ...byId['download'] },
                 { ...byId['copy'], separatorBefore: true },
                 { ...byId['move'] },
                 { ...byId['bulk-rename'], separatorBefore: true },
                 { ...byId['change-permissions'] },
+                { ...byId['convert-encoding'] },
                 { ...byId['delete'], separatorBefore: true },
                 { ...byId['copy-path'], separatorBefore: true },
                 { ...byId['copy-relative-path'] },
@@ -21373,7 +23434,7 @@ class FmFileManagerTable extends FmTable {
         const allowed = new Set([
             "create-new-folder", "create-new-file", "rename", "delete", "copy", "move", "duplicate", "new-folder-from-selection",
             "copy-path", "copy-relative-path",
-            "get-info", "bulk-rename", "change-permissions", "compress", "extract", "refresh", "find", "download", "open-in-new-tab", "terminal-here", "upload",
+            "get-info", "bulk-rename", "change-permissions", "convert-encoding", "compress", "extract", "refresh", "find", "download", "open-in-new-tab", "terminal-here", "upload",
         ]);
         return FmFileManagerTable.ACTIONS.filter((a) => allowed.has(a.id)).map(withShortcut);
     }
@@ -21752,6 +23813,7 @@ class FmFileManagerTable extends FmTable {
         if (f.content) {
             parts.push('text ' + (f.contentMatch === 'regex' ? 'matches regex' : 'contains') + ' “' + f.content + '”' + (f.contentIcase === false ? ' (match case)' : ''));
         }
+        if (f.encoding) parts.push(f.encoding === 'not_utf8' ? 'encoding not UTF-8' : 'encoding ' + f.encoding);
         if (f.type === 'file') parts.push('files');
         if (f.type === 'folder') parts.push('folders');
         if (f.sizeMin !== '') parts.push('from ' + f.sizeMin + ' ' + f.sizeMinUnit);
@@ -22015,6 +24077,93 @@ class FmFileManagerTable extends FmTable {
     }
 
     /**
+     * @override Buttons carry their priority, and a "More" button at the end lists the ones that do not fit.
+     */
+    renderToolbar() {
+        const tb = super.renderToolbar();
+        this.options.actions.forEach((a) => {
+            const btn = tb.querySelector(`[data-action="${a.id}"]`);
+            if (btn) btn.dataset.priority = String(a.priority || 2);
+        });
+        const more = document.createElement('button');
+        more.type = 'button';
+        more.className = 'fm-table-action-btn fm-table-more-btn fm-toolbar-hidden';
+        more.title = 'More actions';
+        more.setAttribute('aria-haspopup', 'menu');
+        more.innerHTML = '<i class="bi bi-three-dots"></i>';
+        more.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            this._showToolbarMoreMenu(more);
+        });
+        tb.appendChild(more);
+        return tb;
+    }
+
+    /**
+     * Keep the toolbar on one line: show every button, then hide the ones with the highest priority number (the
+     * later one first among equals) until the row fits; hidden buttons are listed in the "More" menu.
+     */
+    _fitToolbar() {
+        const tb = this.toolbarEl;
+        if (!tb || !tb.isConnected) return;
+        const buttons = [...tb.querySelectorAll('.fm-table-action-btn[data-action]')];
+        const more = tb.querySelector('.fm-table-more-btn');
+        buttons.forEach((b) => b.classList.remove('fm-toolbar-hidden'));
+        if (more) more.classList.add('fm-toolbar-hidden');
+        this._syncToolbarSeparators();
+        const fits = () => tb.scrollWidth <= tb.clientWidth + 1;
+        if (fits() || !more) return;
+        more.classList.remove('fm-toolbar-hidden');
+        const order = buttons
+            .map((b, i) => ({ b, i, p: Number(b.dataset.priority) || 2 }))
+            .sort((x, y) => (y.p - x.p) || (y.i - x.i));
+        for (const o of order) {
+            o.b.classList.add('fm-toolbar-hidden');
+            this._syncToolbarSeparators();
+            if (fits()) break;
+        }
+    }
+
+    /** A separator is shown only between two visible buttons. */
+    _syncToolbarSeparators() {
+        const tb = this.toolbarEl;
+        if (!tb) return;
+        let lastWasButton = false;
+        let pending = null;
+        [...tb.children].forEach((el) => {
+            if (el.classList.contains('fm-table-more-btn')) return;
+            if (el.classList.contains('fm-table-action-separator')) {
+                el.classList.add('fm-toolbar-hidden');
+                if (lastWasButton) pending = el;
+                lastWasButton = false;
+                return;
+            }
+            if (el.classList.contains('fm-toolbar-hidden')) return;
+            if (pending) {
+                pending.classList.remove('fm-toolbar-hidden');
+                pending = null;
+            }
+            lastWasButton = true;
+        });
+    }
+
+    /** Menu of the toolbar actions that do not fit, in toolbar order, greyed like their buttons. */
+    _showToolbarMoreMenu(moreBtn) {
+        const tb = this.toolbarEl;
+        if (!tb) return;
+        const items = [];
+        this.options.actions.forEach((a, i) => {
+            const btn = tb.querySelector(`.fm-table-action-btn[data-action="${a.id}"]`);
+            if (!btn || !btn.classList.contains('fm-toolbar-hidden')) return;
+            if (i > 0 && a.separatorBefore && items.length) items.push({ type: 'separator' });
+            items.push({ id: a.id, title: a.title, icon: a.icon, shortcut: a.shortcut || null, disabled: btn.classList.contains('disabled') });
+        });
+        const r = moreBtn.getBoundingClientRect();
+        this._renderContextMenu(items, r.left, r.bottom + 2, { selectedRows: this.getSelectedRows(), selectedRow: this.getSelected() });
+    }
+
+    /**
      * Rebuild columns from live config before every render so changes made via
      * the config popup take effect without re-instantiating the table.
      * @override
@@ -22024,7 +24173,8 @@ class FmFileManagerTable extends FmTable {
         const inTrash = this._inTrashView();
         this.options.columns = FmFileManagerTable._buildColumns({
             showActionsColumn: this.options.showActionsColumn,
-            showLastModifiedColumn: this.options.showLastModifiedColumn
+            showLastModifiedColumn: this.options.showLastModifiedColumn,
+            showEncodingColumn: this.options.showEncodingColumn && !inTrash,
         }).map((col) => (inTrash && col.key === 'mtime' ? { ...col, label: 'Deleted' } : col));
         // Whole filtered + sorted list; only one page of it is put into the table.
         const all = this.sortRows(Array.isArray(this._allRows) && this._allRows.length
@@ -22036,10 +24186,24 @@ class FmFileManagerTable extends FmTable {
         this._page = Math.min(Math.max(0, this._page || 0), pages - 1);
         this.rows = size ? all.slice(this._page * size, (this._page + 1) * size) : all;
         super.render();
+        this._fitToolbar();
+        if (!this._toolbarFitObserver && typeof ResizeObserver !== 'undefined' && this.container) {
+            let frame = 0;
+            let lastWidth = 0;
+            this._toolbarFitObserver = new ResizeObserver(() => {
+                const w = this.container.clientWidth;
+                if (w === lastWidth) return;
+                lastWidth = w;
+                cancelAnimationFrame(frame);
+                frame = requestAnimationFrame(() => this._fitToolbar());
+            });
+            this._toolbarFitObserver.observe(this.container);
+        }
         if (this.tableEl) {
             this.tableEl.classList.toggle('fm-table--image-previews', !!this.options.showImagePreviews);
             this.tableEl.classList.toggle('fm-table--trash-view', inTrash);
             this.tableEl.classList.toggle('fm-table--search-view', this._inSearchView());
+            this.tableEl.classList.toggle('fm-table--with-encoding', !!this.options.showEncodingColumn && !inTrash);
             if (this.selectedRows.length) {
                 const sel = new Set(this.selectedRows);
                 this.rows.forEach((row, i) => {
@@ -22053,6 +24217,7 @@ class FmFileManagerTable extends FmTable {
                 this._updatePagerSelectionNote();
             }
             this._syncHeaderGutter();
+            this._loadEncodingsForPage();
             if (typeof ResizeObserver !== 'undefined') {
                 if (this._gutterObserver) this._gutterObserver.disconnect();
                 const tbody = this.tableEl.querySelector('tbody');
@@ -22251,11 +24416,28 @@ class FmFileManagerTable extends FmTable {
         const link = this._rowLink(row);
         const title = '/' + (dir ? dir + '/' : '') + name + (link ? ' — ' + link.title : '');
         const isImg = row.type === 'file' && FmFileManagerTable.isImagePreviewExt(row.ext, name);
+        // A match in a file that is not UTF-8 tells its encoding next to the folder (the match line has no room).
+        const me = row.raw && row.raw.match && row.raw.match.encoding;
+        const where = 'in /' + dir + (me && me.name ? ' · ' + me.name + (me.how === 'guess' ? ' (guess)' : '') : '');
         return '<span class="fm-table-name-cell fm-table-name-cell--trash fm-table-name-cell--search">' +
             `<span class="fm-table-name${isImg ? ' fm-table-name--image-preview' : ''}" title="${this.escapeAttr(title)}">${this.escapeHtml(name)}</span>` +
-            `<span class="fm-trash-origin" title="${this.escapeAttr(title)}">${this.escapeHtml('in /' + dir)}</span>` +
+            `<span class="fm-trash-origin" title="${this.escapeAttr(title)}">${this.escapeHtml(where)}</span>` +
             this._searchMatchHtml(row.raw && row.raw.match) +
+            this._searchEncodingHtml(row.raw && row.raw.encoding) +
             '</span>';
+    }
+
+    /**
+     * Detected encoding under the name when Find filters by encoding: "Windows-1251 (guess) · CRLF".
+     * @param {{name: string, how: string, eol: string}|undefined} e
+     * @returns {string}
+     */
+    _searchEncodingHtml(e) {
+        if (!e || !e.name) return '';
+        const eol = FmConvertEncodingPopup.EOL_TEXT[e.eol];
+        const text = (e.name === 'ASCII' ? 'ASCII (fits UTF-8)' : e.name) + (e.how === 'guess' ? ' (guess)' : '') +
+            (e.how === 'bom' ? ' · BOM' : '') + (eol && e.eol !== 'none' ? ' · ' + eol : '');
+        return `<span class="fm-search-match"><span class="fm-search-match-line">encoding: </span>${this.escapeHtml(text)}</span>`;
     }
 
     /**
@@ -22270,7 +24452,7 @@ class FmFileManagerTable extends FmTable {
         const end = Math.min(chars.length, at + Math.max(0, Number(m.len) || 0));
         const label = 'line ' + Number(m.line).toLocaleString() + ': ';
         // The Name column is narrow: keep only a little text before the match so the match is always visible.
-        const keep = 15;
+        const keep = 8;
         const before = at > keep + 1 ? '…' + chars.slice(at - keep, at).join('') : chars.slice(0, at).join('');
         return `<span class="fm-search-match" title="${this.escapeAttr(label + m.text)}">` +
             `<span class="fm-search-match-line">${this.escapeHtml(label)}</span>` +
@@ -22374,6 +24556,8 @@ class FmFileManagerTable extends FmTable {
                 return this.escapeHtml(row.type === 'folder' ? 'Folder' : (row.ext || '—'));
             case 'mtime':
                 return this.escapeHtml(FmFileManagerTable.formatMtime(row.mtime));
+            case 'encoding':
+                return this._encodingCellHtml(row);
             case 'permissions': {
                 const disp = this.options.permissionsDisplay || 'octal';
                 if (disp === 'both') {
@@ -22393,6 +24577,105 @@ class FmFileManagerTable extends FmTable {
             default:
                 return '';
         }
+    }
+
+    /** Extensions of text files whose encoding the Encoding column reads (others are not opened). */
+    static TEXT_EXTS = new Set([
+        'txt', 'text', 'md', 'markdown', 'rst', 'csv', 'tsv', 'log', 'ini', 'conf', 'cfg', 'cnf', 'env', 'properties', 'toml',
+        'yml', 'yaml', 'json', 'xml', 'xsl', 'svg', 'html', 'htm', 'xhtml', 'shtml', 'css', 'scss', 'sass', 'less', 'js', 'mjs',
+        'cjs', 'ts', 'tsx', 'jsx', 'vue', 'php', 'phtml', 'inc', 'tpl', 'twig', 'blade', 'sql', 'sh', 'bash', 'bat', 'cmd', 'ps1',
+        'py', 'rb', 'pl', 'pm', 'java', 'kt', 'c', 'h', 'cpp', 'hpp', 'cs', 'go', 'rs', 'swift', 'lua', 'asp', 'aspx', 'jsp',
+        'srt', 'sub', 'vtt', 'po', 'pot', 'nfo', 'diz', 'rtf', 'tex', 'htaccess', 'gitignore', 'editorconfig',
+    ]);
+
+    /**
+     * Encoding info as text: "Windows-1251", or with details "Windows-1251 (guessed) · CRLF"; skipped files as a reason.
+     * @param {{encoding?: string, how?: string, eol?: string, skip?: string}} info - fmEncodingFileInfo() result
+     * @param {boolean} [long]
+     * @returns {string}
+     */
+    static encodingText(info, long = false) {
+        if (!info) return '—';
+        if (info.skip) {
+            if (!long) return '—';
+            return ({ binary: 'Binary file', too_big: 'Not read (larger than 20 MB)', link: 'Link (not read)' })[info.skip] || '—';
+        }
+        const name = info.encoding === 'ASCII' && long ? 'ASCII (fits UTF-8)' : (info.encoding || '—');
+        if (!long) return name + (info.how === 'bom' ? ' BOM' : '');
+        const eol = FmConvertEncodingPopup.EOL_TEXT[info.eol];
+        return name + (info.how === 'guess' ? ' (guessed)' : '') + (info.how === 'bom' ? ' · BOM' : '') + (eol && info.eol !== 'none' ? ' · ' + eol : '');
+    }
+
+    /** @returns {boolean} The Encoding column reads this row. */
+    static _encodingApplies(row) {
+        if (!row || row.type !== 'file') return false;
+        const name = String(row.displayName || row.name || '');
+        const ext = String(row.ext || (name.lastIndexOf('.') >= 0 ? name.slice(name.lastIndexOf('.') + 1) : '')).toLowerCase();
+        return FmFileManagerTable.TEXT_EXTS.has(ext);
+    }
+
+    _encodingKey(row, dir = this._currentPath) {
+        return dir + '\n' + row.name + '\n' + row.size + '\n' + row.mtime;
+    }
+
+    _encodingCellHtml(row) {
+        if (!row || row.type !== 'file') return '';
+        if (!FmFileManagerTable._encodingApplies(row)) return '<span class="fm-enc-cell fm-enc-cell--none">—</span>';
+        const info = this._encCache.get(this._encodingKey(row));
+        if (!info) return '<span class="fm-enc-cell fm-enc-cell--none" title="Reading…">…</span>';
+        const cls = info.skip ? ' fm-enc-cell--none' : (info.how === 'guess' ? ' fm-enc-cell--guess' : '');
+        return `<span class="fm-enc-cell${cls}" title="${this.escapeAttr(FmFileManagerTable.encodingText(info, true))}">${this.escapeHtml(FmFileManagerTable.encodingText(info))}</span>`;
+    }
+
+    /**
+     * Encoding column: read the encodings of the text files on the shown page (at most 1,000) in the background,
+     * 200 per request, then fill their cells without re-rendering the table.
+     */
+    _loadEncodingsForPage() {
+        if (!this.options.showEncodingColumn || this._inTrashView() || this._invalidFolderMessage || !this.tableEl) return;
+        const dir = this._currentPath;
+        const want = [];
+        for (const row of this.rows || []) {
+            if (!FmFileManagerTable._encodingApplies(row)) continue;
+            const key = this._encodingKey(row, dir);
+            if (this._encCache.has(key) || this._encPending.has(key)) continue;
+            want.push(row);
+            if (want.length >= 1000) break;
+        }
+        if (!want.length) return;
+        want.forEach((r) => this._encPending.add(this._encodingKey(r, dir)));
+        const rel = this._pathRelativeToRoot(dir) || '';
+        (async () => {
+            for (let i = 0; i < want.length; i += 200) {
+                const batch = want.slice(i, i + 200);
+                const form = new FormData();
+                form.append('action', 'encoding-info');
+                form.append('in', rel);
+                batch.forEach((r) => form.append('names[]', r.name));
+                let data = null;
+                try {
+                    data = await requireAuthFetch(this._ajaxUrl, fmPostInit(form)).then((r) => r.json());
+                } catch (e) {
+                    data = null;
+                }
+                const files = data && data.status === 'success' && Array.isArray(data.files) ? data.files : [];
+                batch.forEach((r, k) => {
+                    const key = this._encodingKey(r, dir);
+                    this._encPending.delete(key);
+                    this._encCache.set(key, files[k] || { skip: 'error' });
+                });
+                if (this._currentPath === dir) this._fillEncodingCells();
+            }
+        })();
+    }
+
+    _fillEncodingCells() {
+        if (!this.tableEl) return;
+        this.tableEl.querySelectorAll('tbody tr[data-index]').forEach((tr) => {
+            const td = tr.querySelector('td.fm-table-col-encoding');
+            const row = this.rows[Number(tr.getAttribute('data-index'))];
+            if (td && row) td.innerHTML = this._encodingCellHtml(row);
+        });
     }
 
     /**
@@ -22550,6 +24833,7 @@ class FmFileManagerTable extends FmTable {
                 getInfoForCurrentFolder: !!(payload && payload.getInfoForCurrentFolder),
             });
             case 'change-permissions': return this._handleChangePermissions({ selectedRows });
+            case 'convert-encoding':  return this._handleConvertEncoding({ selectedRows });
             case 'compress':          return this._handleCompress({ selectedRows });
             case 'extract':           return this._handleExtract({ selectedRows });
             case 'download':          return this._handleDownload({ selectedRows, selectedRow });
@@ -23253,7 +25537,37 @@ class FmFileManagerTable extends FmTable {
             fullPath = this._rowPhysicalPath(selectedRow);
         }
         if (!fullPath) return;
-        new FmGetInfoPopup({ fullPath, rootDir: this._rootDir, ajaxUrl: this._ajaxUrl }).show();
+        const isFolder = !!getInfoForCurrentFolder || (selectedRow && selectedRow.type === 'folder');
+        new FmGetInfoPopup({ fullPath, rootDir: this._rootDir, ajaxUrl: this._ajaxUrl, isFolder }).show();
+    }
+
+    /**
+     * Convert encoding: selected files only → those files; folders selected or nothing selected → scan them (or this
+     * folder). In search results without a selection: the found files.
+     * @param {{ selectedRows?: Object[] }} param0
+     * @returns {void}
+     */
+    _handleConvertEncoding({ selectedRows } = {}) {
+        if (this._inTrashView() || this._invalidFolderMessage) return;
+        let rows = (selectedRows || []).filter((r) => r && r.name);
+        const searchAll = this._inSearchView() && rows.length === 0;
+        if (searchAll) rows = (this._viewRows || []).filter((r) => r && r.type === 'file');
+        const files = rows.filter((r) => r.type === 'file').map((r) => r.name);
+        const folders = rows.filter((r) => r.type === 'folder').map((r) => r.name);
+        new FmConvertEncodingPopup({
+            currentPath: this._currentPath,
+            rootDir:     this._rootDir,
+            ajaxUrl:     this._ajaxUrl,
+            files,
+            folders,
+            folderMode:  !searchAll && (folders.length > 0 || rows.length === 0),
+            onDone:      (changed) => {
+                if (!changed) return;
+                this.load(this._currentPath, () => {
+                    this._callHook('after', 'convert-encoding', { currentPath: this._currentPath });
+                });
+            },
+        }).show();
     }
 
     /**
@@ -23608,7 +25922,14 @@ class FmFileManagerTable extends FmTable {
         const names = rows.map(r => r.name);
         if (names.length === 0) return;
 
-        const baseName = names.length === 1 ? names[0] : 'archive';
+        // One item: its name; several: the name of this folder (the root folder's own name at the root).
+        const lastPart = (p) => String(p || '').replace(/\\/g, '/').replace(/\/+$/, '').split('/').pop() || '';
+        let baseName = (names.length === 1 ? lastPart(rows[0].displayName || names[0]) : lastPart(this._currentPath)) || 'archive';
+        const taken = new Set((this._allRows || []).map((r) => lastPart(r.displayName || r.name).toLowerCase()));
+        if (taken.has((baseName + '.zip').toLowerCase())) {
+            const d = new Date();
+            baseName += '-' + d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+        }
         const defaultNameWithExt = baseName + '.zip';
 
         new FmCompressPopup({
@@ -23952,6 +26273,7 @@ class FmFileManagerTable extends FmTable {
                 { id: 'close-search', title: 'Close search results', icon: 'bi-x-lg', shortcut: sc['close-search'] },
             ];
             if (this.rows.length > 0) {
+                items.push({ type: 'separator' }, { id: 'convert-encoding', title: 'Convert encoding of the found files', icon: 'bi-translate' });
                 items.push(
                     { type: 'separator' },
                     { id: 'invert-selection', title: 'Invert selection', icon: 'bi-arrow-left-right', shortcut: sc['invert-selection'] },
@@ -23967,6 +26289,7 @@ class FmFileManagerTable extends FmTable {
             { id: 'bookmark-pin-current', title: 'Bookmark current folder', icon: 'bi-bookmark-plus', shortcut: sc['bookmark-pin-current'] },
             { id: 'bookmark-remove-current', title: 'Remove current bookmark', icon: 'bi-bookmark-x', shortcut: sc['bookmark-remove-current'] },
             { id: 'terminal-here', title: 'Open terminal here', icon: 'bi-terminal', shortcut: sc['terminal-here'] },
+            { id: 'convert-encoding', title: 'Convert encoding in this folder', icon: 'bi-translate' },
             { type: 'separator' },
             { id: 'refresh', title: 'Refresh', icon: 'bi-arrow-clockwise', shortcut: sc['refresh'] },
             { id: 'get-info', title: 'Get info', icon: 'bi-info-circle', shortcut: sc['get-info'] },
@@ -24062,6 +26385,7 @@ class FmFileManagerTable extends FmTable {
                 { id: 'move', title: 'Move', icon: 'bi-arrow-right-square', shortcut: sc['move'] },
                 { id: 'bulk-rename', title: 'Bulk rename', icon: 'bi-input-cursor', shortcut: sc['bulk-rename'] },
                 { id: 'change-permissions', title: 'Change permissions', icon: 'bi-shield-lock', shortcut: sc['change-permissions'] },
+                { id: 'convert-encoding', title: 'Convert encoding', icon: 'bi-translate' },
                 { id: 'delete', title: 'Delete', icon: 'bi-trash', shortcut: sc['delete'] },
                 { type: 'separator' },
                 { id: 'copy-path', title: 'Copy path', icon: 'bi-clipboard', shortcut: sc['copy-path'] },
@@ -24157,7 +26481,9 @@ class FmFileManagerTable extends FmTable {
                 return;
             }
             const id = it.id;
-            if (this._isContextMenuActionDisabled(id, payload)) return;
+            // Items with an explicit `disabled` (the toolbar "More" menu) are shown greyed; others are left out.
+            const disabled = typeof it.disabled === 'boolean' ? it.disabled : this._isContextMenuActionDisabled(id, payload);
+            if (disabled && typeof it.disabled !== 'boolean') return;
             if (pendingSeparator) {
                 const sep = document.createElement('div');
                 sep.className = 'fm-context-menu-sep';
@@ -24175,9 +26501,14 @@ class FmFileManagerTable extends FmTable {
                 `<span class="fm-context-menu-item-label">${this.escapeHtml(it.title)}</span>` +
                 (it.shortcut ? `<span class="fm-context-menu-item-kbd">${this.escapeHtml(it.shortcut)}</span>` : '');
             btn.title = label;
+            if (disabled) {
+                btn.disabled = true;
+                btn.classList.add('fm-context-menu-item--disabled');
+            }
             btn.addEventListener('click', (ev) => {
                 ev.preventDefault();
                 ev.stopPropagation();
+                if (disabled) return;
                 this._hideContextMenu();
                 this.handleAction(id, payload);
             });
@@ -25017,6 +27348,8 @@ function normalizePermissionsDisplay(v) {
 const defaultConfig = {
     showActionsColumn:      true,
     showLastModifiedColumn: true,
+    /** Encoding of text files, read in the background for the shown page only. */
+    showEncodingColumn:     false,
     automaticGetFoldersSize: false,
     /** When true, image files show an inline preview (original file via file-view); no server resize. */
     showImagePreviews:      false,
@@ -25487,6 +27820,48 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
             else panel.setAttribute('hidden', '');
         });
     };
+    /** Server tab values that differ from what the PHP file has now. */
+    const readServerChanges = (pop) => {
+        const opsRadio = pop.querySelector('.cfg-fileops:checked');
+        const idleSel = pop.querySelector('.cfg-idle');
+        const ipsInp = pop.querySelector('.cfg-ips');
+        const trashRadio = pop.querySelector('.cfg-trash-name:checked');
+        const nextOps = normalizeFileOpsModeUi(opsRadio ? opsRadio.value : curOps);
+        const nextIdle = idleSel ? parseInt(idleSel.value, 10) : curIdle;
+        const nextIps = ipsInp ? parseIpText(ipsInp.value) : curIps;
+        const nextTrashMode = trashRadio ? trashRadio.value : curTrashMode;
+        const c = {
+            nextOps, nextIdle, nextIps, nextTrashMode,
+            opsChanged: nextOps !== curOps,
+            idleChanged: nextIdle !== curIdle,
+            ipsChanged: nextIps.join('\n') !== curIps.join('\n'),
+            trashChanged: nextTrashMode !== curTrashMode,
+        };
+        c.any = c.opsChanged || c.idleChanged || c.ipsChanged || c.trashChanged;
+        return c;
+    };
+    const setPassInvalid = (pop, on) => {
+        const inp = pop.querySelector('[name="cfg-fileops-password"]');
+        if (!inp) return;
+        inp.classList.toggle('fm-input--invalid', on);
+        if (on) inp.setAttribute('aria-invalid', 'true');
+        else inp.removeAttribute('aria-invalid');
+    };
+    const clearServerErr = (pop) => {
+        const err = pop.querySelector('[data-cfg-fileops-error]');
+        if (err) { err.style.display = 'none'; err.textContent = ''; }
+        setPassInvalid(pop, false);
+    };
+    /** The bar holds the password (needed once a server setting changed) and the server-side error line. */
+    const syncPassBar = (pop) => {
+        const bar = pop.querySelector('.fm-cfg-pass-bar');
+        if (!bar) return;
+        const err = pop.querySelector('[data-cfg-fileops-error]');
+        const changed = readServerChanges(pop).any;
+        if (!changed) clearServerErr(pop);
+        const errShown = !!(err && err.style.display !== 'none');
+        bar.hidden = !((changed && authOn) || errShown);
+    };
     const cfgHtml =
         '<div class="fm-cfg-tabs" role="tablist" aria-label="Configuration sections">' +
         '<button type="button" class="fm-cfg-tab" role="tab" data-cfg-tab="display" aria-selected="true" aria-controls="fm-cfg-panel-display" id="fm-cfg-tab-display">Display</button>' +
@@ -25498,6 +27873,7 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
         '<p class="fm-cfg-server-desc">Saved in this browser only.</p>' +
         '<label class="fm-cfg-option"><input type="checkbox" name="cfg-actions" class="cfg-actions" ' + (config.showActionsColumn ? 'checked' : '') + '> Show row actions column</label>' +
         '<label class="fm-cfg-option"><input type="checkbox" name="cfg-mtime" class="cfg-mtime" ' + (config.showLastModifiedColumn ? 'checked' : '') + '> Show last modified column</label>' +
+        '<label class="fm-cfg-option"><input type="checkbox" name="cfg-encoding" class="cfg-encoding" ' + (config.showEncodingColumn ? 'checked' : '') + '> Show encoding column <span class="fm-cfg-perm-example">text files only; read in the background for the shown page</span></label>' +
         '<label class="fm-cfg-option"><input type="checkbox" name="cfg-auto" class="cfg-auto" ' + (config.automaticGetFoldersSize ? 'checked' : '') + '> Automatic get folders size</label>' +
         '<label class="fm-cfg-option"><input type="checkbox" name="cfg-imgprev" class="cfg-imgprev" ' + (config.showImagePreviews ? 'checked' : '') + '> Show image previews in list <span class="fm-cfg-perm-example">loads original file in the icon column; may be slow for large folders</span></label>' +
         '</fieldset>' +
@@ -25554,10 +27930,6 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
         '<label class="fm-cfg-option"><input type="radio" name="cfg-trash-name" value="default" class="cfg-trash-name" ' + (curTrashMode === 'default' ? 'checked' : '') + '> <code>.trash</code> <span class="fm-cfg-perm-example">default</span></label>' +
         '<label class="fm-cfg-option"><input type="radio" name="cfg-trash-name" value="random" class="cfg-trash-name" ' + (curTrashMode === 'random' ? 'checked' : '') + '> Random name <span class="fm-cfg-perm-example">e.g. .trash-3f9a1c2b7d4e</span></label>' +
         '</fieldset>' +
-        (authOn
-            ? '<label class="fm-cfg-fileops-pass"><span>Password <span class="fm-cfg-hint">(required to change settings on this tab)</span></span><input class="fm-input" name="cfg-fileops-password" type="password" autocomplete="current-password"></label>'
-            : '') +
-        '<p class="fm-error" data-cfg-fileops-error style="display:none"></p>' +
         '<div class="fm-pwd-hash-box" data-cfg-fileops-fallback style="display:none">' +
         '<p class="fm-hint" data-cfg-fileops-fallback-msg></p>' +
         '<textarea data-cfg-fileops-fallback-line readonly></textarea>' +
@@ -25565,6 +27937,13 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
         '<button type="button" class="fm-btn secondary" data-cfg-fileops-copy>Copy line</button>' +
         '<button type="button" class="fm-btn" data-cfg-fileops-reload>I updated the file — reload</button>' +
         '</div></div>' +
+        '</div>' +
+        // Pinned above the buttons and shown once a server setting differs, so it is seen from either tab.
+        '<div class="fm-cfg-pass-bar" hidden>' +
+        (authOn
+            ? '<label class="fm-cfg-fileops-pass"><span>Password <span class="fm-cfg-hint">(needed to save the changed server settings)</span></span><input class="fm-input" name="cfg-fileops-password" type="password" autocomplete="current-password"></label>'
+            : '') +
+        '<p class="fm-error" data-cfg-fileops-error style="display:none"></p>' +
         '</div>';
     const p = new FmPopup({
             title:'Configuration',
@@ -25577,29 +27956,34 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
                 const root = p.el;
                 const cbA = p.querySelector('.cfg-actions');
                 const cbM = p.querySelector('.cfg-mtime');
+                const cbE = p.querySelector('.cfg-encoding');
                 const cbS = p.querySelector('.cfg-auto');
                 const cbImg = p.querySelector('.cfg-imgprev');
                 const stepInp = p.querySelector('.cfg-pagestep');
                 const permRadio = p.querySelector('.cfg-perm-display:checked');
-                const opsRadio = p.querySelector('.cfg-fileops:checked');
-                const idleSel = p.querySelector('.cfg-idle');
-                const ipsInp = p.querySelector('.cfg-ips');
                 const opsPass = p.querySelector('[name="cfg-fileops-password"]');
                 const opsErr = p.querySelector('[data-cfg-fileops-error]');
                 const opsFallback = p.querySelector('[data-cfg-fileops-fallback]');
                 const opsFallbackMsg = p.querySelector('[data-cfg-fileops-fallback-msg]');
                 const opsFallbackLine = p.querySelector('[data-cfg-fileops-fallback-line]');
-                const showServerErr = (msg) => {
-                    showCfgTab(root, 'server');
+                // The message goes under the password field, in the bar pinned above the buttons.
+                const showServerErr = (msg, passProblem) => {
                     if (opsErr) {
                         opsErr.textContent = msg;
                         opsErr.style.display = 'block';
                     }
+                    syncPassBar(p);
+                    if (passProblem && opsPass) {
+                        setPassInvalid(p, true);
+                        opsPass.focus();
+                        opsPass.select();
+                    }
                 };
-                if (opsErr) { opsErr.style.display = 'none'; opsErr.textContent = ''; }
+                clearServerErr(p);
                 if (opsFallback) opsFallback.style.display = 'none';
                 if (cbA) config.showActionsColumn = cbA.checked;
                 if (cbM) config.showLastModifiedColumn = cbM.checked;
+                if (cbE) config.showEncodingColumn = cbE.checked;
                 if (cbS) config.automaticGetFoldersSize = cbS.checked;
                 if (cbImg) config.showImagePreviews = cbImg.checked;
                 if (permRadio) config.permissionsDisplay = normalizePermissionsDisplay(permRadio.value);
@@ -25611,6 +27995,7 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
                     mainTable.options.listPageSize = config.listPageSize;
                     mainTable.options.showActionsColumn = config.showActionsColumn !== false;
                     mainTable.options.showLastModifiedColumn = config.showLastModifiedColumn !== false;
+                    mainTable.options.showEncodingColumn = config.showEncodingColumn === true;
                     mainTable.options.automaticGetFoldersSize = config.automaticGetFoldersSize === true;
                     mainTable.options.pageUpDownStep = config.pageUpDownStep;
                     mainTable.options.permissionsDisplay = config.permissionsDisplay;
@@ -25618,16 +28003,8 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
                 }
                 saveConfig();
 
-                const nextOps = normalizeFileOpsModeUi(opsRadio ? opsRadio.value : curOps);
-                const nextIdle = idleSel ? parseInt(idleSel.value, 10) : curIdle;
-                const nextIps = ipsInp ? parseIpText(ipsInp.value) : curIps;
-                const trashRadio = p.querySelector('.cfg-trash-name:checked');
-                const nextTrashMode = trashRadio ? trashRadio.value : curTrashMode;
-                const opsChanged = nextOps !== curOps;
-                const idleChanged = nextIdle !== curIdle;
-                const ipsChanged = nextIps.join('\n') !== curIps.join('\n');
-                const trashChanged = nextTrashMode !== curTrashMode;
-                if (!opsChanged && !idleChanged && !ipsChanged && !trashChanged) {
+                const { nextOps, nextIdle, nextIps, nextTrashMode, opsChanged, idleChanged, ipsChanged, trashChanged, any } = readServerChanges(p);
+                if (!any) {
                     p.hideAndDestroy();
                     fetchAndShowFolder(currentPath);
                     return;
@@ -25637,7 +28014,7 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
                     return;
                 }
                 if (authOn && (!opsPass || !(opsPass.value || '').length)) {
-                    showServerErr('Password is required to change server settings.');
+                    showServerErr('Enter your password to save the server settings.', true);
                     return;
                 }
                 const passVal = opsPass ? (opsPass.value || '') : '';
@@ -25647,6 +28024,7 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
                         opsFallbackMsg.textContent = msg || 'Edit the script manually:';
                         opsFallbackLine.value = line || '';
                         opsFallback.style.display = 'block';
+                        opsFallback.scrollIntoView({ block: 'nearest' });
                     }
                 };
                 const runSave = (action, fields) => {
@@ -25696,7 +28074,8 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
                         if (!ok) return false;
                         return runSave(step.action, step.fields).then((data) => {
                             if (!data || data.status !== 'success') {
-                                showServerErr((data && data.msg) || step.errMsg);
+                                const msg = (data && data.msg) || step.errMsg;
+                                showServerErr(msg, /password is incorrect|invalid password/i.test(msg));
                                 return false;
                             }
                             if (!data.saved) {
@@ -25719,6 +28098,12 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
                     showCfgTab(root, btn.getAttribute('data-cfg-tab') || 'display');
                 });
             });
+            root.querySelectorAll('.cfg-fileops, .cfg-idle, .cfg-ips, .cfg-trash-name').forEach((el) => {
+                el.addEventListener('change', () => syncPassBar(p));
+                el.addEventListener('input', () => syncPassBar(p));
+            });
+            const passEl = root.querySelector('[name="cfg-fileops-password"]');
+            if (passEl) passEl.addEventListener('input', () => setPassInvalid(p, false));
             const addMineBtn = root.querySelector('[data-cfg-ip-add-mine]');
             const ipsEl = root.querySelector('.cfg-ips');
             if (addMineBtn && ipsEl && clientIp) {
@@ -25727,6 +28112,7 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
                     if (!list.includes(clientIp.toLowerCase())) list.push(clientIp.toLowerCase());
                     ipsEl.value = list.join('\n');
                     ipsEl.focus();
+                    syncPassBar(p);
                 });
             }
             const copyBtn = p.querySelector('[data-cfg-fileops-copy]');
@@ -25952,6 +28338,7 @@ window.addEventListener('hashchange', () => {
         sortDir: config.sortDir || 'asc',
         showActionsColumn: config.showActionsColumn !== false,
         showLastModifiedColumn: config.showLastModifiedColumn !== false,
+        showEncodingColumn: config.showEncodingColumn === true,
         automaticGetFoldersSize: config.automaticGetFoldersSize === true,
         showImagePreviews: config.showImagePreviews === true,
         permissionsDisplay: normalizePermissionsDisplay(config.permissionsDisplay),

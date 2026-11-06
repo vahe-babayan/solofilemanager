@@ -273,6 +273,10 @@ file_put_contents($cs . '/bin.dat', "abc\0hello");
 file_put_contents($cs . '/cp1251.txt', "\xcf\xf0\xe8 hello\n");
 file_put_contents($cs . '/nonl.txt', 'x hello');
 file_put_contents($cs . '/long.txt', str_repeat('a', 70000) . "hello\nnext hello");
+$legacyText = "Первая строка отчёта за квартал.\nБюджет на 2026 год утверждён советом.\n";
+file_put_contents($cs . '/koi8.txt', iconv('UTF-8', 'KOI8-R', $legacyText));
+file_put_contents($cs . '/u16.txt', "\xFF\xFE" . iconv('UTF-8', 'UTF-16LE', $legacyText));
+file_put_contents($cs . '/u16-nobom.txt', iconv('UTF-8', 'UTF-16BE', $legacyText));
 /** Content search below $cs: [path => match]. */
 $contentSearch = static function (array $post, ?callable $tune = null) use ($cs) {
     $c = fmSearchCriteria($post);
@@ -297,7 +301,14 @@ check('line number and snippet without indentation', ($r['a.txt'] ?? null) === [
 check('line without a final newline', ($r['nonl.txt']['line'] ?? 0) === 1 && ($r['nonl.txt']['text'] ?? '') === 'x hello');
 check('long line checked in parts, still line 1, snippet cut at the start', ($r['long.txt']['line'] ?? 0) === 1 && strpos($r['long.txt']['text'] ?? '', '…') === 0
     && mb_substr($r['long.txt']['text'], $r['long.txt']['at'], 5) === 'hello');
-check('non-UTF-8 line matched byte by byte, its bytes shown as ?', ($r['cp1251.txt']['text'] ?? '') === '??? hello');
+check('legacy line decoded before matching, encoding reported', ($r['cp1251.txt']['text'] ?? '') === 'При hello'
+    && ($r['cp1251.txt']['encoding']['name'] ?? '') === 'Windows-1251' && !isset($r['a.txt']['encoding']), json_encode($r['cp1251.txt'] ?? null, JSON_UNESCAPED_UNICODE));
+$r = $contentSearch(['content' => 'бюджет']);
+check('Cyrillic found in KOI8-R and UTF-16 files (with and without BOM)', array_keys((array)$r) === ['koi8.txt', 'u16-nobom.txt', 'u16.txt'], json_encode($r, JSON_UNESCAPED_UNICODE));
+check('decoded match: line number, text and encoding', ($r['koi8.txt']['line'] ?? 0) === 2 && strpos($r['koi8.txt']['text'] ?? '', 'Бюджет на 2026') === 0
+    && ($r['koi8.txt']['encoding']['name'] ?? '') === 'KOI8-R' && ($r['u16.txt']['line'] ?? 0) === 2 && ($r['u16.txt']['encoding']['how'] ?? '') === 'bom'
+    && ($r['u16-nobom.txt']['encoding']['name'] ?? '') === 'UTF-16BE', json_encode($r, JSON_UNESCAPED_UNICODE));
+check('short binary data with NUL bytes is not taken for UTF-16', fmDetectEncoding("abc\0hello")['how'] === 'binary');
 check('case-sensitive text', array_keys((array)$contentSearch(['content' => 'Hello', 'content_icase' => '0'])) === ['a.txt']);
 $r = $contentSearch(['content' => 'привет']);
 check('Cyrillic, ignore case', array_keys((array)$r) === ['sub/ru.txt'] && ($r['sub/ru.txt']['line'] ?? 0) === 2 && ($r['sub/ru.txt']['len'] ?? 0) === 6, json_encode($r, JSON_UNESCAPED_UNICODE));
@@ -320,6 +331,135 @@ if ($haveSearchLink) {
 }
 check('find: text search keeps files and links only', in_array('-type', fmSearchFindArgv($cs, false, fmSearchCriteria(['content' => 'x'])), true)
     && !in_array('-type', fmSearchFindArgv($cs, false, fmSearchCriteria(['name' => 'x'])), true));
+
+section('Encodings');
+$encList = fmEncodingList();
+check('the server converts the main encodings', !array_diff(['UTF-8', 'UTF-16LE', 'UTF-16BE', 'Windows-1251', 'KOI8-R', 'CP866', 'Windows-1252', 'ARMSCII-8'], $encList), implode(',', $encList));
+$ru = "Привет! Это тестовый текст для проверки кодировки. Бюджет на 2026 год утверждён, отчёт готов.\nВторая строка: съешь же ещё этих мягких французских булок, да выпей чаю.\n";
+$texts = [
+    'fr' => "Le café est très bon. Où est la bibliothèque? Ça va très bien, merci. Garçon, l'addition s'il vous plaît.\n",
+    'de' => "Die Größe der Straße ist schön. Über den Fluss führt eine Brücke. Mädchen und Jungen spielen im Garten.\n",
+    'hy' => "Բարեւ ձեզ։ Սա փորձնական տեքստ է կոդավորման ստուգման համար։ Հայաստանը գեղեցիկ երկիր է, Երեւանը մայրաքաղաքն է։\n",
+    'ru' => $ru,
+];
+$detect = static fn(string $text, string $enc): array => fmDetectEncoding((string)fmEncodingConvert($text, 'UTF-8', $enc));
+check('BOM: UTF-8, UTF-16LE, UTF-16BE', fmDetectEncoding("\xEF\xBB\xBFabc") === ['encoding' => 'UTF-8', 'how' => 'bom', 'bom' => 3]
+    && fmDetectEncoding("\xFF\xFEa\0")['encoding'] === 'UTF-16LE' && fmDetectEncoding("\xFE\xFF\0a")['encoding'] === 'UTF-16BE');
+check('ASCII and valid UTF-8 are certain', fmDetectEncoding("plain text\n")['how'] === 'ascii' && fmDetectEncoding($ru) === ['encoding' => 'UTF-8', 'how' => 'utf8', 'bom' => 0]);
+check('a character cut at the end of a sample is still UTF-8', fmDetectEncoding(substr('ёж', 0, 3), true)['encoding'] === 'UTF-8');
+check('UTF-16 without BOM (LE and BE)', $detect($ru, 'UTF-16LE')['encoding'] === 'UTF-16LE' && $detect($ru, 'UTF-16BE')['encoding'] === 'UTF-16BE');
+check('binary data', fmDetectEncoding(str_repeat("\x00\x01\x02\x03\xFF\xFE\x10\x00", 50))['how'] === 'binary');
+foreach ([['ru', 'Windows-1251'], ['ru', 'KOI8-R'], ['ru', 'CP866'], ['fr', 'Windows-1252'], ['de', 'Windows-1252'], ['hy', 'ARMSCII-8']] as [$lang, $enc]) {
+    $d = $detect($texts[$lang], $enc);
+    check("guess: $lang in $enc", $d['encoding'] === $enc && $d['how'] === 'guess', json_encode($d));
+}
+check('guess: one short Russian word', $detect("Счёт\n", 'Windows-1251')['encoding'] === 'Windows-1251');
+check('strict: Cyrillic does not exist in Windows-1252', fmEncodingConvert('Привет', 'UTF-8', 'Windows-1252') === null);
+check('strict: invalid UTF-8 refused', fmEncodingConvert("ab\xFF", 'UTF-8', 'Windows-1251') === null);
+check('round trip through KOI8-R and UTF-16LE', fmEncodingConvert((string)fmEncodingConvert($ru, 'UTF-8', 'KOI8-R'), 'KOI8-R', 'UTF-8') === $ru
+    && fmEncodingConvert((string)fmEncodingConvert($ru, 'UTF-8', 'UTF-16LE'), 'UTF-16LE', 'UTF-8') === $ru);
+check('line endings detected', [fmDetectEol("a\r\nb\r\n"), fmDetectEol("a\nb"), fmDetectEol("a\rb"), fmDetectEol("a\r\nb\n"), fmDetectEol('x')] === ['crlf', 'lf', 'cr', 'mixed', 'none']);
+check('line endings changed', fmEolConvert("a\r\nb\nc\rd", 'lf') === "a\nb\nc\nd" && fmEolConvert("a\nb\r\nc\r", 'crlf') === "a\r\nb\r\nc\r\n" && fmEolConvert("a\r\n", 'keep') === "a\r\n");
+$ed = $root . '/enc';
+mkdir($ed . '/sub', 0775, true);
+file_put_contents($ed . '/report.utf8.txt', 'x');
+check('copy name: free name, extension kept, Windows-125x as cp125x', fmEncodingCopyName($ed, 'report.txt', 'UTF-8') === 'report.utf8 (1).txt'
+    && fmEncodingCopyName($ed, 'README', 'Windows-1251') === 'README.cp1251' && fmEncodingCopyName($ed, 'a.b.txt', 'UTF-16LE') === 'a.b.utf16le.txt');
+unlink($ed . '/report.utf8.txt');
+$cp = (string)fmEncodingConvert(str_replace("\n", "\r\n", $ru), 'UTF-8', 'Windows-1251');
+file_put_contents($ed . '/a.txt', $cp);
+file_put_contents($ed . '/b.php', $cp);
+file_put_contents($ed . '/c.txt', $ru);
+file_put_contents($ed . '/d.txt', "plain\n");
+file_put_contents($ed . '/sub/e.txt', $cp);
+file_put_contents($ed . '/f.bin', str_repeat("\x00\x01\x02\xFF", 100));
+$info = fmEncodingFileInfo($ed . '/a.txt', $root);
+check('file info: encoding, how, line endings, size', $info === ['size' => strlen($cp), 'encoding' => 'Windows-1251', 'how' => 'guess', 'eol' => 'crlf'], json_encode($info));
+check('file info: binary skipped', fmEncodingFileInfo($ed . '/f.bin', $root)['skip'] === 'binary');
+if ($haveLink) {
+    check('file info: link skipped', fmEncodingFileInfo($root . '/out-link', $root)['skip'] === 'link');
+}
+/** Paths found by the encoding scan below $ed. */
+$scanEnc = static function (string $mask, bool $notUtf8, bool $recursive = true) use ($ed, $root): array {
+    $c = fmEncodingScanCriteria($mask, $notUtf8);
+    $paths = [];
+    $scanned = 0;
+    fmSearchWalkPhp($ed, false, $root, $c, [], static function (array $r) use (&$paths): bool {
+        $paths[] = $r['path'];
+        return isset($r['encoding']['name']);
+    }, static fn() => true, $scanned, $recursive);
+    sort($paths);
+    return $paths;
+};
+check('scan: not UTF-8 in all subfolders, binary left out', $scanEnc('', true) === ['a.txt', 'b.php', 'sub/e.txt']);
+check('scan: name mask, letter case ignored', $scanEnc('*.TXT', true) === ['a.txt', 'sub/e.txt']);
+check('scan: two masks without subfolders', $scanEnc('*.txt; *.php', true, false) === ['a.txt', 'b.php']);
+check('scan: all text files', $scanEnc('*', false) === ['a.txt', 'b.php', 'c.txt', 'd.txt', 'sub/e.txt']);
+$findEnc = static function (string $enc) use ($ed, $root) {
+    $c = fmSearchCriteria(['encoding' => $enc]);
+    if (isset($c['error'])) {
+        return $c['error'];
+    }
+    $paths = [];
+    $scanned = 0;
+    fmSearchWalkPhp($ed, false, $root, $c, [], static function (array $r) use (&$paths): bool {
+        $paths[] = $r['path'] . ':' . $r['encoding']['name'];
+        return true;
+    }, static fn() => true, $scanned);
+    sort($paths);
+    return $paths;
+};
+check('Find: encoding not UTF-8 (folders left out)', $findEnc('not_utf8') === ['a.txt:Windows-1251', 'b.php:Windows-1251', 'sub/e.txt:Windows-1251']);
+check('Find: UTF-8 includes ASCII', $findEnc('utf-8') === ['c.txt:UTF-8', 'd.txt:ASCII']);
+check('Find: unknown encoding reported', is_string($findEnc('EBCDIC-XYZ')));
+check('find(1): encoding filter keeps files and links only', in_array('-type', fmSearchFindArgv($ed, false, fmSearchCriteria(['encoding' => 'not_utf8'])), true));
+$r = fmEncodingConvertFile($ed . '/a.txt', $root, 'auto', 'UTF-8', false, 'lf', 'replace');
+check('convert: replace, detected source, line endings to LF', ($r['status'] ?? '') === 'converted' && $r['from'] === 'Windows-1251' && file_get_contents($ed . '/a.txt') === $ru, json_encode($r));
+check('convert: the same again is "already"', fmEncodingConvertFile($ed . '/a.txt', $root, 'auto', 'UTF-8', false, 'lf', 'replace')['status'] === 'already');
+$r = fmEncodingConvertFile($ed . '/b.php', $root, 'Windows-1251', 'UTF-8', true, 'keep', 'copy');
+check('convert: copy with BOM, original untouched', ($r['new_name'] ?? '') === 'b.utf8.php' && file_get_contents($ed . '/b.utf8.php') === "\xEF\xBB\xBF" . str_replace("\n", "\r\n", $ru)
+    && file_get_contents($ed . '/b.php') === $cp, json_encode($r));
+$r = fmEncodingConvertFile($ed . '/c.txt', $root, 'auto', 'Windows-1252', false, 'keep', 'replace');
+check('convert: characters missing in the target fail and leave the file', $r['status'] === 'failed' && file_get_contents($ed . '/c.txt') === $ru, json_encode($r));
+$r = fmEncodingConvertFile($ed . '/b.php', $root, 'UTF-8', 'Windows-1251', false, 'keep', 'replace');
+check('convert: a chosen source the file is not valid in fails and leaves the file', $r['status'] === 'failed' && file_get_contents($ed . '/b.php') === $cp, json_encode($r));
+check('convert: binary skipped', fmEncodingConvertFile($ed . '/f.bin', $root, 'auto', 'UTF-8', false, 'keep', 'replace')['status'] === 'skipped');
+check('convert: no temp files left', glob($ed . '/.fm-conv-*') === []);
+
+section('Archive jobs and status files');
+check('zip output: files counted, folders and messages not', [
+    fmArchiverOutputFile('  adding: docs/report.txt (deflated 61%)'), fmArchiverOutputFile('  adding: docs/ (stored 0%)'),
+    fmArchiverOutputFile('updating: a b.txt (stored 0%)'), fmArchiverOutputFile('zip warning: name not matched: x'), fmArchiverOutputFile(''),
+] === ['docs/report.txt', null, 'a b.txt', null, null]);
+check('tar -v output (GNU and bsdtar)', [fmArchiverOutputFile('docs/'), fmArchiverOutputFile('docs/a.txt'), fmArchiverOutputFile('a docs/b.txt'), fmArchiverOutputFile('tar: Removing leading `/\'')]
+    === [null, 'docs/a.txt', 'docs/b.txt', null]);
+$stateDir = fmStateDir();
+check('status folder found and writable', is_string($stateDir) && fmDirAcceptsFiles($stateDir), (string)$stateDir);
+$lines = [];
+$ticks = 0;
+$php = escapeshellarg(PHP_BINARY);
+file_put_contents($base . '/fake-zip.php', '<?php echo "  adding: one.txt (stored 0%)\n"; usleep(600000); echo "  adding: two.txt (deflated 10%)\n"; fwrite(STDERR, "warn\n");');
+[$code, $tail] = fmRunArchiver($php . ' ' . escapeshellarg($base . '/fake-zip.php'),
+    static function (string $l) use (&$lines): void { $lines[] = $l; }, static function () use (&$ticks): void { $ticks++; });
+check('archiver runner: output lines while running, stderr too, exit code, ticks', $code === 0 && $lines === ['  adding: one.txt (stored 0%)', '  adding: two.txt (deflated 10%)', 'warn']
+    && $ticks >= 1 && strpos($tail, 'warn') !== false, json_encode([$code, $lines, $ticks]));
+[$code] = fmRunArchiver($php . ' -r ' . escapeshellarg('exit(3);'), static function (): void {}, static function (): void {});
+check('archiver runner: failing command reports its exit code', $code === 3);
+check('archiver runner leaves no output files', glob($stateDir . '/fm-arcout-*') === []);
+check('service folders at the root are known', fmIsServiceName('.fm-state') && fmIsServiceName('.fm-upload-tmp') && !fmIsServiceName('.trash'));
+$gzSrc = random_bytes(1500000) . str_repeat('text ', 200000);
+file_put_contents($base . '/big.tar', $gzSrc);
+$calls = [];
+fmGzipFileWithProgress($base . '/big.tar', $base . '/big.tar.gz', static function (int $done, int $all) use (&$calls): void { $calls[] = [$done, $all]; });
+check('gzip in PHP: the same data back, progress per MB up to the full size',
+    gzdecode((string)file_get_contents($base . '/big.tar.gz')) === $gzSrc && count($calls) === 3 && end($calls) === [strlen($gzSrc), strlen($gzSrc)], json_encode($calls));
+$gzErr = '';
+try {
+    fmGzipFileWithProgress($base . '/missing.tar', $base . '/missing.tar.gz', static function (): void {});
+} catch (RuntimeException $e) {
+    $gzErr = $e->getMessage();
+}
+check('gzip in PHP: a missing source is an error and writes nothing', $gzErr !== '' && !file_exists($base . '/missing.tar.gz'), $gzErr);
 
 section('Item names from names[]');
 check('plain name', fmRequestItemName('a.txt') === 'a.txt');

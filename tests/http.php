@@ -301,6 +301,115 @@ try {
     }
     @unlink($outside . '/report-outside.txt');
 
+    section('Archive jobs');
+    mkdir($dirA . '/arc/inner', 0775, true);
+    file_put_contents($dirA . '/arc/inner/a.txt', str_repeat('a', 5000));
+    file_put_contents($dirA . '/arc/b.txt', 'b');
+    $tok = bin2hex(random_bytes(16));
+    [, $body] = $br->post($u('a'), ['action' => 'compress', 'in' => 'arc', 'names[]' => ['inner', 'b.txt'], 'archive_name' => 'arc', 'archive_type' => 'zip', 'total' => '2', 'dl_token' => $tok]);
+    $lines = $ndjson($body);
+    $last = end($lines) ?: [];
+    check('compress streams progress and ends with done', !empty($last['done']) && !array_filter($lines, static fn($l) => isset($l['error'])) && is_file($dirA . '/arc/arc.zip'), $body);
+    [, $body] = $br->req($u('a') . '?action=download-status&token=' . $tok);
+    check('compress job status is done (read after a dropped connection)', strpos($body, '"state":"done"') !== false && strpos($body, '"items":') !== false, $body);
+    $tok = bin2hex(random_bytes(16));
+    [, $body] = $br->post($u('a'), ['action' => 'compress', 'in' => 'arc', 'names[]' => 'b.txt', 'archive_name' => 'arc', 'archive_type' => 'zip', 'dl_token' => $tok]);
+    [, $st] = $br->req($u('a') . '?action=download-status&token=' . $tok);
+    check('a failed job keeps its reason in the status', strpos($body, 'already exists') !== false && strpos($st, '"state":"error"') !== false && strpos($st, 'already exists') !== false, $st);
+    [, $body] = $br->req($u('a') . '?action=download-status&token=' . bin2hex(random_bytes(16)));
+    check('unknown job token is pending', strpos($body, '"state":"pending"') !== false, $body);
+    [, $body] = $br->post($u('a'), ['action' => 'compress', 'in' => 'arc', 'names[]' => 'b.txt', 'archive_name' => 'other.zip', 'archive_type' => 'tar']);
+    check('archive name with another archive extension gets the right one', is_file($dirA . '/arc/other.tar') && !file_exists($dirA . '/arc/other.zip.tar'), $body);
+    $tok = bin2hex(random_bytes(16));
+    [, $body] = $br->post($u('a'), ['action' => 'compress', 'in' => 'arc', 'names[]' => ['inner', 'b.txt'], 'archive_name' => 'gz', 'archive_type' => 'gzip', 'total' => '2', 'dl_token' => $tok]);
+    $lines = $ndjson($body);
+    $last = end($lines) ?: [];
+    $counts = array_values(array_filter(array_map(static fn($l) => $l['n'] ?? null, $lines), static fn($n) => $n !== null));
+    check('PHP tar.gz is written in one pass and counts files', !empty($last['done']) && end($counts) === 2 && strpos($body, 'Writing and compressing') !== false, $body);
+    $gzEntries = [];
+    try {
+        foreach (new RecursiveIteratorIterator(new PharData($dirA . '/arc/gz.tar.gz')) as $f) {
+            $gzEntries[] = str_replace('\\', '/', substr($f->getPathname(), strpos($f->getPathname(), 'gz.tar.gz') + 10));
+        }
+    } catch (Throwable $e) {
+        $gzEntries = [$e->getMessage()];
+    }
+    sort($gzEntries);
+    check('PHP tar.gz keeps folder paths and leaves no .tar', $gzEntries === ['b.txt', 'inner/a.txt'] && !file_exists($dirA . '/arc/gz.tar'), implode(', ', $gzEntries));
+    [, $body] = $br->post($u('a'), ['action' => 'compress', 'in' => 'arc', 'names[]' => 'inner', 'archive_name' => 'plain', 'archive_type' => 'tar']);
+    $tarEntries = [];
+    try {
+        foreach (new RecursiveIteratorIterator(new PharData($dirA . '/arc/plain.tar')) as $f) {
+            $tarEntries[] = str_replace('\\', '/', substr($f->getPathname(), strpos($f->getPathname(), 'plain.tar') + 10));
+        }
+    } catch (Throwable $e) {
+        $tarEntries = [$e->getMessage()];
+    }
+    check('PHP tar keeps the folder name in paths', $tarEntries === ['inner/a.txt'], implode(', ', $tarEntries) . ' ' . $body);
+    @mkdir($dirA . '/.fm-state');
+    [, $body] = $br->req($u('a') . '?action=open&folder=' . rawurlencode($dirA));
+    check('.fm-state is not listed at the root', strpos($body, '.fm-state') === false, substr($body, 0, 300));
+    @rmdir($dirA . '/.fm-state');
+
+    section('Convert encoding');
+    $ruText = "Бюджет на 2026 год утверждён.\nОтчёт готов, счёт оплачен.\n";
+    $ruCp = (string)iconv('UTF-8', 'Windows-1251', $ruText);
+    mkdir($dirA . '/enc/deep', 0775, true);
+    file_put_contents($dirA . '/enc/ru.txt', $ruCp);
+    file_put_contents($dirA . '/enc/deep/old.txt', $ruCp);
+    file_put_contents($dirA . '/enc/u.txt', $ruText);
+    file_put_contents($dirA . '/enc/plain.txt', "plain\n");
+    file_put_contents($dirA . '/enc/bin.dat', str_repeat("\x00\x01\x02\xFF", 64));
+    file_put_contents($outside . '/o.txt', $ruCp);
+    $eLink = makeDirLink($dirA . '/enc/out', $outside);
+    [, $body] = $br->post($u('a'), ['action' => 'encoding-info', 'in' => 'enc', 'names[]' => ['ru.txt', 'u.txt', 'bin.dat', '../x.txt']]);
+    $info = json_decode($body, true) ?: [];
+    $byName = array_column($info['files'] ?? [], null, 'name');
+    check('info: detected encodings, binary and invalid names skipped', ($byName['ru.txt']['encoding'] ?? '') === 'Windows-1251' && ($byName['u.txt']['encoding'] ?? '') === 'UTF-8'
+        && ($byName['bin.dat']['skip'] ?? '') === 'binary' && ($byName['x.txt']['skip'] ?? '') === 'invalid' && in_array('ARMSCII-8', $info['encodings'] ?? [], true), $body);
+    [, $body] = $br->post($u('a'), ['action' => 'encoding-scan', 'in' => 'enc']);
+    $lines = $ndjson($body);
+    $last = end($lines) ?: [];
+    check('scan: files not in UTF-8 in all subfolders, links not followed', $found($lines) === ['deep/old.txt', 'ru.txt'] && !empty($last['done']), $body);
+    [, $body] = $br->post($u('a'), ['action' => 'encoding-scan', 'in' => '', 'names[]' => 'enc', 'recursive' => '0', 'not_utf8' => '0', 'mask' => '*.txt']);
+    check('scan: a selected folder, no subfolders, all text files', $found($ndjson($body)) === ['enc/plain.txt', 'enc/ru.txt', 'enc/u.txt'], $body);
+    [, $body] = $br->post($u('a'), ['action' => 'encoding-scan', 'in' => '', 'names[]' => '../..']);
+    check('scan: .. refused', strpos($body, 'Invalid name') !== false, $body);
+    [, $body] = $br->post($u('a'), ['action' => 'encoding-preview', 'in' => 'enc', 'name' => 'ru.txt', 'from' => 'auto', 'to' => 'UTF-8']);
+    $prev = json_decode($body, true) ?: [];
+    check('preview: text after decoding', ($prev['after'][0] ?? '') === 'Бюджет на 2026 год утверждён.' && ($prev['from'] ?? '') === 'Windows-1251' && strpos($prev['now'][0] ?? '', '?') !== false, $body);
+    [, $body] = $br->post($u('a'), ['action' => 'encoding-convert', 'in' => 'enc', 'names[]' => 'ru.txt', 'from' => 'auto', 'to' => 'UTF-8', 'mode' => 'copy']);
+    check('convert: copy next to the file, original untouched', strpos($body, '"new_name":"ru.utf8.txt"') !== false && @file_get_contents($dirA . '/enc/ru.utf8.txt') === $ruText
+        && file_get_contents($dirA . '/enc/ru.txt') === $ruCp, $body);
+    [, $body] = $br->post($u('a'), ['action' => 'encoding-convert', 'in' => 'enc', 'names[]' => ['ru.txt', 'deep/old.txt', 'plain.txt', 'bin.dat', '../zz.txt'], 'from' => 'auto', 'to' => 'UTF-8', 'eol' => 'crlf']);
+    $res = array_column((json_decode($body, true) ?: [])['files'] ?? [], 'status', 'name');
+    check('convert: replace in place (also below the folder), CRLF', file_get_contents($dirA . '/enc/ru.txt') === str_replace("\n", "\r\n", $ruText)
+        && file_get_contents($dirA . '/enc/deep/old.txt') === str_replace("\n", "\r\n", $ruText) && ($res['ru.txt'] ?? '') === 'converted', $body);
+    check('convert: binary and .. skipped, the rest reported', ($res['bin.dat'] ?? '') === 'skipped' && ($res['zz.txt'] ?? '') === 'skipped' && ($res['plain.txt'] ?? '') === 'converted' && file_get_contents($dirA . '/enc/plain.txt') === "plain\r\n" && count($res) === 5, $body);
+    [, $body] = $br->post($u('a'), ['action' => 'encoding-convert', 'in' => 'enc', 'names[]' => 'u.txt', 'from' => 'auto', 'to' => 'Windows-1252']);
+    check('convert: characters missing in the target fail, file untouched', strpos($body, '"status":"failed"') !== false && file_get_contents($dirA . '/enc/u.txt') === $ruText, $body);
+    [, $body] = $br->post($u('a'), ['action' => 'encoding-convert', 'in' => 'enc', 'names[]' => 'u.txt', 'from' => 'auto', 'to' => 'UTF-8']);
+    check('convert: already in the target encoding', strpos($body, '"status":"already"') !== false, $body);
+    file_put_contents($dirA . '/enc/legacy.txt', $ruCp);
+    [, $body] = $br->req($u('a') . '?action=get-info&path=' . rawurlencode($dirA . '/enc/legacy.txt'));
+    $gi = json_decode($body, true) ?: [];
+    check('Get info: a file reports its encoding', ($gi['encoding']['encoding'] ?? '') === 'Windows-1251' && ($gi['encoding']['how'] ?? '') === 'guess', $body);
+    [, $body] = $br->post($u('a'), ['action' => 'search', 'in' => 'enc', 'content' => 'счёт']);
+    $hit = array_values(array_filter(array_merge(...array_map(static fn($l) => $l['items'] ?? [], $ndjson($body))), static fn($it) => $it['path'] === 'legacy.txt'))[0] ?? [];
+    check('Find: text found in a Windows-1251 file, line decoded', ($hit['match']['encoding']['name'] ?? '') === 'Windows-1251' && strpos($hit['match']['text'] ?? '', 'счёт оплачен') !== false, $body);
+    unlink($dirA . '/enc/legacy.txt');
+    [, $body] = $br->post($u('a'), ['action' => 'encoding-convert', 'in' => 'enc', 'names[]' => 'u.txt', 'from' => 'auto', 'to' => 'EBCDIC-XYZ']);
+    check('convert: unknown encoding refused', strpos($body, 'cannot convert') !== false, $body);
+    if ($eLink) {
+        [, $body] = $br->post($u('a'), ['action' => 'encoding-convert', 'in' => 'enc', 'names[]' => 'out/o.txt', 'from' => 'auto', 'to' => 'UTF-8']);
+        check('convert: a file through a link to outside the root is not touched', strpos($body, '"status":"skipped"') !== false && file_get_contents($outside . '/o.txt') === $ruCp, $body);
+        rmTree($dirA . '/enc/out');
+    }
+    @unlink($outside . '/o.txt');
+    check('convert: no temp files left', glob($dirA . '/enc/.fm-conv-*') === [] && glob($dirA . '/enc/deep/.fm-conv-*') === []);
+    [, $body] = $br->post($u('a'), ['action' => 'search', 'in' => 'enc', 'encoding' => 'not_utf8']);
+    check('Find: encoding filter after the conversion finds nothing', $found($ndjson($body)) === [], $body);
+
     section('Random trash folder name');
     file_put_contents($dirA . '/up/to-trash.txt', 'T');
     $br->post($u('a'), ['action' => 'trash-move', 'in' => 'up', 'names[]' => 'to-trash.txt']);
