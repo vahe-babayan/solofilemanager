@@ -2,6 +2,16 @@
 
 All notable changes to SoloFileManager are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.8.2] - 2026-11-07
+
+### Changed
+
+- Simpler first run: right after the rename the page asks you to set your password and logs you in. The step where you logged in with the default password `admin` is gone. If two browsers set it at the same moment, the second one is told the password is already set instead of replacing it
+
+### Security
+
+- A copy that was not renamed yet (still `solofilemanager.php`) answered file actions without a password: anyone who opened it could list, download or change files before the first-run rename. Until the rename, the only accepted action is now the rename itself
+
 ## [1.8.1] - 2026-11-07
 
 ### Added

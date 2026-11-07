@@ -6,7 +6,7 @@ Manage files directly from your browser — without installing WordPress, Larave
 
 ### One PHP file. No installation. No database.
 
-Current version: **1.8.1** — see [CHANGELOG.md](CHANGELOG.md)
+Current version: **1.8.2** — see [CHANGELOG.md](CHANGELOG.md)
 
 ## Why SoloFileManager?
 
@@ -129,7 +129,7 @@ Current version: **1.8.1** — see [CHANGELOG.md](CHANGELOG.md)
 1. Copy `solofilemanager.php` into the directory you want to manage (or into a web-accessible folder pointing at your target root).
 2. Open it in the browser, e.g. `http://localhost/solofilemanager.php`
 3. On first run, SoloFileManager asks you to **rename** the file. You can pick a pure random name (harder to find) or a `solofilemanager_`-prefixed name (easier to spot in the folder).
-4. Log in with the default password **`admin`**. SoloFileManager then asks you to **set a new password** (new + confirm only — no need to retype `admin`). It tries to update `$PASSWORD_HASH` in the same PHP file; if the file is not writable, it shows a hash to paste manually. You can change the password later from the key icon in the header.
+4. Right after the rename, SoloFileManager asks you to **set your password** (new + confirm) and logs you in; there is no login with a default password. It tries to update `$PASSWORD_HASH` in the same PHP file; if the file is not writable, it shows a hash to paste manually. Until a password is set, whoever opens the file can set it, so finish these steps right after uploading. You can change the password later from the key icon in the header.
 
 ### Requirements
 
@@ -213,7 +213,7 @@ Paste the result into `$PASSWORD_HASH` near the top of the script.
 
 SoloFileManager can create, rename, and delete files. Treat it as **high risk** if exposed on the public internet.
 
-- Keep `$ENABLE_AUTH = true` and change the default `admin` password on first login
+- Keep `$ENABLE_AUTH = true` and set your password on first open (right after the rename)
 - Do not rely on the random filename alone
 - Prefer HTTPS, IP allowlists, and/or HTTP Basic Auth at the web server. If you cannot change the web server config (shared hosting), use the built-in `$FM_ALLOWED_IPS` allowlist
 - Built in: CSRF token on every state-changing request; session cookie is `HttpOnly` + `SameSite=Lax` and separate for each installation; changing the password logs out other sessions
@@ -226,7 +226,7 @@ The `tests/` folder is for development only (it is not included in release archi
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). Latest: **1.8.1** — popups can be moved by their title bar, Get info shows a summary for several selected items, and actions on more than about 1,000 selected items no longer handle only the first ~1,000.
+See [CHANGELOG.md](CHANGELOG.md). Latest: **1.8.2** — security fix: a copy that was not renamed yet answered file actions without a password; the first run is simpler (rename, then set your password, no login with `admin`).
 
 ## License
 

@@ -155,6 +155,12 @@ check('password fingerprint differs per hash', fmPasswordFingerprint('a') !== fm
 check('password fingerprint is stable', fmPasswordFingerprint('a') === fmPasswordFingerprint('a'));
 $adminHash = password_hash('admin', PASSWORD_DEFAULT);
 $otherHash = password_hash('not-admin-123', PASSWORD_DEFAULT);
+$hashLine = '$PASSWORD_HASH = \'' . $adminHash . '\';';
+preg_match('/(\$PASSWORD_HASH\s*=\s*)([\'"])([^\'"]*)\2(\s*;)/', $hashLine, $hm);
+check('password line: replaced while it still holds the expected hash',
+    fmPasswordHashReplacement($hm, $otherHash, $adminHash) === '$PASSWORD_HASH = \'' . $otherHash . '\';');
+check('password line: left alone when another browser set it meanwhile', fmPasswordHashReplacement($hm, $otherHash, $otherHash) === null);
+check('password line: no expected hash = always replaced', fmPasswordHashReplacement($hm, $otherHash, null) !== null);
 check('default password found, also when asked again',
     fmPasswordIsDefault($adminHash) && fmPasswordIsDefault($adminHash) && !fmPasswordIsDefault($otherHash) && !fmPasswordIsDefault($otherHash) && !fmPasswordIsDefault(''));
 

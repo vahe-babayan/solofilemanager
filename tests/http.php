@@ -166,6 +166,47 @@ try {
     check('other session logged out', $s2->state($u('b')) === 'login');
     check('old password refused', !$s2->login($u('b'), 'pass-B-12345'));
 
+    section('First run: rename, then set the password (no "admin" login)');
+    $dirD = installCopy('d', 'admin');
+    rename($dirD . '/' . $script, $dirD . '/solofilemanager.php');
+    file_put_contents($dirD . '/secret.txt', 'S');
+    $hashIn = static function () use ($dirD): string {
+        foreach (glob($dirD . '/*.php') ?: [] as $f) {
+            if (preg_match("/^\\\$PASSWORD_HASH = '([^']+)';/m", (string)file_get_contents($f), $m)) return $m[1];
+        }
+        return '';
+    };
+    $fresh = "http://127.0.0.1:{$port}/d/solofilemanager.php";
+    $f = new Browser();
+    [, $page] = $f->req($fresh);
+    check('not renamed yet: the setup page', strpos($page, 'Setup required') !== false && strpos($page, 'fm-login-input') === false);
+    [$st, $body] = $f->req($fresh . '?action=open&folder=');
+    check('not renamed yet: file list refused (403)', $st === 403 && strpos($body, 'secret.txt') === false, "status {$st} {$body}");
+    [$st] = $f->post($fresh, ['action' => 'create-new-folder', 'in' => '', 'name' => 'early']);
+    check('not renamed yet: file actions refused (403)', $st === 403 && !is_dir($dirD . '/early'), "status {$st}");
+    [, $body] = $f->post($fresh, ['action' => 'change-password', 'new_password' => 'first-pass-123', 'confirm_password' => 'first-pass-123']);
+    check('not renamed yet: the password cannot be set', strpos($body, '"error"') !== false && password_verify('admin', $hashIn()), $body);
+    $newName = 'solofilemanager_' . str_repeat('Ab1', 9) . '.php';
+    [, $body] = $f->post($fresh, ['action' => 'do-rename', 'new_name' => $newName]);
+    check('rename works', strpos($body, '"success"') !== false && is_file($dirD . '/' . $newName), $body);
+    $named = "http://127.0.0.1:{$port}/d/{$newName}";
+    [, $page] = $f->req($named);
+    check('after the rename: set-password screen, no login form', strpos($page, 'fm-pwd-new') !== false && strpos($page, 'fm-login-input') === false);
+    [$st] = $f->req($named . '?action=open&folder=');
+    check('before the password is set, file actions still need a login (401)', $st === 401, "status {$st}");
+    [, $body] = $f->post($named, ['action' => 'change-password', 'new_password' => 'first-pass-123', 'confirm_password' => 'other-pass-123']);
+    check('confirmation must match', strpos($body, 'do not match') !== false, $body);
+    [, $body] = $f->post($named, ['action' => 'change-password', 'new_password' => 'admin', 'confirm_password' => 'admin']);
+    check('"admin" is refused', strpos($body, '"error"') !== false, $body);
+    [, $body] = $f->post($named, ['action' => 'change-password', 'new_password' => 'first-pass-123', 'confirm_password' => 'first-pass-123']);
+    check('password set without logging in first', strpos($body, '"saved":true') !== false && password_verify('first-pass-123', $hashIn()), $body);
+    check('the browser that set it is logged in', $f->state($named) === 'app');
+    $g = new Browser();
+    check('another browser gets the login form', $g->state($named) === 'login');
+    [$st] = $g->post($named, ['action' => 'change-password', 'new_password' => 'evil-pass-123', 'confirm_password' => 'evil-pass-123']);
+    check('another browser cannot set it again (401)', $st === 401 && password_verify('first-pass-123', $hashIn()), "status {$st}");
+    check('the new password logs in', $g->login($named, 'first-pass-123') && $g->state($named) === 'app');
+
     section('IP allowlist');
     [$st, $body] = (new Browser())->req($u('c'));
     check('address not on the list gets 403 before the login page', $st === 403 && trim($body) === 'Forbidden', "status {$st}");

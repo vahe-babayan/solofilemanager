@@ -8,7 +8,7 @@ declare(strict_types=1);
  */
 
 /** Product version (semver). Shown in UI / server info. */
-const SOLOFILEMANAGER_VERSION = '1.8.1';
+const SOLOFILEMANAGER_VERSION = '1.8.2';
 
 // Set max execution time to 1 day (86400 seconds)
 @set_time_limit(86400);
@@ -31,7 +31,8 @@ $DEFAULT_FILENAME = 'solofilemanager.php';
 $ENABLE_AUTH = true;
 
 // Password hash for login. Prefer changing via the in-app "Change password" UI after setup.
-// Default password is: admin (you will be asked to change it). Manual fallback:
+// The shipped hash is for "admin": on first open (after the rename) you set your own password, no login with
+// "admin" is needed; until then whoever opens the file can set it. Manual fallback:
 //   password_hash('your-strong-password', PASSWORD_DEFAULT) → paste into $PASSWORD_HASH below.
 $PASSWORD_HASH = '$2y$10$gfAs1ZRrZH6GElppZp3UV.Zt8N7R.KnGFJ0X02Ow6ZhMNtGihJvlK';
 
@@ -1606,22 +1607,43 @@ function fmEditScriptWithCallback(string $pattern, callable $replacer): array {
 }
 
 /**
+ * New text of a matched `$PASSWORD_HASH = '...';` line, or null when the file no longer holds $expectedOld
+ * (another browser set the password meanwhile).
+ *
+ * @param array<int, string> $m Match of the $PASSWORD_HASH line pattern
+ */
+function fmPasswordHashReplacement(array $m, string $newHash, ?string $expectedOld): ?string {
+    if ($expectedOld !== null && !hash_equals($expectedOld, (string)($m[3] ?? ''))) {
+        return null;
+    }
+    $escaped = str_replace(['\\', '\''], ['\\\\', '\\\''], $newHash);
+    return $m[1] . '\'' . $escaped . '\'' . $m[4];
+}
+
+/**
  * Replace $PASSWORD_HASH = '...' in this script file.
  *
+ * @param string|null $expectedOld Only replace this hash (first run: still the default)
  * @return array{ok:bool, reason?:string}
  */
-function fmWritePasswordHashToScript(string $newHash): array {
+function fmWritePasswordHashToScript(string $newHash, ?string $expectedOld = null): array {
     if ($newHash === '' || !preg_match('/^\$2[ayb]\$\d{2}\$[A-Za-z0-9\.\/]{53}$/', $newHash)) {
         return ['ok' => false, 'reason' => 'invalid_hash'];
     }
+    $stale = false;
     // Use a callback so bcrypt `$2y$10$...` is not treated as preg_replace backreferences.
-    return fmEditScriptWithCallback(
+    $result = fmEditScriptWithCallback(
         '/(\$PASSWORD_HASH\s*=\s*)([\'"])([^\'"]*)\2(\s*;)/',
-        static function (array $m) use ($newHash): string {
-            $escaped = str_replace(['\\', '\''], ['\\\\', '\\\''], $newHash);
-            return $m[1] . '\'' . $escaped . '\'' . $m[4];
+        static function (array $m) use ($newHash, $expectedOld, &$stale): string {
+            $line = fmPasswordHashReplacement($m, $newHash, $expectedOld);
+            if ($line === null) {
+                $stale = true;
+                return $m[0];
+            }
+            return $line;
         }
     );
+    return $stale ? ['ok' => false, 'reason' => 'changed_meanwhile'] : $result;
 }
 
 /**
@@ -1879,10 +1901,21 @@ function fmChangePassword(string $currentPass, string $newPass, string $confirmP
     if ($newHash === false || $newHash === '') {
         return ['status' => 'error', 'msg' => 'Could not hash the new password'];
     }
-    $write = fmWritePasswordHashToScript($newHash);
+    // First run: write only over the default hash, so a second browser cannot replace a password just set.
+    $write = fmWritePasswordHashToScript($newHash, $isDefault ? $passwordHash : null);
+    if (($write['reason'] ?? '') === 'changed_meanwhile') {
+        return ['status' => 'error', 'msg' => 'The password was already set. Reload the page and log in with it.'];
+    }
     if (!empty($write['ok'])) {
-        // Keep this session logged in; other sessions still carry the old fingerprint and must log in again.
+        // Log this session in (on first run it was not); other sessions carry the old fingerprint and must log in again.
+        ensureSession();
+        if (!headers_sent()) {
+            session_regenerate_id(true);
+        }
         fmBindSessionToPassword($newHash);
+        if (fmIdleTimeoutMinutes() > 0) {
+            $_SESSION['fm_last_activity'] = time();
+        }
         return [
             'status' => 'success',
             'saved'  => true,
@@ -6087,7 +6120,8 @@ $needsRename = ($thisFileName === $DEFAULT_FILENAME);
 // If auth is enabled, determine current auth state (used for initial HTML rendering).
 $isAuthed = (!$needsRename) ? isAuthed($ENABLE_AUTH) : false;
 $passwordIsDefault = $ENABLE_AUTH && fmPasswordIsDefault($PASSWORD_HASH);
-$needsPasswordChange = (!$needsRename) && $ENABLE_AUTH && $isAuthed && $passwordIsDefault;
+// Still the shipped "admin" hash: whoever opens the renamed file sets the password (no login with "admin").
+$needsPasswordChange = (!$needsRename) && $ENABLE_AUTH && $passwordIsDefault;
 
 if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && !fmCsrfRequestIsValid()) {
     // An expired session also loses its token; answer 401 so the client shows the usual sign-in message.
@@ -6205,7 +6239,12 @@ if (isset($_POST['action']) && $_POST['action'] === 'set-trash-name') {
     ));
 }
 if (isset($_POST['action']) && $_POST['action'] === 'change-password') {
-    requireAuthOrExit($ENABLE_AUTH);
+    if ($needsRename) {
+        jsonOut(['status' => 'error', 'msg' => 'Rename this file first.']);
+    }
+    if (!$passwordIsDefault) {
+        requireAuthOrExit($ENABLE_AUTH);
+    }
     jsonOut(fmChangePassword(
         (string)($_POST['current_password'] ?? ''),
         (string)($_POST['new_password'] ?? ''),
@@ -6247,11 +6286,18 @@ if (isset($_POST['action']) && $_POST['action'] === 'set-file-ops-mode') {
 // API actions
 // =========================
 
+// Not renamed yet: nothing but the rename itself (the default name is public, so no file action may run).
+if ($needsRename && (isset($_GET['action']) || isset($_POST['action']))) {
+    http_response_code(403);
+    jsonOut(['status' => 'error', 'msg' => 'Finish setup first: rename this file.']);
+}
+
 // If renamed and auth is enabled, protect all API actions.
 if (!$needsRename) {
     if (isset($_GET['action']) || isset($_POST['action'])) {
         $a = (string)($_GET['action'] ?? $_POST['action'] ?? '');
-        $allowUnauthed = in_array($a, ['do-rename', 'login', 'logout'], true);
+        $allowUnauthed = in_array($a, ['do-rename', 'login', 'logout'], true)
+            || ($a === 'change-password' && $passwordIsDefault);
         if (!$allowUnauthed) {
             requireAuthOrExit($ENABLE_AUTH);
         }
@@ -13452,7 +13498,7 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
             <button class="fm-btn" id="fm-rename-btn">Rename</button>
         </div>
         <p class="fm-error" id="fm-rename-error" style="display:none"></p>
-        <p class="fm-hint">After renaming, you’ll be redirected automatically.</p>
+        <p class="fm-hint">After renaming you will set the password.</p>
     </div>
     <script>
         (function () {
@@ -13488,49 +13534,10 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
         })();
     </script>
 <?php else: ?>
-<?php if ($ENABLE_AUTH && !$isAuthed): ?>
-    <div class="fm-card">
-        <h1>Login</h1>
-        <p class="fm-hint">Enter the password to continue.<?php if ($passwordIsDefault): ?> Default password is <code><strong>admin</strong></code> — you will be asked to change it after login.<?php endif; ?></p>
-        <div class="fm-row">
-            <input class="fm-input" id="fm-login-input" type="password" placeholder="Password" autocomplete="current-password">
-            <button class="fm-btn" id="fm-login-btn">Login</button>
-        </div>
-        <p class="fm-error" id="fm-login-error" style="display:none"></p>
-        <p class="fm-hint">SoloFileManager <?php echo htmlspecialchars(SOLOFILEMANAGER_VERSION, ENT_QUOTES); ?></p>
-    </div>
-    <script>
-        (function () {
-            const btn = document.getElementById('fm-login-btn');
-            const input = document.getElementById('fm-login-input');
-            const err = document.getElementById('fm-login-error');
-            function showErr(msg){ err.textContent = msg; err.style.display = 'block'; }
-            function doLogin() {
-                err.style.display = 'none';
-                const pass = (input.value || '');
-                const form = new FormData();
-                form.append('action', 'login');
-                form.append('password', pass);
-                fetch(ajax_url, fmPostInit(form))
-                    .then(r => r.json())
-                    .then(data => {
-                        if (data.status === 'success') {
-                            location.reload();
-                        } else {
-                            showErr(data.msg || 'Login failed');
-                        }
-                    })
-                    .catch(() => showErr('Login failed'));
-            }
-            btn.addEventListener('click', doLogin);
-            input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); doLogin(); } });
-            input.focus();
-        })();
-    </script>
-<?php elseif ($needsPasswordChange): ?>
+<?php if ($needsPasswordChange): ?>
     <div class="fm-card">
         <h1>Set a password</h1>
-        <p class="fm-hint">Choose a new password before using SoloFileManager (the default <code>admin</code> login is only for first setup).</p>
+        <p class="fm-hint">Choose the password for this file manager. You will need it to log in from now on.</p>
         <p class="fm-hint">SoloFileManager will try to update <code><strong>$PASSWORD_HASH</strong></code> in <code><strong><?php echo htmlspecialchars($thisFileName, ENT_QUOTES); ?></strong></code>. If the file is not writable, you will get a hash to paste manually.</p>
         <div class="fm-pwd-fields">
             <label><span>New password (min 8 characters)</span><input class="fm-input" id="fm-pwd-new" type="password" autocomplete="new-password"></label>
@@ -13605,6 +13612,45 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
             });
             reloadBtn.addEventListener('click', function () { location.reload(); });
             newEl.focus();
+        })();
+    </script>
+<?php elseif ($ENABLE_AUTH && !$isAuthed): ?>
+    <div class="fm-card">
+        <h1>Login</h1>
+        <p class="fm-hint">Enter the password to continue.</p>
+        <div class="fm-row">
+            <input class="fm-input" id="fm-login-input" type="password" placeholder="Password" autocomplete="current-password">
+            <button class="fm-btn" id="fm-login-btn">Login</button>
+        </div>
+        <p class="fm-error" id="fm-login-error" style="display:none"></p>
+        <p class="fm-hint">SoloFileManager <?php echo htmlspecialchars(SOLOFILEMANAGER_VERSION, ENT_QUOTES); ?></p>
+    </div>
+    <script>
+        (function () {
+            const btn = document.getElementById('fm-login-btn');
+            const input = document.getElementById('fm-login-input');
+            const err = document.getElementById('fm-login-error');
+            function showErr(msg){ err.textContent = msg; err.style.display = 'block'; }
+            function doLogin() {
+                err.style.display = 'none';
+                const pass = (input.value || '');
+                const form = new FormData();
+                form.append('action', 'login');
+                form.append('password', pass);
+                fetch(ajax_url, fmPostInit(form))
+                    .then(r => r.json())
+                    .then(data => {
+                        if (data.status === 'success') {
+                            location.reload();
+                        } else {
+                            showErr(data.msg || 'Login failed');
+                        }
+                    })
+                    .catch(() => showErr('Login failed'));
+            }
+            btn.addEventListener('click', doLogin);
+            input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); doLogin(); } });
+            input.focus();
         })();
     </script>
 <?php else: ?>
