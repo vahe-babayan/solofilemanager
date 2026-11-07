@@ -2,6 +2,25 @@
 
 All notable changes to SoloFileManager are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.8.0] - 2026-11-07
+
+### Changed
+
+- One progress window for long jobs (copy, move, duplicate, new folder from selection, delete forever, archive, extract): what is happening now, items done of the total with the percent, the current file and the elapsed time. Every line keeps its height, so the window does not change size (and does not jump) while progress comes in. Delete forever and copy / move no longer open a separate "Counting items…" window first: the server counts and the same window goes on
+- Progress also when the server uses its own commands: on Linux `rm`, `cp`, `unzip` and `tar` run with verbose output and every file they report is counted; commands that print nothing (Windows `rmdir`, `move`) count each selected item when it is done. Extract reports every entry in PHP too (ZIP in parts, TAR per entry) instead of one step per archive
+- Long delete, copy, move and extract jobs send a keep-alive line every 5 s while a command is silent, like archives, so hosting proxies do not close the connection
+- Rename, new folder, new file and new folder from selection keep a line for the error message, so an error does not change the popup's size (the centred popup no longer jumps); a long message ends with "…" and shows in full on hover. The error line under the Configuration password is reserved the same way
+
+### Removed
+
+- `$FM_VERBOSE_PROGRESS_MIN_ITEMS`: progress details are always shown (jobs under 800 items used to show only a moving bar). The line can stay in old copies; it is ignored
+
+### Fixed
+
+- Copy / move progress never showed the "n / total" count (a style hid it)
+- The Upload dialog's status line ("Ready — 2 file(s) to upload", "Batch finished…") never appeared
+- Delete forever, copy / move and extract could leave the progress window open forever when the connection ended without a result; they now say so and ask to refresh the folder
+
 ## [1.7.0] - 2026-11-06
 
 ### Added

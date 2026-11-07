@@ -461,6 +461,46 @@ try {
 }
 check('gzip in PHP: a missing source is an error and writes nothing', $gzErr !== '' && !file_exists($base . '/missing.tar.gz'), $gzErr);
 
+section('Progress of OS commands');
+$osLines = [
+    "removed '/srv/site/a b.txt'" => '/srv/site/a b.txt',
+    "removed directory '/srv/site/docs'" => '/srv/site/docs',
+    "removed \u{2018}/srv/x\u{2019}" => '/srv/x',
+    "'/srv/a/f.txt' -> '/srv/b/f.txt'" => '/srv/a/f.txt',
+    '  inflating: docs/report.txt  ' => 'docs/report.txt',
+    '   creating: docs/' => 'docs/',
+    ' extracting: img/logo.png' => 'img/logo.png',
+    'Archive:  backup.zip' => null,
+    'x docs/a.txt' => 'docs/a.txt',
+    'docs/b.txt' => 'docs/b.txt',
+    'I:\\site\\src\\f1.txt' => 'I:\\site\\src\\f1.txt',
+    '2 File(s) copied' => null,
+    '        1 file(s) copied.' => null,
+    "rm: cannot remove 'x': Permission denied" => null,
+    'tar: Removing leading `/\' from member names' => null,
+    '' => null,
+];
+$osBad = [];
+foreach ($osLines as $line => $want) {
+    if (fmOsProgressLineName((string)$line) !== $want) {
+        $osBad[] = $line . ' => ' . var_export(fmOsProgressLineName((string)$line), true);
+    }
+}
+check('verbose output of rm / cp / unzip / tar / xcopy: paths counted, headers and errors not', $osBad === [], implode(' | ', $osBad));
+$sent = [];
+[$jp, $jt, $jl] = fmJobProgress(static function (array $p) use (&$sent): void { $sent[] = $p; }, $base, 10);
+$jp(3, $base . '/docs/a.txt', true);
+$jp(4, $base . '/docs/b.txt');
+check('job progress: name below the root, at most 4 lines a second', $sent === [['n' => 3, 'name' => 'docs/a.txt', 'total' => 10]], json_encode($sent));
+$cnt = 2;
+$sent = [];
+$onLine = $jl($cnt, 3);
+usleep(300000);
+foreach (["removed '$base/x1'", 'rm: cannot remove', "removed '$base/x2'", "removed '$base/x3'", "removed '$base/x4'"] as $l) {
+    $onLine($l);
+}
+check('OS lines count up to the item total only', $cnt === 5 && ($sent[0]['n'] ?? 0) === 3, json_encode([$cnt, $sent]));
+
 section('Item names from names[]');
 check('plain name', fmRequestItemName('a.txt') === 'a.txt');
 check('relative path from search results', fmRequestItemName('docs/a.txt') === 'docs/a.txt');

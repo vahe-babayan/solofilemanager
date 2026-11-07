@@ -6,7 +6,7 @@ Manage files directly from your browser — without installing WordPress, Larave
 
 ### One PHP file. No installation. No database.
 
-Current version: **1.7.0** — see [CHANGELOG.md](CHANGELOG.md)
+Current version: **1.8.0** — see [CHANGELOG.md](CHANGELOG.md)
 
 ## Why SoloFileManager?
 
@@ -169,7 +169,8 @@ Current version: **1.7.0** — see [CHANGELOG.md](CHANGELOG.md)
 - Optional IP allowlist (off by default): only listed IPs / CIDR ranges (IPv4 and IPv6) can open the file manager; everyone else gets 403 before the login page
 - Symlinks and Windows junctions shown as links (folder-link icon, arrow badge on file links); tooltip and Info show the target; links outside the root are dimmed and cannot be opened. Windows `.lnk` shortcuts to a folder inside the root open like a Folder link. Size, counts, PHP copy and archives do not follow links; copying a link recreates the link
 - Create folder/file, rename, bulk rename (find / replace with optional regular expressions, numbering, case), duplicate
-- Copy / move with progress; drag and drop
+- Copy / move; drag and drop
+- Long jobs (copy, move, duplicate, delete forever, archive, extract) show one progress window that keeps its size: what is happening now, items done of the total with the percent, the current file and the elapsed time — also when the server uses its own commands (`cp`, `rm`, `unzip`, `tar` on Linux report every file)
 - Delete to Trash or delete forever. Trash works like the Windows Recycle Bin: a flat list showing each item's original name, the folder it came from, deletion date and size, with Restore (back to where it was, renamed to "name (restored)" if that name is taken) and Delete forever; Empty Trash (with confirm); item count on the Trash button, a reminder on Logout, and Server info shows how many items / how much space Trash holds; the `.trash` folder is removed as soon as it is empty
 - Filter the current folder listing by name (search field in the breadcrumb bar)
 - Find in the current folder and all subfolders by name (text, wildcard or regular expression), text inside files of any encoding (Windows-1251, UTF-16… are detected; the matching line is shown), encoding (e.g. everything that is not UTF-8), type, size and modified date; results show where each item is and can be opened, downloaded, copied, moved, deleted, bulk renamed or have their permissions changed; Back returns to the results without searching again. Uses `find` on Linux / macOS when OS file ops are allowed, PHP otherwise
@@ -195,7 +196,6 @@ Edit the config block at the top of `solofilemanager.php`:
 | `$FM_IDLE_TIMEOUT_MINUTES` | Idle session lock: `0` (off) or `15` / `30` / `60` / `120`. Prefer **Configuration** (password); file edit is the fallback |
 | `$FM_ALLOWED_IPS` | IP allowlist, e.g. `['203.0.113.5', '192.168.1.0/24']`. Empty `[]` = everyone (default). Editable in **Configuration → Server** (password); if you lock yourself out, edit this line in the PHP file |
 | `$FM_TRUSTED_PROXIES` | Reverse proxies (e.g. Cloudflare ranges) allowed to pass the real client IP in `X-Forwarded-For`. Empty = use the direct connection IP only (default). File edit only |
-| `$FM_VERBOSE_PROGRESS_MIN_ITEMS` | When to show detailed progress for large jobs |
 | `$FM_TRASH_BASENAME` | Hidden recycle folder under root (default `.trash`). **Configuration → Server** (password) can switch to a random `.trash-…` name and renames the folder with it |
 | `$FM_ENABLE_TERMINAL_HERE` | Standard terminal-here (**false** by default). Prefer Terminal settings from the terminal icon (password); or set `true` in the file on trusted hosts only |
 | `$FM_ENABLE_TERMINAL_MANUAL` / `$FM_ENABLE_TERMINAL_ADVANCED` | Manual / advanced modes (**false** by default). Same Terminal settings UI (gear in the terminal popup), or edit the file |
@@ -225,7 +225,7 @@ The `tests/` folder is for development only (it is not included in release archi
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). Latest: **1.7.0** — Convert encoding for files and whole folders, Find by encoding and by text in files of any encoding, an optional Encoding column, and popups that keep their height.
+See [CHANGELOG.md](CHANGELOG.md). Latest: **1.8.0** — one progress window for every long job (items done of the total, percent, current file, elapsed time, also for the server's own `rm` / `cp` / `unzip` / `tar`), and popups that no longer jump when progress or error messages appear.
 
 ## License
 

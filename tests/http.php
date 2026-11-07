@@ -351,6 +351,48 @@ try {
     check('.fm-state is not listed at the root', strpos($body, '.fm-state') === false, substr($body, 0, 300));
     @rmdir($dirA . '/.fm-state');
 
+    section('Progress of file jobs');
+    // Copy A runs in PHP; copy B in auto mode, i.e. OS commands followed line by line where exec() works.
+    $brB = new Browser();
+    $brB->login($u('b'), 'pass-B-new-67890');
+    $dirB = $www . '/b';
+    $jobLines = static function (string $body) use ($ndjson): array {
+        $lines = $ndjson($body);
+        $ns = array_values(array_filter($lines, static fn($l) => isset($l['n'])));
+        return [$lines, $ns, end($ns) ?: []];
+    };
+    foreach (['a' => [$br, $dirA, 'PHP'], 'b' => [$brB, $dirB, 'auto']] as $copy => [$who, $root, $mode]) {
+        mkdir($root . '/job/src/sub', 0775, true);
+        for ($i = 1; $i <= 6; $i++) {
+            file_put_contents($root . '/job/src/sub/f' . $i . '.txt', str_repeat('x', 100));
+        }
+        file_put_contents($root . '/job/src/top.txt', 'top');
+        mkdir($root . '/job/dest');
+        [, $body] = $who->post($u($copy), ['action' => 'copy-move-stream', 'operation' => 'copy', 'in' => 'job', 'dest' => 'job/dest', 'names[]' => 'src']);
+        [$lines, $ns, $lastN] = $jobLines($body);
+        $total = $lines[0]['total'] ?? 0;
+        check("$mode copy: total first, counts up to it, names, done", $total >= 8 && ($lastN['n'] ?? 0) === $total
+            && array_filter($ns, static fn($l) => ($l['name'] ?? '') !== '') && !empty(end($lines)['done'])
+            && is_file($root . '/job/dest/src/sub/f6.txt') && strpos($body, 'verbose') === false, $body);
+        [, $body] = $who->post($u($copy), ['action' => 'delete-stream', 'in' => 'job', 'names[]' => 'dest']);
+        [$lines, , $lastN] = $jobLines($body);
+        clearstatcache();
+        $total = $lines[0]['total'] ?? 0;
+        check("$mode delete forever: total first, counts up to it, done", $total >= 9 && ($lastN['n'] ?? 0) === $total
+            && !empty(end($lines)['done']) && !file_exists($root . '/job/dest'), $body);
+        $zip = new ZipArchive();
+        $zip->open($root . '/job/pack.zip', ZipArchive::CREATE);
+        foreach (['p/a.txt', 'p/b.txt', 'p/c.txt'] as $e) {
+            $zip->addFromString($e, $e);
+        }
+        $zip->close();
+        [, $body] = $who->post($u($copy), ['action' => 'extract', 'in' => 'job', 'names[]' => 'pack.zip', 'separate_folders' => '1']);
+        [$lines, , $lastN] = $jobLines($body);
+        check("$mode extract: entries counted up to the total, done", ($lines[0]['total'] ?? 0) === 3 && ($lastN['n'] ?? 0) === 3
+            && !empty(end($lines)['done']) && is_file($root . '/job/pack/p/c.txt'), $body);
+        rmTree($root . '/job');
+    }
+
     section('Convert encoding');
     $ruText = "Бюджет на 2026 год утверждён.\nОтчёт готов, счёт оплачен.\n";
     $ruCp = (string)iconv('UTF-8', 'Windows-1251', $ruText);

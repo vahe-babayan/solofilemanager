@@ -37,7 +37,7 @@ $info = is_file($infoFile) ? (json_decode((string)file_get_contents($infoFile), 
 
 /** Config lines kept by --keep-name (one line each in the script). */
 const KEEP_VARS = [
-    'ROOT_DIR', 'ENABLE_AUTH', 'PASSWORD_HASH', 'FM_FILE_OPS_MODE', 'FM_VERBOSE_PROGRESS_MIN_ITEMS',
+    'ROOT_DIR', 'ENABLE_AUTH', 'PASSWORD_HASH', 'FM_FILE_OPS_MODE',
     'FM_TRASH_BASENAME', 'FM_IDLE_TIMEOUT_MINUTES', 'FM_ALLOWED_IPS', 'FM_TRUSTED_PROXIES',
     'FM_ENABLE_TERMINAL_HERE', 'FM_ENABLE_TERMINAL_MANUAL', 'FM_ENABLE_TERMINAL_ADVANCED',
 ];

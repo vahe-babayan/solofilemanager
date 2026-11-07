@@ -8,7 +8,7 @@ declare(strict_types=1);
  */
 
 /** Product version (semver). Shown in UI / server info. */
-const SOLOFILEMANAGER_VERSION = '1.7.0';
+const SOLOFILEMANAGER_VERSION = '1.8.0';
 
 // Set max execution time to 1 day (86400 seconds)
 @set_time_limit(86400);
@@ -56,13 +56,6 @@ $EXCLUDE_NAMES = [
  * Can also be changed from Configuration in the UI (password) when the script file is writable.
  */
 $FM_FILE_OPS_MODE = 'auto';
-
-/**
- * Below this estimated item count, progress UIs stay indeterminate (no n/total detail).
- * At or above: show detailed NDJSON progress only when work runs via PHP with granular callbacks; OS paths stay indeterminate.
- * Set to 0 to disable the "small job" band (only PHP vs OS rules apply).
- */
-$FM_VERBOSE_PROGRESS_MIN_ITEMS = 800;
 
 /**
  * Hidden trash folder under root. Default '.trash'; Configuration can switch to a random name such as
@@ -838,42 +831,6 @@ function fmFileOpsTryShell(): bool {
  */
 function fmFileOpsAllowPhpFallback(): bool {
     return fmFileOpsMode() !== 'os';
-}
-
-/**
- * Summary of fmVerboseProgressMinItems
- * 
- * @throws RuntimeException
- * @return int
- */
-function fmVerboseProgressMinItems(): int {
-    global $FM_VERBOSE_PROGRESS_MIN_ITEMS;
-    $n = isset($FM_VERBOSE_PROGRESS_MIN_ITEMS) ? (int)$FM_VERBOSE_PROGRESS_MIN_ITEMS : 800;
-    return max(0, $n);
-}
-
-/**
- * NDJSON hint for progress UIs: whether to show determinate n/total (and paths) vs indeterminate.
- *
- * Rules:
- * - If estimated count is below {@see fmVerboseProgressMinItems()} (when threshold is positive): never detailed (`false`).
- * - If threshold is 0: detailed only when `$granularPhpProgress` is true.
- * - Otherwise (large job): detailed only when `$granularPhpProgress` is true (PHP granular path); OS / shell phases use `false`.
- *
- * @param int  $estimatedTotal       Estimated files+folders (or entries) affected
- * @param bool $granularPhpProgress  True when this phase streams per-item progress from PHP
- * @return array{verbose_progress: bool, verbose_progress_threshold: int}
- */
-function fmStreamProgressMeta(int $estimatedTotal, bool $granularPhpProgress): array {
-    $th = fmVerboseProgressMinItems();
-    if ($th === 0) {
-        $verbose = $granularPhpProgress;
-    } elseif ($estimatedTotal < $th) {
-        $verbose = false;
-    } else {
-        $verbose = $granularPhpProgress;
-    }
-    return ['verbose_progress' => $verbose, 'verbose_progress_threshold' => $th];
 }
 
 /**
@@ -3109,22 +3066,29 @@ function deletePathWithProgress(string $path, string $rootDir, int &$count, call
  * 
  * @throws RuntimeException If $cmd fails or $path does not exist, is not readable, or an error occurs while checking its contents.
  */
-function osDeletePath(string $path, string $rootDir): bool {
+function osDeletePath(string $path, string $rootDir, ?callable $onLine = null, ?callable $tick = null): bool {
     if (!pathInsideRoot($path, $rootDir)) return false;
     if (!file_exists($path)) return true;
 
+    $follow = $onLine !== null && $tick !== null;
     if (PHP_OS_FAMILY === 'Windows') {
+        // del / rmdir print nothing per file: progress comes per selected item.
         $pathWin = str_replace('/', '\\', $path);
         if (is_file($path)) {
-            $cmd = 'del /f /q ' . escapeshellarg($pathWin) . ' 2>nul';
+            $cmd = 'del /f /q ' . escapeshellarg($pathWin);
         } else {
-            $cmd = 'rmdir /s /q ' . escapeshellarg($pathWin) . ' 2>nul';
+            $cmd = 'rmdir /s /q ' . escapeshellarg($pathWin);
         }
     } else {
-        $cmd = 'rm -rf ' . escapeshellarg($path) . ' 2>/dev/null';
+        // -v: one line per removed file or folder.
+        $cmd = 'rm -rf' . ($follow ? 'v' : '') . ' -- ' . escapeshellarg($path);
     }
 
-    @exec($cmd, $output, $returnCode);
+    if ($follow) {
+        fmRunArchiver($cmd, $onLine, $tick);
+    } else {
+        @exec($cmd . (PHP_OS_FAMILY === 'Windows' ? ' 2>nul' : ' 2>/dev/null'), $output, $returnCode);
+    }
     // Per-path clearing misses the cached entry of a junction.
     clearstatcache(true);
     return !file_exists($path);
@@ -3344,7 +3308,7 @@ function fmNextDuplicateBasename(string $dir, string $sourceName, array &$taken)
  * 
  * @throws RuntimeException If $src or $dst does not exist, is not readable, or an error occurs while checking its contents.
  */
-function osCopyEntry(string $src, string $dst, string $rootDir): bool {
+function osCopyEntry(string $src, string $dst, string $rootDir, ?callable $onLine = null, ?callable $tick = null): bool {
     if (!pathInsideRoot($src, $rootDir) || !file_exists($src)) {
         return false;
     }
@@ -3371,9 +3335,14 @@ function osCopyEntry(string $src, string $dst, string $rootDir): bool {
             $cmd = 'cmd /c xcopy ' . escapeshellarg($srcW) . ' ' . escapeshellarg($dstW) . ' /E /I /H /Y';
         }
     } else {
-        $cmd = 'cp -a ' . escapeshellarg($src) . ' ' . escapeshellarg($dst);
+        // -v: one line per copied file or folder.
+        $cmd = 'cp -a' . ($onLine !== null ? 'v' : '') . ' ' . escapeshellarg($src) . ' ' . escapeshellarg($dst);
     }
-    @exec($cmd, $out, $rc);
+    if ($onLine !== null && $tick !== null) {
+        fmRunArchiver($cmd, $onLine, $tick);
+    } else {
+        @exec($cmd, $out, $rc);
+    }
     return file_exists($dst);
 }
 
@@ -3387,7 +3356,7 @@ function osCopyEntry(string $src, string $dst, string $rootDir): bool {
  * 
  * @throws RuntimeException If $src or $dst does not exist, is not readable, or an error occurs while checking its contents.
  */
-function osMoveEntry(string $src, string $dst, string $rootDir): bool {
+function osMoveEntry(string $src, string $dst, string $rootDir, ?callable $tick = null): bool {
     if (!pathInsideRoot($src, $rootDir) || !file_exists($src)) {
         return false;
     }
@@ -3408,7 +3377,12 @@ function osMoveEntry(string $src, string $dst, string $rootDir): bool {
     } else {
         $cmd = 'mv ' . escapeshellarg($src) . ' ' . escapeshellarg($dst);
     }
-    @exec($cmd, $out, $rc);
+    if ($tick !== null) {
+        // A move inside one disk is instant; across disks it copies, and the ticks keep the stream alive.
+        fmRunArchiver($cmd, static function (): void {}, $tick);
+    } else {
+        @exec($cmd, $out, $rc);
+    }
     return !file_exists($src) && file_exists($dst);
 }
 
@@ -4774,10 +4748,13 @@ function fmTarWalk(string $path, bool $gz, callable $onEntry): bool {
  * @param array<string, true>|null $only
  * @return string '' on success, otherwise an error message
  */
-function fmTarExtract(string $path, bool $gz, string $destReal, string $rootDir, ?array $only): string {
+function fmTarExtract(string $path, bool $gz, string $destReal, string $rootDir, ?array $only, ?callable $onEntry = null): string {
     $dest = rtrim(normPath($destReal), '/');
     $error = '';
-    $ok = fmTarWalk($path, $gz, static function (string $name, string $kind, int $size, callable $readData) use ($dest, $rootDir, $only, &$error): bool {
+    $ok = fmTarWalk($path, $gz, static function (string $name, string $kind, int $size, callable $readData) use ($dest, $rootDir, $only, &$error, $onEntry): bool {
+        if ($onEntry !== null) {
+            $onEntry($name);
+        }
         $rel = str_replace('\\', '/', $name);
         while (strpos($rel, './') === 0) {
             $rel = substr($rel, 2);
@@ -5150,6 +5127,85 @@ function fmArchiverOutputFile(string $line): ?string {
         $name = (string)preg_replace('/^a\s+/', '', $line);
     }
     return substr($name, -1) === '/' || substr($name, -1) === '\\' ? null : $name;
+}
+
+/**
+ * Progress senders of an NDJSON file job (copy, move, duplicate, delete):
+ *   $progress(int $n, ?string $absPath, bool $force = false)  {n, name (below the root), total}, at most 4 times a second;
+ *   $tick()                                                   {tick: seconds} after 5 s without any line (keeps proxies
+ *                                                             from closing the stream while an OS command is silent);
+ *   $lines(int &$count, int $itemTotal)                       onLine callback for an OS command: every output line with
+ *                                                             a path counts, up to the item's own total.
+ *
+ * @return array{0: callable, 1: callable, 2: callable}
+ */
+function fmJobProgress(callable $send, string $rootDir, int $total): array {
+    $rootNorm = rtrim(normPath(safeRealpath($rootDir)), '/');
+    $started = microtime(true);
+    $lastSentAt = $started;
+    $lastProgressAt = 0.0;
+    $progress = static function (int $n, ?string $absPath, bool $force = false) use ($send, $rootNorm, $total, &$lastSentAt, &$lastProgressAt): void {
+        $now = microtime(true);
+        if (!$force && ($now - $lastProgressAt) < 0.25) {
+            return;
+        }
+        $lastProgressAt = $now;
+        $lastSentAt = $now;
+        $name = '';
+        if ($absPath !== null && $absPath !== '') {
+            $norm = normPath($absPath);
+            $name = strpos($norm, $rootNorm . '/') === 0 ? substr($norm, strlen($rootNorm) + 1) : basename($norm);
+        }
+        $send(['n' => min($n, $total), 'name' => $name, 'total' => $total]);
+    };
+    $tick = static function () use ($send, $started, &$lastSentAt): void {
+        if (microtime(true) - $lastSentAt >= 5) {
+            $lastSentAt = microtime(true);
+            $send(['tick' => (int)(microtime(true) - $started)]);
+        }
+    };
+    $lines = static function (int &$count, int $itemTotal) use ($progress): callable {
+        $base = $count;
+        return static function (string $line) use (&$count, $base, $itemTotal, $progress): void {
+            $path = fmOsProgressLineName($line);
+            if ($path === null) {
+                return;
+            }
+            if ($count < $base + $itemTotal) {
+                $count++;
+            }
+            $progress($count, $path);
+        };
+    };
+    return [$progress, $tick, $lines];
+}
+
+/**
+ * The path in one line of verbose output of rm / cp / unzip / tar / xcopy (one line = one entry done), or null for
+ * headers and summaries. GNU tools quote with '' or ‘’ depending on the locale; cp gives "'src' -> 'dst'".
+ */
+function fmOsProgressLineName(string $line): ?string {
+    $line = trim($line);
+    if ($line === '') {
+        return null;
+    }
+    $q = "(?:'|\u{2018}|\u{2019}|\")";
+    if (preg_match('/^removed(?: directory)? ' . $q . '(.*)' . $q . '$/u', $line, $m)) {
+        return $m[1];
+    }
+    if (preg_match('/^' . $q . '(.*?)' . $q . ' -> ' . $q . '.*' . $q . '$/u', $line, $m)) {
+        return $m[1];
+    }
+    if (preg_match('/^(?:inflating|extracting|creating|linking|exploding|replacing):\s+(.+?)\s*$/', $line, $m)) {
+        return $m[1];
+    }
+    if (preg_match('/^Archive:\s/', $line)
+        || preg_match('/^\d+\s+(?:File|Datei|fichier)/i', $line)
+        || preg_match('/^(?:rm|cp|mv|tar|unzip|bsdtar|xcopy|warning|caution|error)\b.*:/i', $line)) {
+        return null;
+    }
+    // bsdtar -xv: "x path"
+    return (string)preg_replace('/^x\s+/', '', $line);
 }
 
 /**
@@ -6196,7 +6252,6 @@ if (isset($_GET['action']) && $_GET['action'] === 'get-server-info') {
         'allowed_ips_count'         => count(fmAllowedIps()),
         'trusted_proxies_count'     => count(fmTrustedProxies()),
         'client_ip'                 => fmClientIp(),
-        'verbose_progress_min_items'=> fmVerboseProgressMinItems(),
         'capabilities'              => $serverCapabilities,
     ]);
 }
@@ -6830,8 +6885,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'compress' && isset($_POST['
     $tryShell         = fmFileOpsTryShell();
     $allowPhpFallback = fmFileOpsAllowPhpFallback();
 
-    $estForProgress = $total > 0 ? $total : max(count($names), 1);
-    $send(array_merge(['total' => $total, 'n' => 0, 'name' => ''], fmStreamProgressMeta($estForProgress, !$tryShell)));
+    $send(['total' => $total, 'n' => 0, 'name' => '']);
 
     $shellAttempted = false;
     try {
@@ -6988,10 +7042,10 @@ if (isset($_POST['action']) && $_POST['action'] === 'compress' && isset($_POST['
 
     if ($allowPhpFallback) {
         try {
-            $send(array_merge(
-                ['phase' => 'php', 'msg' => 'Building archive in PHP…'],
-                fmStreamProgressMeta($estForProgress, true)
-            ));
+            // After a failed system archiver its message (with the reason) stays on screen.
+            if (!$shellAttempted) {
+                $send(['phase' => 'php', 'msg' => 'Building archive in PHP…']);
+            }
             // PHP progress updates are per archive entry (files + directories) to avoid "0 then instantly done".
             $lastProgressAt = microtime(true);
             $progressMinInterval = 0.2; // seconds
@@ -7179,23 +7233,36 @@ if (isset($_POST['action']) && $_POST['action'] === 'extract' && isset($_POST['i
     }
 
     $processed = 0;
-    $send(array_merge(['total' => $grandTotal, 'n' => 0], fmStreamProgressMeta($grandTotal, !$tryShell)));
+    $send(['total' => $grandTotal, 'n' => 0]);
 
-    $lastProgressAt = microtime(true);
-    $progressMinInterval = 0.18;
-    $progressEvery = 200;
-    $sendProgress = function () use ($send, &$processed, &$lastProgressAt, $progressEvery, $progressMinInterval, $grandTotal): void {
+    // Entries done, at most 4 times a second; "tick" after 5 s without output keeps proxies from closing the stream.
+    $started = microtime(true);
+    $lastProgressAt = 0.0;
+    $lastSentAt = $started;
+    $extractRoot = rtrim(normPath(safeRealpath($ROOT_DIR)), '/') . '/';
+    $sendProgress = function (string $name = '', bool $force = false) use ($send, &$processed, &$lastProgressAt, &$lastSentAt, $grandTotal, $extractRoot): void {
         $now = microtime(true);
-        $timeOk = ($now - $lastProgressAt) >= $progressMinInterval;
-        $countOk = ($progressEvery > 0) && ($processed % $progressEvery === 0);
-        if ($timeOk || $countOk || $processed >= $grandTotal) {
+        if ($force || ($now - $lastProgressAt) >= 0.25) {
             $lastProgressAt = $now;
-            $send(['n' => $processed, 'total' => $grandTotal]);
+            $lastSentAt = $now;
+            // unzip prints the full target path: show it below the root like the other jobs.
+            $norm = normPath($name);
+            if (strpos($norm, $extractRoot) === 0) {
+                $name = substr($norm, strlen($extractRoot));
+            }
+            $send(['n' => min($processed, $grandTotal), 'total' => $grandTotal, 'name' => $name]);
+        }
+    };
+    $tick = function () use ($send, &$lastSentAt, $started): void {
+        if (microtime(true) - $lastSentAt >= 5) {
+            $lastSentAt = microtime(true);
+            $send(['tick' => (int)(microtime(true) - $started)]);
         }
     };
 
     /** @param list<array{name: string, raw: string, kind: string}>|null $only extract just these entries (null = all) */
     $phpExtractOne = function (string $archivePath, string $destDir, string $type, int $entryCount, ?array $only = null) use (&$processed, $sendProgress, $sendError, $ROOT_DIR, $serverCapabilities): void {
+        $base = $processed;
         if (!is_dir($destDir)) {
             if (!@mkdir($destDir, 0775, true)) {
                 $sendError('Could not create folder: ' . basename($destDir));
@@ -7242,12 +7309,17 @@ if (isset($_POST['action']) && $_POST['action'] === 'extract' && isset($_POST['i
                 $zip->close();
                 $sendError('No extractable entries in ZIP (or paths were rejected for safety)');
             }
-            if (!$zip->extractTo($destApi, $entries)) {
-                $zip->close();
-                $sendError('ZIP extraction failed');
+            // In parts, so the progress moves while a big archive is extracted.
+            foreach (array_chunk($entries, 100) as $part) {
+                if (!$zip->extractTo($destApi, $part)) {
+                    $zip->close();
+                    $sendError('ZIP extraction failed');
+                }
+                $processed = min($base + $entryCount, $processed + count($part));
+                $sendProgress((string)end($part));
             }
-            $processed += $entryCount;
-            $sendProgress();
+            $processed = $base + $entryCount;
+            $sendProgress('', true);
             $zip->close();
             return;
         }
@@ -7260,15 +7332,21 @@ if (isset($_POST['action']) && $_POST['action'] === 'extract' && isset($_POST['i
                 $onlySet[$e['name']] = true;
             }
         }
-        $err = fmTarExtract($archivePath, $type === 'tgz', $destReal, $ROOT_DIR, $onlySet);
+        $err = fmTarExtract($archivePath, $type === 'tgz', $destReal, $ROOT_DIR, $onlySet, static function (string $name) use (&$processed, $sendProgress, $base, $entryCount): void {
+            if ($processed < $base + $entryCount) {
+                $processed++;
+            }
+            $sendProgress($name);
+        });
         if ($err !== '') {
             $sendError('Could not extract ' . basename($archivePath) . ': ' . $err);
         }
-        $processed += $entryCount;
-        $sendProgress();
+        $processed = $base + $entryCount;
+        $sendProgress('', true);
     };
 
-    $shellExtractOne = function (string $archivePath, string $destDir, string $type) use ($isUnixLikeShell, $isWindows): bool {
+    // unzip / tar print every entry they write (-v; unzip without -q): each line is progress.
+    $shellExtractOne = function (string $archivePath, string $destDir, string $type, int $entryCount) use ($isUnixLikeShell, &$processed, $sendProgress, $tick): bool {
         if (!is_dir($destDir)) {
             if (!@mkdir($destDir, 0775, true)) {
                 return false;
@@ -7276,17 +7354,26 @@ if (isset($_POST['action']) && $_POST['action'] === 'extract' && isset($_POST['i
         }
         $archEsc = escapeshellarg($archivePath);
         $destEsc = escapeshellarg($destDir);
-        $out = [];
-        $ret = 1;
         if ($type === 'zip') {
-            $cmd = $isUnixLikeShell 
-            ? 'unzip -o -q ' . $archEsc . ' -d ' . $destEsc . ' 2>&1'
-            : 'tar -xf ' . $archEsc . ' -C ' . $destEsc . ' 2>&1';
+            $cmd = $isUnixLikeShell
+                ? 'unzip -o ' . $archEsc . ' -d ' . $destEsc
+                : 'tar -xvf ' . $archEsc . ' -C ' . $destEsc;
         } else {
-            $cmd = 'tar -x' . ($type === 'tgz' ? 'z' : '') . 'f ' . $archEsc . ' -C ' . $destEsc . ' 2>&1';
+            $cmd = 'tar -xv' . ($type === 'tgz' ? 'z' : '') . 'f ' . $archEsc . ' -C ' . $destEsc;
         }
-        exec($cmd, $out, $ret);
-        return $ret === 0;
+        $base = $processed;
+        [$code] = fmRunArchiver($cmd, static function (string $line) use (&$processed, $sendProgress, $base, $entryCount): void {
+            $name = fmOsProgressLineName($line);
+            if ($name === null) {
+                return;
+            }
+            if ($processed < $base + $entryCount) {
+                $processed++;
+            }
+            $sendProgress($name);
+        }, $tick);
+        $processed = $code === 0 ? $base + $entryCount : $base;
+        return $code === 0;
     };
 
     try {
@@ -7341,22 +7428,18 @@ if (isset($_POST['action']) && $_POST['action'] === 'extract' && isset($_POST['i
                 foreach ($split['unsafe'] as $u) {
                     $skipped[] = $base . ': ' . $u;
                 }
-                $send(array_merge(
-                    ['n' => $processed, 'total' => $grandTotal, 'phase' => 'php', 'msg' => 'Extracting via PHP without unsafe entries: ' . $base],
-                    fmStreamProgressMeta($grandTotal, true)
-                ));
+                $send(['n' => $processed, 'total' => $grandTotal, 'phase' => 'php', 'msg' => 'Extracting in PHP without unsafe entries: ' . $base]);
                 $phpExtractOne($apath, $destDir, $atype, $entryCount, $split['safe']);
                 continue;
             }
 
             $shellOk = false;
             if ($tryShell) {
-                $shellOk = $shellExtractOne($apath, $destDir, $atype);
+                $shellOk = $shellExtractOne($apath, $destDir, $atype, $entryCount);
             }
 
             if ($shellOk) {
-                $processed += $entryCount;
-                $sendProgress();
+                $sendProgress('', true);
                 continue;
             }
 
@@ -7364,15 +7447,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'extract' && isset($_POST['i
                 $sendError('Extraction failed (OS only): ' . $base);
             }
 
-            $send(array_merge(
-                [
-                    'n' => $processed,
-                    'total' => $grandTotal,
-                    'phase' => 'php',
-                    'msg' => 'Extracting via PHP: ' . $base,
-                ],
-                fmStreamProgressMeta($grandTotal, true)
-            ));
+            $send(['n' => $processed, 'total' => $grandTotal, 'phase' => 'php', 'msg' => ($tryShell ? 'The OS command failed, extracting in PHP: ' : 'Extracting in PHP: ') . $base]);
 
             $phpExtractOne($apath, $destDir, $atype, $entryCount);
         }
@@ -7488,7 +7563,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'copy-move-stream' && isset(
         exit;
     };
 
-    $rootNorm = rtrim(safeRealpath($ROOT_DIR), '/');
     $execOk = fmIsExecAvailable();
     if (fmFileOpsMode() === 'os' && !$execOk) {
         $sendError('File ops mode is OS-only but exec() is disabled. Set $FM_FILE_OPS_MODE to "auto" or "php".');
@@ -7497,49 +7571,23 @@ if (isset($_POST['action']) && $_POST['action'] === 'copy-move-stream' && isset(
     $allowPhpFallback = fmFileOpsAllowPhpFallback();
 
     $totalEstimate = 0;
+    $itemTotals = [];
     foreach ($names as $name) {
         $sp = $srcDir . '/' . $name;
         if (!pathInsideRoot($sp, $ROOT_DIR) || !file_exists($sp)) {
             continue;
         }
         $c = countPathFiles($sp, $ROOT_DIR);
-        $totalEstimate += $c['total'];
+        $itemTotals[$name] = max(1, $c['total']);
+        $totalEstimate += $itemTotals[$name];
     }
     if ($totalEstimate < 1) {
         $totalEstimate = count($names);
     }
-
-    $vpCopyMove = fmStreamProgressMeta($totalEstimate, !$tryShell);
-    if ($tryShell) {
-        $send(array_merge([
-            'total'         => 0,
-            'indeterminate' => true,
-            'msg'           => ($operation === 'move' ? 'Moving' : 'Copying')
-                . ($allowPhpFallback ? ' via OS…' : ' via OS only…'),
-        ], $vpCopyMove));
-    } else {
-        $send(array_merge(['total' => $totalEstimate, 'n' => 0, 'name' => ''], $vpCopyMove));
-    }
+    $send(['total' => $totalEstimate, 'n' => 0, 'name' => '']);
 
     $count = 0;
-    $lastFlush = 0.0;
-    $progressMinInterval = 0.25;
-    $verboseCopyMove = $vpCopyMove['verbose_progress'];
-    $phpProgress = function (int $n, ?string $currentPath) use (&$lastFlush, $progressMinInterval, $send, $totalEstimate, $rootNorm, &$verboseCopyMove): void {
-        $now = microtime(true);
-        if (($now - $lastFlush) < $progressMinInterval && $n % 200 !== 0) {
-            return;
-        }
-        $lastFlush = $now;
-        $relName = '';
-        if ($verboseCopyMove && $currentPath !== null) {
-            $norm = normPath($currentPath);
-            $relName = strpos($norm, $rootNorm) === 0
-                ? ltrim(substr($norm, strlen($rootNorm)), '/')
-                : basename($currentPath);
-        }
-        $send(['n' => $n, 'name' => $relName, 'total' => $totalEstimate]);
-    };
+    [$phpProgress, $tick, $osLines] = fmJobProgress($send, $ROOT_DIR, $totalEstimate);
 
     foreach ($names as $name) {
         $srcPath = $srcDir . '/' . $name;
@@ -7566,21 +7614,21 @@ if (isset($_POST['action']) && $_POST['action'] === 'copy-move-stream' && isset(
         }
 
         if ($tryShell) {
+            $base = $count;
+            $itemTotal = $itemTotals[$name] ?? 1;
             $ok = $operation === 'move'
-                ? osMoveEntry($srcPath, $dstPath, $ROOT_DIR)
-                : osCopyEntry($srcPath, $dstPath, $ROOT_DIR);
+                ? osMoveEntry($srcPath, $dstPath, $ROOT_DIR, $tick)
+                : osCopyEntry($srcPath, $dstPath, $ROOT_DIR, $osLines($count, $itemTotal), $tick);
             if ($ok) {
+                $count = $base + $itemTotal;
+                $phpProgress($count, $srcPath, true);
                 continue;
             }
+            $count = $base;
             if (!$allowPhpFallback) {
                 $sendError(($operation === 'move' ? 'Move' : 'Copy') . ' failed (OS only): ' . $name);
             }
-            $vpPhp = fmStreamProgressMeta($totalEstimate, true);
-            $verboseCopyMove = $vpPhp['verbose_progress'];
-            $send(array_merge(
-                ['total' => $totalEstimate, 'n' => $count, 'name' => '', 'fallback' => 'php'],
-                $vpPhp
-            ));
+            $send(['total' => $totalEstimate, 'n' => $count, 'name' => '', 'fallback' => 'php']);
         }
 
         if ($operation === 'copy') {
@@ -7594,6 +7642,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'copy-move-stream' && isset(
         }
     }
 
+    $phpProgress($count, null, true);
     $send(['done' => true]);
     exit;
 }
@@ -7684,7 +7733,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'new-folder-from-selection-s
         $sendError('Could not create folder');
     }
 
-    $rootNorm = rtrim(safeRealpath($ROOT_DIR), '/');
     $execOk = fmIsExecAvailable();
     if (fmFileOpsMode() === 'os' && !$execOk) {
         $sendError('File ops mode is OS-only but exec() is disabled. Set $FM_FILE_OPS_MODE to "auto" or "php".');
@@ -7693,48 +7741,23 @@ if (isset($_POST['action']) && $_POST['action'] === 'new-folder-from-selection-s
     $allowPhpFallback = fmFileOpsAllowPhpFallback();
 
     $totalEstimate = 0;
+    $itemTotals = [];
     foreach ($names as $name) {
         $sp = $srcDir . '/' . $name;
         if (!pathInsideRoot($sp, $ROOT_DIR) || !file_exists($sp)) {
             continue;
         }
         $c = countPathFiles($sp, $ROOT_DIR);
-        $totalEstimate += $c['total'];
+        $itemTotals[$name] = max(1, $c['total']);
+        $totalEstimate += $itemTotals[$name];
     }
     if ($totalEstimate < 1) {
         $totalEstimate = count($names);
     }
-
-    $vpCopyMove = fmStreamProgressMeta($totalEstimate, !$tryShell);
-    if ($tryShell) {
-        $send(array_merge([
-            'total'         => 0,
-            'indeterminate' => true,
-            'msg'           => 'Moving' . ($allowPhpFallback ? ' via OS…' : ' via OS only…'),
-        ], $vpCopyMove));
-    } else {
-        $send(array_merge(['total' => $totalEstimate, 'n' => 0, 'name' => ''], $vpCopyMove));
-    }
+    $send(['total' => $totalEstimate, 'n' => 0, 'name' => '']);
 
     $count = 0;
-    $lastFlush = 0.0;
-    $progressMinInterval = 0.25;
-    $verboseCopyMove = $vpCopyMove['verbose_progress'];
-    $phpProgress = function (int $n, ?string $currentPath) use (&$lastFlush, $progressMinInterval, $send, $totalEstimate, $rootNorm, &$verboseCopyMove): void {
-        $now = microtime(true);
-        if (($now - $lastFlush) < $progressMinInterval && $n % 200 !== 0) {
-            return;
-        }
-        $lastFlush = $now;
-        $relName = '';
-        if ($verboseCopyMove && $currentPath !== null) {
-            $norm = normPath($currentPath);
-            $relName = strpos($norm, $rootNorm) === 0
-                ? ltrim(substr($norm, strlen($rootNorm)), '/')
-                : basename($currentPath);
-        }
-        $send(['n' => $n, 'name' => $relName, 'total' => $totalEstimate]);
-    };
+    [$phpProgress, $tick, $osLines] = fmJobProgress($send, $ROOT_DIR, $totalEstimate);
 
     foreach ($names as $name) {
         $srcPath = $srcDir . '/' . $name;
@@ -7761,19 +7784,19 @@ if (isset($_POST['action']) && $_POST['action'] === 'new-folder-from-selection-s
         }
 
         if ($tryShell) {
-            $ok = osMoveEntry($srcPath, $dstPath, $ROOT_DIR);
+            $base = $count;
+            $itemTotal = $itemTotals[$name] ?? 1;
+            $ok = osMoveEntry($srcPath, $dstPath, $ROOT_DIR, $tick);
             if ($ok) {
+                $count = $base + $itemTotal;
+                $phpProgress($count, $srcPath, true);
                 continue;
             }
+            $count = $base;
             if (!$allowPhpFallback) {
                 $sendError('Move failed (OS only): ' . $name);
             }
-            $vpPhp = fmStreamProgressMeta($totalEstimate, true);
-            $verboseCopyMove = $vpPhp['verbose_progress'];
-            $send(array_merge(
-                ['total' => $totalEstimate, 'n' => $count, 'name' => '', 'fallback' => 'php'],
-                $vpPhp
-            ));
+            $send(['total' => $totalEstimate, 'n' => $count, 'name' => '', 'fallback' => 'php']);
         }
 
         if (!movePathPhp($srcPath, $dstPath, $ROOT_DIR, $count, $phpProgress)) {
@@ -7781,6 +7804,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'new-folder-from-selection-s
         }
     }
 
+    $phpProgress($count, null, true);
     $send(['done' => true]);
     exit;
 }
@@ -7828,7 +7852,6 @@ if (isset($_POST['action']) && $_POST['action'] === 'duplicate-stream' && isset(
         exit;
     };
 
-    $rootNorm = rtrim(safeRealpath($ROOT_DIR), '/');
     $execOk = fmIsExecAvailable();
     if (fmFileOpsMode() === 'os' && !$execOk) {
         $sendError('File ops mode is OS-only but exec() is disabled. Set $FM_FILE_OPS_MODE to "auto" or "php".');
@@ -7839,48 +7862,23 @@ if (isset($_POST['action']) && $_POST['action'] === 'duplicate-stream' && isset(
     $destDir = $srcDir;
 
     $totalEstimate = 0;
+    $itemTotals = [];
     foreach ($names as $name) {
         $sp = $srcDir . '/' . $name;
         if (!pathInsideRoot($sp, $ROOT_DIR) || !file_exists($sp)) {
             continue;
         }
         $c = countPathFiles($sp, $ROOT_DIR);
-        $totalEstimate += $c['total'];
+        $itemTotals[$name] = max(1, $c['total']);
+        $totalEstimate += $itemTotals[$name];
     }
     if ($totalEstimate < 1) {
         $totalEstimate = count($names);
     }
-
-    $vpCopyMove = fmStreamProgressMeta($totalEstimate, !$tryShell);
-    if ($tryShell) {
-        $send(array_merge([
-            'total'         => 0,
-            'indeterminate' => true,
-            'msg'           => 'Duplicating' . ($allowPhpFallback ? ' via OS…' : ' via OS only…'),
-        ], $vpCopyMove));
-    } else {
-        $send(array_merge(['total' => $totalEstimate, 'n' => 0, 'name' => ''], $vpCopyMove));
-    }
+    $send(['total' => $totalEstimate, 'n' => 0, 'name' => '']);
 
     $count = 0;
-    $lastFlush = 0.0;
-    $progressMinInterval = 0.25;
-    $verboseCopyMove = $vpCopyMove['verbose_progress'];
-    $phpProgress = function (int $n, ?string $currentPath) use (&$lastFlush, $progressMinInterval, $send, $totalEstimate, $rootNorm, &$verboseCopyMove): void {
-        $now = microtime(true);
-        if (($now - $lastFlush) < $progressMinInterval && $n % 200 !== 0) {
-            return;
-        }
-        $lastFlush = $now;
-        $relName = '';
-        if ($verboseCopyMove && $currentPath !== null) {
-            $norm = normPath($currentPath);
-            $relName = strpos($norm, $rootNorm) === 0
-                ? ltrim(substr($norm, strlen($rootNorm)), '/')
-                : basename($currentPath);
-        }
-        $send(['n' => $n, 'name' => $relName, 'total' => $totalEstimate]);
-    };
+    [$phpProgress, $tick, $osLines] = fmJobProgress($send, $ROOT_DIR, $totalEstimate);
 
     $created = [];
     $taken = [];
@@ -7908,19 +7906,19 @@ if (isset($_POST['action']) && $_POST['action'] === 'duplicate-stream' && isset(
         }
 
         if ($tryShell) {
-            $ok = osCopyEntry($srcPath, $dstPath, $ROOT_DIR);
+            $base = $count;
+            $itemTotal = $itemTotals[$name] ?? 1;
+            $ok = osCopyEntry($srcPath, $dstPath, $ROOT_DIR, $osLines($count, $itemTotal), $tick);
             if ($ok) {
+                $count = $base + $itemTotal;
+                $phpProgress($count, $srcPath, true);
                 continue;
             }
+            $count = $base;
             if (!$allowPhpFallback) {
                 $sendError('Duplicate failed (OS only): ' . $name);
             }
-            $vpPhp = fmStreamProgressMeta($totalEstimate, true);
-            $verboseCopyMove = $vpPhp['verbose_progress'];
-            $send(array_merge(
-                ['total' => $totalEstimate, 'n' => $count, 'name' => '', 'fallback' => 'php'],
-                $vpPhp
-            ));
+            $send(['total' => $totalEstimate, 'n' => $count, 'name' => '', 'fallback' => 'php']);
         }
 
         if (!copyPathPhp($srcPath, $dstPath, $ROOT_DIR, $count, $phpProgress)) {
@@ -7928,6 +7926,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'duplicate-stream' && isset(
         }
     }
 
+    $phpProgress($count, null, true);
     $send(['done' => true, 'created' => $created]);
     exit;
 }
@@ -8431,67 +8430,53 @@ if (isset($_POST['action']) && $_POST['action'] === 'delete-stream' && isset($_P
     header('Cache-Control: no-cache');
     fm_ob_implicit_flush_enable();
 
+    $send = static function (array $payload): void {
+        echo json_encode($payload, JSON_UNESCAPED_SLASHES) . "\n";
+        if (ob_get_level()) {
+            ob_flush();
+        }
+        flush();
+    };
+
     $count  = 0;
     $failed = null;
 
     $deleteEstimate = 0;
+    $itemTotals = [];
     foreach ($names as $fp) {
         $cDel = countPathFiles($fp, $ROOT_DIR);
-        $deleteEstimate += $cDel['total'];
+        $itemTotals[$fp] = max(1, $cDel['total']);
+        $deleteEstimate += $itemTotals[$fp];
     }
     if ($deleteEstimate < 1) {
         $deleteEstimate = count($names);
     }
-    $vpDelete = fmStreamProgressMeta($deleteEstimate, $deleteMode === 'php');
-    echo json_encode(array_merge(['total' => $deleteEstimate, 'n' => 0], $vpDelete)) . "\n";
-    if (ob_get_level()) {
-        ob_flush();
-    }
-    flush();
+    $send(['total' => $deleteEstimate, 'n' => 0]);
 
-    // PHP progress callback (shared by php mode and auto fallback).
-    $lastFlushTime     = 0.0;
-    $progressBatchSize = 500;
-    $progressMinInterval = 0.3;
-    $rootDirNorm       = rtrim(safeRealpath($ROOT_DIR), '/');
-    $verboseDeleteProgress = $vpDelete['verbose_progress'];
-    $phpProgress = function (int $n, ?string $currentPath) use (&$lastFlushTime, $progressBatchSize, $progressMinInterval, $rootDirNorm, &$verboseDeleteProgress): void {
-        $now     = microtime(true);
-        $timeOk  = ($now - $lastFlushTime) >= $progressMinInterval;
-        $batchOk = ($n % $progressBatchSize === 0);
-        if ($batchOk || $timeOk) {
-            $lastFlushTime = $now;
-            $relName = '';
-            if ($verboseDeleteProgress && $currentPath !== null) {
-                $norm = normPath($currentPath);
-                $relName = strpos($norm, $rootDirNorm) === 0
-                    ? ltrim(substr($norm, strlen($rootDirNorm)), '/')
-                    : basename($currentPath);
-            }
-            echo json_encode(['n' => $n, 'name' => $relName]) . "\n";
-            if (ob_get_level()) ob_flush();
-            flush();
+    [$phpProgress, $tick, $osLines] = fmJobProgress($send, $ROOT_DIR, $deleteEstimate);
+    // OS delete with progress: rm -v reports every entry; Windows del / rmdir report nothing until the item is gone.
+    $osDelete = static function (string $fullPath) use (&$count, $itemTotals, $osLines, $tick, $phpProgress, $ROOT_DIR): bool {
+        $base = $count;
+        $itemTotal = $itemTotals[$fullPath] ?? 1;
+        $ok = osDeletePath($fullPath, $ROOT_DIR, $osLines($count, $itemTotal), $tick);
+        $count = $ok ? $base + $itemTotal : $base;
+        if ($ok) {
+            $phpProgress($count, $fullPath, true);
         }
+        return $ok;
     };
 
     foreach ($names as $fullPath) {
         if ($deleteMode === 'auto') {
-            $osOk = osDeletePath($fullPath, $ROOT_DIR);
-            if (!$osOk) {
-                $vpPhp = fmStreamProgressMeta($deleteEstimate, true);
-                $verboseDeleteProgress = $vpPhp['verbose_progress'];
-                echo json_encode(array_merge(['total' => $deleteEstimate, 'n' => $count, 'fallback' => 'php'], $vpPhp)) . "\n";
-                if (ob_get_level()) {
-                    ob_flush();
-                }
-                flush();
+            if (!$osDelete($fullPath)) {
+                $send(['total' => $deleteEstimate, 'n' => $count, 'fallback' => 'php']);
                 if (!deletePathWithProgress($fullPath, $ROOT_DIR, $count, $phpProgress)) {
                     $failed = $fullPath;
                     break;
                 }
             }
         } elseif ($deleteMode === 'os') {
-            if (!osDeletePath($fullPath, $ROOT_DIR)) {
+            if (!$osDelete($fullPath)) {
                 $failed = $fullPath;
                 break;
             }
@@ -8503,6 +8488,9 @@ if (isset($_POST['action']) && $_POST['action'] === 'delete-stream' && isset($_P
         }
     }
 
+    if ($failed === null) {
+        $phpProgress($count, null, true);
+    }
     if ($failed !== null) echo json_encode(['error' => 'Could not delete: ' . basename($failed)]) . "\n";
     if (normPath($dir) === normPath(fmTrashFilesDir($ROOT_DIR))) {
         $infoDir = fmTrashInfoDir($ROOT_DIR);
@@ -9628,9 +9616,44 @@ html:has(.fm-table-wrapper) body {
     word-break: break-all;
 }
 
-.fm-download-progress-popup .fm-download-progress-line {
-    margin-top: 14px;
-    margin-bottom: 0;
+/* FmProgressPopup: every line keeps its height, so the popup does not change size while progress comes in. */
+.fm-progress-popup .fm-pp-phase {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    overflow: hidden;
+    overflow-wrap: anywhere;
+    line-height: 1.45;
+    min-height: 2.9em;
+    margin: 0 0 10px;
+}
+.fm-progress-popup .fm-pp-counts {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    font-size: 12px;
+    line-height: 18px;
+    height: 18px;
+    color: #444;
+    white-space: nowrap;
+}
+.fm-progress-popup .fm-pp-count {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.fm-progress-popup .fm-pp-time {
+    color: #888;
+    font-variant-numeric: tabular-nums;
+}
+.fm-progress-popup .fm-pp-name {
+    font-size: 12px;
+    line-height: 18px;
+    height: 18px;
+    margin: 2px 0 12px;
+    color: #777;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 /* Universal error / warning notices (FmNoticePopup) */
@@ -9801,12 +9824,7 @@ html:has(.fm-table-wrapper) body {
     transform: rotate(-45deg);
 }
 
-/* Universal progress helpers (used by paste, delete, compress, etc.) */
-.fm-progress-label {
-    margin: 0 0 .75rem 0;
-    color: #373737;
-}
-
+/* Progress bar (FmProgressPopup and other long jobs) */
 .fm-progress-wrap {
     height: 8px;
     background: #e0e0e0;
@@ -9832,20 +9850,9 @@ html:has(.fm-table-wrapper) body {
     }
 }
 
-.fm-copy-move-progress-wrap .fm-progress-bar {
-    animation: none;
-    width: 0%;
-    transition: width 0.2s linear;
-}
-
 .fm-progress-wrap--determinate .fm-progress-bar {
     animation: none;
     transition: width 0.3s linear;
-}
-
-.fm-copy-move-progress-wrap.fm-progress-indeterminate .fm-progress-bar {
-    animation: fm-progress-indeterminate 1.2s ease-in-out infinite;
-    width: 35%;
 }
 
 .fm-copy-move-method-row {
@@ -9954,15 +9961,6 @@ html:has(.fm-table-wrapper) body {
     outline: 2px solid var(--main-color);
     outline-offset: 2px;
     border-radius: 3px;
-}
-
-.fm-copy-move-name {
-    margin: 4px 0 0 0;
-    font-size: 11px;
-    color: var(--muted-text);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
 }
 
 /* Upload popup */
@@ -10187,7 +10185,12 @@ html:has(.fm-table-wrapper) body {
 .fm-upload-status {
     margin: 0.5rem 0 0;
     font-size: 0.8125rem;
+    line-height: 1.4;
+    min-height: 1.4em;
     color: #444;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 /* Compress popup */
@@ -10321,57 +10324,12 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     margin-top: 0;
 }
 
-.fm-extract-progress-wrap,
-.fm-copy-move-progress-wrap,
-.fm-delete-progress-wrap {
-    margin-top: 8px;
-}
-
-.fm-delete-phase,
-.fm-copy-move-phase {
-    margin: 6px 0 0 0;
-}
-
-.fm-copy-move-count-wrap {
-    margin: 4px 0 0 0;
-    display: none;
-}
-
 .fm-extract-option-hint {
     margin: 0 0 0.5rem 0;
 }
 
-.fm-extract-wait {
-    margin: 8px 0 0 0;
-}
-
 .fm-copy-move-intro {
     margin: 0 0 0.35rem 0;
-}
-
-/* Progress bar styles */
-.fm-progress-bar-bg {
-    height: 10px;
-    background: rgba(0, 0, 0, 0.08);
-    border-radius: 8px;
-    overflow: hidden;
-}
-
-.fm-progress-bar-fill {
-    height: 100%;
-    width: 0;
-    background: var(--main-color);
-}
-
-.fm-delete-bar {
-    height: 100%;
-    width: 0;
-    background: var(--main-color);
-}
-
-.fm-progress-bar-bg.fm-progress-indeterminate .fm-delete-bar {
-    width: 35%;
-    animation: fm-progress-indeterminate 1.2s ease-in-out infinite;
 }
 
 /* Get-info popup */
@@ -11085,8 +11043,15 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
 .fm-popup-content .fm-cfg-pass-bar .fm-cfg-fileops-pass {
     margin-top: 0;
 }
+/* Room for one error line is always kept, so a message does not change the height. */
 .fm-popup-content .fm-cfg-pass-bar .fm-error {
+    display: block !important;
     margin: 6px 0 0;
+    min-height: 1.4em;
+    line-height: 1.4;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 .fm-input.fm-input--invalid,
 .fm-input.fm-input--invalid:focus {
@@ -12956,6 +12921,16 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     font-size: 12px;
 }
 
+/* One-field forms: the error line is always there (empty), see fmFieldError(). */
+.fm-popup-container .fm-popup-content .fm-field-error {
+    margin: 6px 0 0;
+    min-height: 1.5em;
+    line-height: 1.5;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
 .fm-rename-options {
     display: flex;
     flex-direction: column;
@@ -13070,7 +13045,6 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
         const fm_idle_timeout_minutes = <?php echo (int)fmIdleTimeoutMinutes(); ?>;
         const fm_allowed_ips = <?php echo json_encode(fmAllowedIps()); ?>;
         const fm_client_ip = <?php echo json_encode(fmClientIp()); ?>;
-        const fm_verbose_progress_min_items = <?php echo (int)fmVerboseProgressMinItems(); ?>;
         const fm_trash_basename = <?php echo json_encode(fmTrashBasename()); ?>;
         const fm_php_upload_max_filesize = <?php echo json_encode((string)ini_get('upload_max_filesize')); ?>;
         const fm_php_post_max_size = <?php echo json_encode((string)ini_get('post_max_size')); ?>;
@@ -13343,7 +13317,7 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
 <script>
 /* ===== Shared utilities ===== */
 /**
- * @fileoverview Shared utilities (paths, hash, auth fetch, verbose-progress helpers).
+ * @fileoverview Shared utilities (paths, hash, auth fetch).
  */
 
 /**
@@ -13486,6 +13460,20 @@ function getParentPath(path) {
  * @param {number} maxLen - The maximum length of the string to return
  * @returns {string} - The shortened string
  */
+/**
+ * Error line under the field of a one-field form (rename, new folder, new file). The line always takes its place,
+ * so showing a message does not change the popup height; a long message ends with "…" and is complete on hover.
+ * @param {HTMLElement|null} el - `.fm-field-error`
+ * @param {string} msg - '' clears the line
+ */
+function fmFieldError(el, msg) {
+    if (!el) return;
+    const text = String(msg || '');
+    el.textContent = text || '\u00a0';
+    el.title = text;
+    el.classList.toggle('fm-field-error--on', !!text);
+}
+
 function shortenMiddle(str, maxLen) {
     if (!str) return '';
     const s = String(str);
@@ -13499,29 +13487,6 @@ function shortenMiddle(str, maxLen) {
     if (head < 1) head = 1;
     if (tail < 1) tail = 1;
     return s.slice(0, head) + '...' + s.slice(s.length - tail);
-}
-
-/** Matches PHP `$FM_VERBOSE_PROGRESS_MIN_ITEMS` (injected as `fm_verbose_progress_min_items`). */
-function fmVerboseProgressThreshold() {
-    const v = typeof window.fm_verbose_progress_min_items === 'number' ? window.fm_verbose_progress_min_items : 800;
-    return Math.max(0, v);
-}
-
-/**
- * Prefer server `verbose_progress` from NDJSON (authoritative). If missing, guess from total vs threshold.
- * @param {object|null|undefined} data
- * @param {number} [fallbackTotal]
- * @returns {boolean}
- */
-function fmShouldShowVerboseItemProgress(data, fallbackTotal) {
-    if (data && typeof data.verbose_progress === 'boolean') {
-        return data.verbose_progress;
-    }
-    const th = fmVerboseProgressThreshold();
-    const t = (data && typeof data.total === 'number')
-        ? data.total
-        : (typeof fallbackTotal === 'number' ? fallbackTotal : 0);
-    return th === 0 || t >= th;
 }
 
 /**
@@ -13819,7 +13784,7 @@ function fmIdleHandleUnauthorized() {
  * @fileoverview Modal / popup layer for SoloFileManager.
  * Base: {@link FmPopup}. Domain subclasses include {@link FmDeletePopup}, {@link FmCompressPopup},
  * {@link FmDownloadArchivePopup}, {@link FmExtractPopup}, {@link FmCopyMovePopup}, {@link FmUploadPopup}, {@link FmChmodPopup}, {@link FmBulkRenamePopup}, {@link FmServerInfoPopup},
- * {@link FmNoticePopup}, {@link FmIndeterminateProgressPopup}, {@link FmImageViewerPopup}, and smaller dialogs (rename, new folder, …).
+ * {@link FmNoticePopup}, {@link FmProgressPopup}, {@link FmImageViewerPopup}, and smaller dialogs (rename, new folder, …).
  *
  * FmPopup – JS-driven popup class.
  * Builds modal DOM from config; works with .fm-popup / .fm-popup-container styles.
@@ -14266,57 +14231,141 @@ class FmPopup {
 }
 
 /**
- * Universal blocking popup with an indeterminate (infinite) progress line.
- * Uses the same layout and styles as long-running download / archive waits.
+ * Blocking progress popup for long jobs. Every line has a fixed height, so the popup keeps its size while the job
+ * reports progress: what happens now (up to two lines), "n of total items · pct%" with the elapsed time, the
+ * current file (one line) and a bar that fills when the total is known and moves while it is not.
  *
  * @example
- *   new FmIndeterminateProgressPopup({ title: 'Download', message: 'Preparing file…' }).show();
- *   new FmIndeterminateProgressPopup({ title: 'Archive', messageHtml: '<p>Building…</p>' }).show();
+ *   const p = new FmProgressPopup({ title: 'Delete', phase: 'Counting items…' });
+ *   p.show();
+ *   p.setPhase('Deleting…');
+ *   p.setProgress(120, 2400, 'items');
+ *   p.setName('docs/old/a.txt');
+ *   p.hideAndDestroy();
  */
-class FmIndeterminateProgressPopup extends FmPopup {
+class FmProgressPopup extends FmPopup {
     /**
      * @param {Object} [options]
      * @param {string} [options.title='Please wait']
-     * @param {string} [options.message] - Plain text; wrapped in a left-aligned paragraph (HTML-escaped)
-     * @param {string} [options.messageHtml] - Raw HTML above the bar; takes precedence over `message`
-     * @param {string} [options.maxWidth='440px']
-     * @param {string} [options.className=''] - Extra class on the root (in addition to `fm-download-progress-popup`)
+     * @param {string} [options.phase] - First text of the "what happens now" line
+     * @param {string} [options.maxWidth='460px']
+     * @param {string} [options.className=''] - Extra class on the root (in addition to `fm-progress-popup`)
      */
     constructor(options = {}) {
         const {
             title = 'Please wait',
-            message,
-            messageHtml,
-            maxWidth = '440px',
+            phase = 'Please wait\u2026',
+            maxWidth = '460px',
             className = '',
             ...rest
         } = options;
 
-        let bodyHtml;
-        if (messageHtml != null && String(messageHtml).trim() !== '') {
-            bodyHtml = String(messageHtml);
-        } else if (message != null && String(message).trim() !== '') {
-            bodyHtml = '<p>' + FmPopup.escapeHtml(String(message)) + '</p>';
-        } else {
-            bodyHtml = '<p>Please wait\u2026</p>';
-        }
-
-        const content =
-            bodyHtml +
-            '<div class="fm-progress-wrap fm-download-progress-line"><div class="fm-progress-bar"></div></div>';
-
         super({
             title,
-            content,
+            content:
+                '<div class="fm-pp-phase"></div>' +
+                '<div class="fm-pp-counts"><span class="fm-pp-count">\u00a0</span><span class="fm-pp-time">0:00</span></div>' +
+                '<div class="fm-pp-name">\u00a0</div>' +
+                '<div class="fm-progress-wrap fm-pp-bar"><div class="fm-progress-bar"></div></div>',
             buttons: [],
             closeOnBackdrop: false,
             closeOnEscape: false,
             showHeaderClose: false,
             showKeyboardHints: false,
-            className: ('fm-download-progress-popup ' + className).trim(),
+            className: ('fm-progress-popup ' + className).trim(),
             maxWidth,
             ...rest,
         });
+        this._startedAt = Date.now();
+        this._clock = null;
+        this.setPhase(phase);
+    }
+
+    show() {
+        super.show();
+        this._startedAt = Date.now();
+        this._showElapsed();
+        if (!this._clock) this._clock = setInterval(() => this._showElapsed(), 1000);
+    }
+
+    hide(onFinish = null) {
+        if (this._clock) {
+            clearInterval(this._clock);
+            this._clock = null;
+        }
+        return super.hide(onFinish);
+    }
+
+    _line(cls) {
+        return this.el ? this.el.querySelector('.' + cls) : null;
+    }
+
+    _showElapsed() {
+        const el = this._line('fm-pp-time');
+        if (!el) return;
+        const s = Math.floor((Date.now() - this._startedAt) / 1000);
+        el.textContent = Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+    }
+
+    /** @param {string} text - what happens now */
+    setPhase(text) {
+        const el = this._line('fm-pp-phase');
+        if (!el) return;
+        el.textContent = text || '\u00a0';
+        el.title = text || '';
+    }
+
+    /**
+     * @param {number|null} n - done so far (null: nothing to count)
+     * @param {number} [total] - 0 / missing: not known (count only, moving bar)
+     * @param {string} [unit='items']
+     */
+    setProgress(n, total, unit = 'items') {
+        const el = this._line('fm-pp-count');
+        const known = typeof total === 'number' && total > 0;
+        const num = (x) => Number(x).toLocaleString();
+        if (el) {
+            if (typeof n !== 'number') {
+                el.textContent = '\u00a0';
+            } else if (known) {
+                const done = Math.min(n, total);
+                el.textContent = num(done) + ' of ' + num(total) + ' ' + unit + ' \u00b7 ' + Math.floor(done * 100 / total) + '%';
+            } else {
+                el.textContent = num(n) + ' ' + unit;
+            }
+        }
+        this._setBar(known && typeof n === 'number' ? Math.min(100, n * 100 / total) : null);
+    }
+
+    /** Percent of a step without a count (e.g. compressing). */
+    setPercent(pct, label = 'done') {
+        const el = this._line('fm-pp-count');
+        const p = Math.max(0, Math.min(100, Math.round(Number(pct) || 0)));
+        if (el) el.textContent = p + '% ' + label;
+        this._setBar(p);
+    }
+
+    /** @param {string} name - current file; long paths keep their start and end */
+    setName(name) {
+        const el = this._line('fm-pp-name');
+        if (!el) return;
+        const s = String(name || '');
+        el.textContent = s ? (typeof shortenMiddle === 'function' ? shortenMiddle(s, 64) : s) : '\u00a0';
+        el.title = s;
+    }
+
+    /** Bar moves without a known end. */
+    indeterminate() {
+        this._setBar(null);
+    }
+
+    _setBar(pct) {
+        const wrap = this._line('fm-pp-bar');
+        const bar = wrap && wrap.querySelector('.fm-progress-bar');
+        if (!bar) return;
+        const known = typeof pct === 'number' && isFinite(pct);
+        wrap.classList.toggle('fm-progress-wrap--determinate', known);
+        bar.style.width = known ? Math.max(0, Math.min(100, pct)) + '%' : '';
     }
 }
 
@@ -14986,7 +15035,7 @@ class FmCreateNewFolderPopup extends FmPopup {
 
         super({
             title: 'Create new folder',
-            content: `<label><span>Folder name</span><input type="text" name="folder-name" class="fm-input-focus-on-open fm-input" autocomplete="off" placeholder="folder-name"></label><p class="fm-error" data-err style="display:none"></p>`,
+            content: `<label><span>Folder name</span><input type="text" name="folder-name" class="fm-input-focus-on-open fm-input" autocomplete="off" placeholder="folder-name"></label><p class="fm-error fm-field-error" data-err>&nbsp;</p>`,
             buttons: [
                 { label: 'Cancel', close: true },
                 { label: 'Create', primary: true, close: false, onClick: () => this._handleCreate() }
@@ -15005,21 +15054,19 @@ class FmCreateNewFolderPopup extends FmPopup {
         const input = this.querySelector('input');
         const err   = this.querySelector('[data-err]');
         if (err) {
-            err.style.display = 'none';
+            fmFieldError(err, '');
         }
 
         const name = (input ? input.value : '').trim();
         if (!name) {
             if (err) {
-                err.textContent = 'Enter a folder name';
-                err.style.display = 'block';
+                fmFieldError(err, 'Enter a folder name');
             }
             return;
         }
         if (/[\\/:*?"<>|]/.test(name)) {
             if (err) {
-                err.textContent = 'Name cannot contain \\ / : * ? " < > |';
-                err.style.display = 'block';
+                fmFieldError(err, 'Name cannot contain \\ / : * ? " < > |');
             }
             return;
         }
@@ -15039,15 +15086,13 @@ class FmCreateNewFolderPopup extends FmPopup {
                     this.hideAndDestroy();
                 } else {
                     if (err) {
-                        err.textContent = data.msg || 'Could not create folder';
-                        err.style.display = 'block';
+                        fmFieldError(err, data.msg || 'Could not create folder');
                     }
                 }
             })
             .catch(() => {
                 if (err) {
-                    err.textContent = 'Could not create folder';
-                    err.style.display = 'block';
+                    fmFieldError(err, 'Could not create folder');
                 }
             });
     }
@@ -15075,7 +15120,7 @@ class FmNewFolderFromSelectionPopup extends FmPopup {
                 '<p class="fm-hint mt-0 mb-2">Selected items will be moved into a new subfolder in this directory.</p>' +
                 '<label><span>New folder name</span>' +
                 '<input type="text" name="folder-name" class="fm-input-focus-on-open fm-input" autocomplete="off" placeholder="folder-name"></label>' +
-                '<p class="fm-error" data-err style="display:none"></p>',
+                '<p class="fm-error fm-field-error" data-err>&nbsp;</p>',
             buttons: [
                 { label: 'Cancel', close: true },
                 { label: 'Create and move', primary: true, close: false, onClick: () => this._handleSubmit() },
@@ -15096,29 +15141,26 @@ class FmNewFolderFromSelectionPopup extends FmPopup {
         const input = this.querySelector('input');
         const err   = this.querySelector('[data-err]');
         if (err) {
-            err.style.display = 'none';
+            fmFieldError(err, '');
         }
 
         const name = (input ? input.value : '').trim();
         if (!name) {
             if (err) {
-                err.textContent = 'Enter a folder name';
-                err.style.display = 'block';
+                fmFieldError(err, 'Enter a folder name');
             }
             return;
         }
         if (/[\\/:*?"<>|]/.test(name)) {
             if (err) {
-                err.textContent = 'Name cannot contain \\ / : * ? " < > |';
-                err.style.display = 'block';
+                fmFieldError(err, 'Name cannot contain \\ / : * ? " < > |');
             }
             return;
         }
 
         if (this._names.length === 0) {
             if (err) {
-                err.textContent = 'Nothing selected';
-                err.style.display = 'block';
+                fmFieldError(err, 'Nothing selected');
             }
             return;
         }
@@ -15169,7 +15211,7 @@ class FmCreateFilePopup extends FmPopup {
 
         super({
             title: 'Create new file',
-            content: `<label><span>File name</span><input type="text" name="file-name" class="fm-input-focus-on-open fm-input" autocomplete="off" placeholder="filename.txt"></label><p class="fm-error" data-err style="display:none"></p>`,
+            content: `<label><span>File name</span><input type="text" name="file-name" class="fm-input-focus-on-open fm-input" autocomplete="off" placeholder="filename.txt"></label><p class="fm-error fm-field-error" data-err>&nbsp;</p>`,
             buttons: [
                 { label: 'Cancel', close: true },
                 { label: 'Create', primary: true, close: false, onClick: () => this._handleCreate() }
@@ -15188,21 +15230,19 @@ class FmCreateFilePopup extends FmPopup {
         const input = this.querySelector('input');
         const err   = this.querySelector('[data-err]');
         if (err) {
-            err.style.display = 'none';
+            fmFieldError(err, '');
         }
 
         const name = (input ? input.value : '').trim();
         if (!name) {
             if (err) {
-                err.textContent = 'Enter a file name';
-                err.style.display = 'block';
+                fmFieldError(err, 'Enter a file name');
             }
             return;
         }
         if (/[\\/:*?"<>|]/.test(name)) {
             if (err) {
-                err.textContent = 'Name cannot contain \\ / : * ? " < > |';
-                err.style.display = 'block';
+                fmFieldError(err, 'Name cannot contain \\ / : * ? " < > |');
             }
             return;
         }
@@ -15222,15 +15262,13 @@ class FmCreateFilePopup extends FmPopup {
                     this.hideAndDestroy();
                 } else {
                     if (err) {
-                        err.textContent = data.msg || 'Could not create file';
-                        err.style.display = 'block';
+                        fmFieldError(err, data.msg || 'Could not create file');
                     }
                 }
             })
             .catch(() => {
                 if (err) {
-                    err.textContent = 'Could not create file';
-                    err.style.display = 'block';
+                    fmFieldError(err, 'Could not create file');
                 }
             });
     }
@@ -15373,163 +15411,71 @@ class FmDeletePopup extends FmPopup {
     }
 
     /**
-     * Permanent delete via delete-stream (OS first when allowed, PHP with progress otherwise).
+     * Permanent delete via delete-stream (OS first when allowed, PHP otherwise). The server counts the items and
+     * reports each one deleted, or a keep-alive "tick" while an OS command that prints nothing is running.
      */
     _runPermanentDeleteChain(liveNames, onAllDone) {
         const pathIn = this._currentPath === this._rootDir ? '' : this._currentPath.slice(this._rootDir.length + 1);
-        const finishTrashed = () => {
-            if (typeof onAllDone === 'function') onAllDone();
-        };
-
         if (!liveNames.length) {
-            finishTrashed();
+            if (typeof onAllDone === 'function') onAllDone();
             return;
         }
-
-        const opsMode = typeof fm_file_ops_mode === 'string' ? String(fm_file_ops_mode).toLowerCase() : 'auto';
-        const usePhpDeleteUiFirst = opsMode === 'php' || !this._execAvailable;
-
-        if (usePhpDeleteUiFirst) {
-            const loadPopup = new FmPopup({
-                title: 'Delete',
-                content:
-                    '<div>' +
-                    '<p class="fm-progress-label">Preparing delete forever\u2026</p>' +
-                    '<p class="fm-delete-phase fm-hint">Counting items to delete.</p>' +
-                    '<div class="fm-progress-wrap fm-delete-progress-wrap"><div class="fm-progress-bar"></div></div>' +
-                    '</div>',
-                buttons: [],
-                closeOnBackdrop: false,
-                closeOnEscape: false,
-                maxWidth: '460px'
-            });
-            loadPopup.show();
-
-            const countForm = new FormData();
-            countForm.append('action', 'get-files-and-folders-count');
-            countForm.append('in', pathIn);
-            liveNames.forEach((n) => countForm.append('names[]', n));
-
-            fetch(this._ajaxUrl, fmPostInit(countForm))
-                .then((r) => r.json())
-                .then((countData) => {
-                    loadPopup.hideAndDestroy();
-                    const total = (countData.status === 'success' && typeof countData.total === 'number')
-                        ? countData.total
-                        : liveNames.length;
-                    this._runStream(pathIn, total, 'php', liveNames, finishTrashed);
-                })
-                .catch(() => {
-                    loadPopup.hideAndDestroy();
-                    fmUserNotice({ title: 'Delete', message: 'Could not count items to delete.' });
-                });
-        } else {
-            const streamMethod = opsMode === 'os' ? 'os' : 'auto';
-            this._runStream(pathIn, 0, streamMethod, liveNames, finishTrashed);
-        }
+        this._runStream(pathIn, liveNames, () => {
+            if (typeof onAllDone === 'function') onAllDone();
+        });
     }
 
     /**
      * @param {string} pathIn
-     * @param {number} total
-     * @param {string} method
      * @param {string[]} [namesList]
      * @param {() => void} [thenFn]
      */
-    _runStream(pathIn, total, method, namesList, thenFn) {
+    _runStream(pathIn, namesList, thenFn) {
         const names = (namesList && namesList.length) ? namesList : this._names;
-        // `auto` uses the detailed DOM so PHP fallback can show n/total; only pure `os` uses the shell-only layout.
-        const isOsMode = (method === 'os');
-        const progressPopup = new FmPopup({
-            title: 'Delete',
-            content: isOsMode
-                ? '<div>' +
-                  '<p class="fm-progress-label">Deleting (OS commands)\u2026</p>' +
-                  '<p class="fm-delete-phase fm-hint">Please wait (this can take a while).</p>' +
-                  '<div class="fm-progress-wrap fm-delete-progress-wrap"><div class="fm-progress-bar"></div></div>' +
-                  '</div>'
-                : `<div><p class="fm-progress-label">Deleting\u2026 <span class="fm-delete-count">0 / ${total}</span></p>` +
-                  `<p class="fm-delete-name" title=""></p>` +
-                  `<div class="fm-progress-bar-bg">` +
-                  `<div class="fm-delete-bar"></div></div></div>`,
-            buttons: [],
-            closeOnBackdrop: false,
-            closeOnEscape: false,
-            maxWidth: '460px'
-        });
-        progressPopup.show();
-
-        const countEl = progressPopup.querySelector('.fm-delete-count');
-        const nameEl = progressPopup.querySelector('.fm-delete-name');
-        const barEl = progressPopup.querySelector('.fm-delete-bar');
-        const barWrap = barEl ? barEl.parentElement : null;
-
-        let runningTotal = total;
-        let verboseItems = fmShouldShowVerboseItemProgress(null, total);
-
-        const applyDeleteProgressMode = () => {
-            if (!barWrap) return;
-            if (verboseItems) {
-                barWrap.classList.remove('fm-progress-indeterminate');
-                if (countEl) countEl.style.display = '';
-                if (nameEl) nameEl.style.display = '';
-            } else {
-                barWrap.classList.add('fm-progress-indeterminate');
-                if (countEl) countEl.style.display = 'none';
-                if (nameEl) nameEl.style.display = 'none';
-                if (barEl) barEl.style.width = '';
-            }
+        const popup = new FmProgressPopup({ title: 'Delete', phase: 'Counting items to delete\u2026' });
+        popup.show();
+        let total = 0;
+        let failed = false;
+        const fail = (msg) => {
+            failed = true;
+            popup.hideAndDestroy();
+            fmUserNotice({ title: 'Delete', message: msg });
         };
-        applyDeleteProgressMode();
 
         const streamForm = new FormData();
         streamForm.append('action', 'delete-stream');
         streamForm.append('in', pathIn);
         names.forEach((n) => streamForm.append('names[]', n));
 
+        const processLine = (line) => {
+            line = String(line || '').trim();
+            if (!line || failed) return;
+            let data;
+            try { data = JSON.parse(line); } catch (e) { return; }
+            if (data.error) {
+                fail(data.error);
+                return;
+            }
+            if (typeof data.total === 'number' && data.total > 0 && total === 0) {
+                total = data.total;
+                popup.setPhase('Deleting\u2026');
+            }
+            if (data.fallback === 'php') popup.setPhase('The OS command failed, deleting in PHP\u2026');
+            if (typeof data.n === 'number') {
+                popup.setProgress(data.n, total);
+                if (typeof data.name === 'string') popup.setName(data.name);
+            }
+        };
+
         fetch(this._ajaxUrl, fmPostInit(streamForm))
             .then((response) => {
                 if (!response.ok || !response.body) {
-                    progressPopup.hideAndDestroy();
-                    fmUserNotice({ title: 'Delete', message: 'Delete failed.' });
+                    fail('Delete failed.');
                     return;
                 }
                 const reader = response.body.getReader();
                 const decoder = new TextDecoder();
                 let buffer = '';
-                let failed = false;
-
-                const processLine = (line) => {
-                    line = String(line || '').trim();
-                    if (!line) return;
-                    try {
-                        const data = JSON.parse(line);
-                        if (typeof data.total === 'number' && data.total > 0) {
-                            runningTotal = data.total;
-                        }
-                        if (data && Object.prototype.hasOwnProperty.call(data, 'verbose_progress')) {
-                            verboseItems = !!data.verbose_progress;
-                            applyDeleteProgressMode();
-                        }
-                        if (typeof data.n === 'number' && countEl && barEl) {
-                            const t = runningTotal > 0 ? runningTotal : total;
-                            if (verboseItems) {
-                                countEl.textContent = data.n + ' / ' + (t > 0 ? t : '\u2026');
-                                if (nameEl) {
-                                    nameEl.textContent = shortenMiddle(data.name || '', 50);
-                                    nameEl.title = data.name || '';
-                                }
-                                barEl.style.width = (t > 0 ? (data.n / t * 100) : 100) + '%';
-                            }
-                        }
-                        if (data.error) {
-                            failed = true;
-                            progressPopup.hideAndDestroy();
-                            fmUserNotice({ title: 'Delete', message: data.error });
-                        }
-                    } catch (e) { /* ignore */ }
-                };
-
                 const readChunk = () => {
                     reader.read().then((result) => {
                         if (result.value) buffer += decoder.decode(result.value, { stream: !result.done });
@@ -15539,7 +15485,7 @@ class FmDeletePopup extends FmPopup {
                         if (result.done) {
                             if (buffer) processLine(buffer);
                             if (!failed) {
-                                progressPopup.hideAndDestroy();
+                                popup.hideAndDestroy();
                                 if (typeof thenFn === 'function') {
                                     thenFn();
                                 } else if (this._onSuccess) {
@@ -15550,15 +15496,13 @@ class FmDeletePopup extends FmPopup {
                         }
                         if (!failed) readChunk();
                     }).catch(() => {
-                        progressPopup.hideAndDestroy();
-                        fmUserNotice({ title: 'Delete', message: 'Delete failed.' });
+                        if (!failed) fail('Delete failed (the connection was lost). Refresh the folder to see what was deleted.');
                     });
                 };
                 readChunk();
             })
             .catch(() => {
-                progressPopup.hideAndDestroy();
-                fmUserNotice({ title: 'Delete', message: 'Delete failed.' });
+                if (!failed) fail('Delete failed.');
             });
     }
 }
@@ -15929,7 +15873,9 @@ class FmCompressPopup extends FmPopup {
                     return;
                 }
                 const job = jobs[idx++];
-                FmCompressPopup._setBusyText(busyPopup, 'Archive ' + idx + ' of ' + jobs.length + ': ' + job.archiveName);
+                busyPopup.setPhase('Archive ' + idx + ' of ' + jobs.length + ': ' + job.archiveName);
+                busyPopup.setProgress(null);
+                busyPopup.setName('');
                 this._runCompressJob(busyPopup, job.archiveName, [job.itemName], type, allowOverwrite).then((r) => {
                     if (r.ok) {
                         nextJob();
@@ -15973,32 +15919,12 @@ class FmCompressPopup extends FmPopup {
         });
     }
 
-    /** Progress popup for archive jobs: a message line and a progress line under it. */
+    /** Progress popup for archive jobs. */
     static _busyPopup() {
-        return new FmIndeterminateProgressPopup({
+        return new FmProgressPopup({
             title: 'Archive',
-            messageHtml: '<p class="mt-0 fm-archive-busy-text">The server is building your archive. Large folders may take a while.</p>' +
-                '<p class="mt-0 fm-archive-busy-progress">&nbsp;</p>',
+            phase: 'The server is building your archive. Large folders may take a while.',
         });
-    }
-
-    static _setBusyText(popup, text, progress) {
-        const el = popup && popup.el;
-        if (!el) return;
-        const t = el.querySelector('.fm-archive-busy-text');
-        const p = el.querySelector('.fm-archive-busy-progress');
-        if (t && text != null) t.textContent = text;
-        if (p && progress != null) p.textContent = progress || '\u00a0';
-    }
-
-    /** Fill the progress line to pct (0–100); null brings back the moving (unknown progress) line. */
-    static _setBusyBar(popup, pct) {
-        const wrap = popup && popup.el && popup.el.querySelector('.fm-progress-wrap');
-        const bar = wrap && wrap.querySelector('.fm-progress-bar');
-        if (!bar) return;
-        const known = typeof pct === 'number' && isFinite(pct);
-        wrap.classList.toggle('fm-progress-wrap--determinate', known);
-        bar.style.width = known ? Math.max(0, Math.min(100, pct)) + '%' : '';
     }
 
     /**
@@ -16032,18 +15958,15 @@ class FmCompressPopup extends FmPopup {
         form.append('dl_token', token);
         names.forEach((n) => form.append('names[]', n));
 
-        const progressText = (n, name) => {
-            const count = total > 0 ? Number(n).toLocaleString() + ' of ' + total.toLocaleString() + ' files' : Number(n).toLocaleString() + ' files';
-            return count + (name ? ' · ' + (name.length > 60 ? '…' + name.slice(-59) : name) : '');
-        };
-        // Files done fill the line while files are added; the compressing step (gzip, PHP zip) fills it again by its percent.
+        // Files done fill the bar while files are added; the compressing step (gzip, PHP zip) fills it again by its percent.
         const showFiles = (n, name) => {
-            FmCompressPopup._setBusyText(busyPopup, null, progressText(n, name));
-            FmCompressPopup._setBusyBar(busyPopup, total > 0 ? Math.min(100, n * 100 / total) : null);
+            busyPopup.setProgress(n, total, 'files');
+            if (name !== null) busyPopup.setName(name);
         };
         const showPct = (pct, msg) => {
-            FmCompressPopup._setBusyText(busyPopup, msg || 'Compressing…', pct + '% compressed');
-            FmCompressPopup._setBusyBar(busyPopup, pct);
+            busyPopup.setPhase(msg || 'Compressing\u2026');
+            busyPopup.setPercent(pct, 'compressed');
+            busyPopup.setName('');
         };
         let result = null;
         try {
@@ -16063,7 +15986,7 @@ class FmCompressPopup extends FmPopup {
                 else if (d.done) result = { ok: true };
                 else if (typeof d.pct === 'number') showPct(d.pct, d.msg);
                 else if (typeof d.n === 'number' && d.n > 0) showFiles(d.n, d.name || '');
-                else if (d.msg) FmCompressPopup._setBusyText(busyPopup, d.msg);
+                else if (d.msg) busyPopup.setPhase(d.msg);
             };
             for (;;) {
                 const { value, done } = await reader.read();
@@ -16083,7 +16006,8 @@ class FmCompressPopup extends FmPopup {
         if (result) return result;
 
         // The connection ended before "done" or "error": follow the job on the server.
-        FmCompressPopup._setBusyText(busyPopup, 'The connection was interrupted, but the server is still building the archive. Waiting for it to finish…');
+        busyPopup.setPhase('The connection was interrupted, but the server is still building the archive. Waiting for it to finish\u2026');
+        busyPopup.setName('');
         const unknown = {
             ok: false, unknown: true,
             error: 'The connection to the server was lost while the archive was being built, and its result cannot be checked on this server. It may still be finishing: refresh the folder in a minute to see whether the archive is there.',
@@ -16107,7 +16031,7 @@ class FmCompressPopup extends FmPopup {
             if (st === 'untracked' || ((st === 'pending' || st === 'unknown') && Date.now() - startedWaiting > 30000)) return unknown;
             if (st === 'preparing' || st === 'streaming') {
                 if (typeof d.pct === 'number') showPct(d.pct, 'The connection was interrupted, but the server is still compressing the archive…');
-                else if (typeof d.items === 'number' && d.items > 0) showFiles(d.items, '');
+                else if (typeof d.items === 'number' && d.items > 0) showFiles(d.items, null);
                 if (typeof d.now === 'number' && typeof d.heartbeat === 'number' && d.now - d.heartbeat > 120) {
                     return { ok: false, error: 'Archiving stopped on the server (no progress for 2 minutes; a hosting time limit may have stopped it). The archive may be incomplete.' };
                 }
@@ -16217,23 +16141,10 @@ class FmExtractPopup extends FmPopup {
 
         this.hideAndDestroy();
 
-        const waitPopup = new FmPopup({
-            title: 'Extract',
-            content:
-                '<div>' +
-                '<p class="fm-progress-label">Extracting\u2026</p>' +
-                '<p class="fm-hint fm-extract-wait">Please wait.</p>' +
-                '<div class="fm-progress-wrap fm-extract-progress-wrap"><div class="fm-progress-bar"></div></div>' +
-                '</div>',
-            buttons: [],
-            closeOnBackdrop: false,
-            closeOnEscape:   false,
-            maxWidth:        '420px'
-        });
+        const waitPopup = new FmProgressPopup({ title: 'Extract', phase: 'Extracting\u2026' });
         waitPopup.show();
-
-        const extractBarWrap = waitPopup.querySelector('.fm-extract-progress-wrap');
         let finished = false;
+        let total = 0;
 
         const form = new FormData();
         form.append('action', 'extract');
@@ -16254,12 +16165,11 @@ class FmExtractPopup extends FmPopup {
                     if (!line) return;
                     let data;
                     try { data = JSON.parse(line); } catch (e) { return; }
-                    if (data && Object.prototype.hasOwnProperty.call(data, 'verbose_progress')) {
-                        if (!data.verbose_progress && extractBarWrap) {
-                            extractBarWrap.classList.add('fm-progress-indeterminate');
-                        } else if (extractBarWrap) {
-                            extractBarWrap.classList.remove('fm-progress-indeterminate');
-                        }
+                    if (typeof data.total === 'number' && data.total > 0) total = data.total;
+                    if (data.msg) waitPopup.setPhase(data.msg);
+                    if (typeof data.n === 'number' && !finished) {
+                        waitPopup.setProgress(data.n, total, 'entries');
+                        if (typeof data.name === 'string') waitPopup.setName(data.name);
                     }
                     if (data.error && !finished) {
                         finished = true;
@@ -16285,7 +16195,15 @@ class FmExtractPopup extends FmPopup {
                 };
 
                 const pump = () => reader.read().then(res => {
-                    if (res.done) { if (buffer) handleLine(buffer); return; }
+                    if (res.done) {
+                        if (buffer) handleLine(buffer);
+                        if (!finished) {
+                            finished = true;
+                            waitPopup.hideAndDestroy();
+                            fmUserNotice({ title: 'Extract', message: 'Extract stopped: the connection was lost. Refresh the folder to see what was extracted.' });
+                        }
+                        return;
+                    }
                     buffer += decoder.decode(res.value, { stream: true });
                     const lines = buffer.split('\n');
                     buffer = lines.pop() || '';
@@ -16328,7 +16246,7 @@ class FmRenamePopup extends FmPopup {
 
         super({
             title:   'Rename',
-            content: '<p><label><span>New name</span><input type="text" name="new-name" class="fm-input-focus-on-open fm-input" autocomplete="off"></label></p><p class="fm-error" data-err style="display:none"></p>',
+            content: '<p><label><span>New name</span><input type="text" name="new-name" class="fm-input-focus-on-open fm-input" autocomplete="off"></label></p><p class="fm-error fm-field-error" data-err>&nbsp;</p>',
             submitOnEnter: true,
             buttons: [
                 { label: 'Cancel', close: true },
@@ -16364,12 +16282,12 @@ class FmRenamePopup extends FmPopup {
     _handleRename() {
         const input = this.querySelector('input');
         const err   = this.querySelector('[data-err]');
-        if (err) err.style.display = 'none';
+        if (err) fmFieldError(err, '');
 
         const name = (input ? input.value : '').trim();
 
         if (!name) {
-            if (err) { err.textContent = 'Enter a name'; err.style.display = 'block'; }
+            if (err) { fmFieldError(err, 'Enter a name'); }
             return;
         }
         if (name === this._currentName) {
@@ -16377,7 +16295,7 @@ class FmRenamePopup extends FmPopup {
             return;
         }
         if (/[\\/:*?"<>|]/.test(name)) {
-            if (err) { err.textContent = 'Name cannot contain \\ / : * ? " < > |'; err.style.display = 'block'; }
+            if (err) { fmFieldError(err, 'Name cannot contain \\ / : * ? " < > |'); }
             return;
         }
 
@@ -16681,9 +16599,6 @@ class FmServerInfoPopup extends FmPopup {
             (ipCount > 0 ? 'On (' + ipCount + (ipCount === 1 ? ' entry' : ' entries') + ')' : 'Off (everyone)') +
             (proxyCount > 0 ? ', ' + proxyCount + ' trusted ' + (proxyCount === 1 ? 'proxy' : 'proxies') : '')
         );
-        const verboseTh = typeof data.verbose_progress_min_items === 'number'
-            ? FmPopup.escapeHtml(String(data.verbose_progress_min_items))
-            : esc(null);
         const authLine = data.auth_enabled === false
             ? '<span class="fm-info-danger">Off — anyone who knows this URL has full access</span>'
             : (data.auth_enabled === true ? 'On' : esc(null));
@@ -16696,7 +16611,6 @@ class FmServerInfoPopup extends FmPopup {
             ['Session idle lock',     idleLine],
             ['IP allowlist',          ipLine],
             ['Your IP',               esc(data.client_ip)],
-            ['Verbose progress (≥ N items)', verboseTh],
             ['PHP SAPI',              esc(data.php_sapi)],
             ['Server software',       esc(data.server_software)],
             ['Operating system',      esc(data.os)],
@@ -17976,174 +17890,74 @@ class FmCopyMovePopup extends FmPopup {
 
         this.hideAndDestroy();
 
-        const pathIn = this._pathIn();
-        const useIndeterminateFirst = this._execAvailable;
-
-        if (!useIndeterminateFirst) {
-            const loadPopup = new FmPopup({
-                title:   this._operation === 'move' ? 'Move' : 'Copy',
-                content: '<p>Counting items\u2026</p>',
-                buttons: [], closeOnBackdrop: false, closeOnEscape: false, maxWidth: '460px'
-            });
-            loadPopup.show();
-            const countForm = new FormData();
-            countForm.append('action', 'get-files-and-folders-count');
-            countForm.append('in', pathIn);
-            this._names.forEach(n => countForm.append('names[]', n));
-            fetch(this._ajaxUrl, fmPostInit(countForm))
-                .then(r => r.json())
-                .then(countData => {
-                    loadPopup.hideAndDestroy();
-                    const total = (countData.status === 'success' && typeof countData.total === 'number')
-                        ? countData.total
-                        : this._names.length;
-                    this._runCopyMoveStream(pathIn, destRel, total, false);
-                })
-                .catch(() => {
-                    loadPopup.hideAndDestroy();
-                    this._runCopyMoveStream(pathIn, destRel, this._names.length, false);
-                });
-        } else {
-            this._runCopyMoveStream(pathIn, destRel, 0, true);
-        }
+        // The server counts the items first and sends the total in its first line.
+        this._runCopyMoveStream(this._pathIn(), destRel);
     }
 
-    _runCopyMoveStream(pathIn, destRel, totalHint, startIndeterminate) {
+    _runCopyMoveStream(pathIn, destRel) {
         const verb = this._operation === 'move' ? 'Move' : 'Copy';
-        const progressPopup = new FmPopup({
-            title: verb,
-            content:
-                '<div class="fm-copy-move-progress">' +
-                '<p class="fm-progress-label fm-copy-move-progress-label">Working\u2026</p>' +
-                '<p class="fm-copy-move-phase fm-hint"></p>' +
-                '<p class="fm-copy-move-count-wrap fm-hint">' +
-                '<span class="fm-copy-move-count">0</span> / <span class="fm-copy-move-total">0</span></p>' +
-                '<p class="fm-copy-move-name" title=""></p>' +
-                '<div class="fm-progress-wrap fm-copy-move-progress-wrap"><div class="fm-progress-bar fm-copy-move-progress-bar"></div></div>' +
-                '</div>',
-            buttons: [],
-            closeOnBackdrop: false,
-            closeOnEscape:   false,
-            maxWidth:        '460px'
-        });
-        progressPopup.show();
-
-        const labelEl   = progressPopup.querySelector('.fm-copy-move-progress-label');
-        const phaseEl   = progressPopup.querySelector('.fm-copy-move-phase');
-        const countWrap = progressPopup.querySelector('.fm-copy-move-count-wrap');
-        const countEl   = progressPopup.querySelector('.fm-copy-move-count');
-        const totalEl   = progressPopup.querySelector('.fm-copy-move-total');
-        const nameEl    = progressPopup.querySelector('.fm-copy-move-name');
-        const barEl     = progressPopup.querySelector('.fm-copy-move-progress-bar');
-        const barWrap   = progressPopup.querySelector('.fm-copy-move-progress-wrap');
-
-        let total  = totalHint > 0 ? totalHint : 0;
-        let indet  = !!startIndeterminate;
-        let failed = false;
-        let verboseItems = fmShouldShowVerboseItemProgress(null, totalHint);
-
-        const applyIndeterminateUi = (msg) => {
-            indet = true;
-            if (labelEl) labelEl.textContent = verb + ' (OS)\u2026';
-            if (phaseEl) phaseEl.textContent = msg || 'Please wait (this can take a while).';
-            if (countWrap) countWrap.style.display = 'none';
-            if (barWrap) barWrap.classList.add('fm-progress-indeterminate');
-            if (barEl) barEl.style.width = '';
-        };
-
-        const applyDeterminateUi = (t) => {
-            indet = false;
-            if (barWrap) barWrap.classList.remove('fm-progress-indeterminate');
-            total = t > 0 ? t : total;
-            if (labelEl) labelEl.textContent = verb + '\u2026';
-            if (phaseEl) phaseEl.textContent = '';
-            if (countWrap) countWrap.style.display = verboseItems ? '' : 'none';
-            if (totalEl) totalEl.textContent = String(total || 0);
-            if (countEl) countEl.textContent = '0';
-            if (barEl) barEl.style.width = '0%';
-            if (!verboseItems && barWrap) barWrap.classList.add('fm-progress-indeterminate');
-            if (nameEl) nameEl.style.display = verboseItems ? '' : 'none';
-        };
-
-        if (startIndeterminate) applyIndeterminateUi('');
-        else applyDeterminateUi(totalHint);
-
         const form = new FormData();
         form.append('action', 'copy-move-stream');
         form.append('operation', this._operation);
         form.append('in', pathIn);
         form.append('dest', destRel);
         this._names.forEach(n => form.append('names[]', n));
+        FmCopyMovePopup._followStream(this._ajaxUrl, form, verb, verb === 'Move' ? 'Moving' : 'Copying', this._onSuccess);
+    }
 
-        fetch(this._ajaxUrl, fmPostInit(form))
+    /**
+     * Follow a copy / move / duplicate job (NDJSON) in one progress popup: {total}, {n, name}, {msg},
+     * {fallback: 'php'}, {tick} (keep-alive while an OS command prints nothing), {error}, {done}.
+     * @param {string} ajaxUrl
+     * @param {FormData} form
+     * @param {string} title - popup and notice title
+     * @param {string} verbing - e.g. "Copying"
+     * @param {(() => void)|null} onSuccess
+     */
+    static _followStream(ajaxUrl, form, title, verbing, onSuccess) {
+        const popup = new FmProgressPopup({ title, phase: 'Counting items\u2026' });
+        popup.show();
+        let total = 0;
+        let finished = false;
+        const fail = (msg) => {
+            finished = true;
+            popup.hideAndDestroy();
+            fmUserNotice({ title, message: msg });
+        };
+        const processLine = (line) => {
+            line = String(line || '').trim();
+            if (!line || finished) return;
+            let data;
+            try { data = JSON.parse(line); } catch (e) { return; }
+            if (data.error) {
+                fail(data.error);
+                return;
+            }
+            if (data.done) {
+                finished = true;
+                popup.hideAndDestroy();
+                if (onSuccess) onSuccess();
+                return;
+            }
+            if (typeof data.total === 'number' && data.total > 0) total = data.total;
+            if (data.fallback === 'php') popup.setPhase('The OS command failed, ' + verbing.toLowerCase() + ' in PHP\u2026');
+            else if (data.msg) popup.setPhase(data.msg);
+            else if (typeof data.n === 'number') popup.setPhase(verbing + '\u2026');
+            if (typeof data.n === 'number') {
+                popup.setProgress(data.n, total);
+                if (typeof data.name === 'string') popup.setName(data.name);
+            }
+        };
+        const lost = title + ' stopped: the connection was lost. Refresh the folder to see what was done.';
+        fetch(ajaxUrl, fmPostInit(form))
             .then(response => {
                 if (!response.ok || !response.body) {
-                    progressPopup.hideAndDestroy();
-                    fmUserNotice({ title: verb, message: verb + ' failed.' });
+                    fail(title + ' failed.');
                     return;
                 }
                 const reader  = response.body.getReader();
                 const decoder = new TextDecoder();
                 let buffer    = '';
-
-                const processLine = (line) => {
-                    line = String(line || '').trim();
-                    if (!line) return;
-                    let data;
-                    try { data = JSON.parse(line); } catch (e) { return; }
-                    if (data && Object.prototype.hasOwnProperty.call(data, 'verbose_progress')) {
-                        verboseItems = !!data.verbose_progress;
-                        if (!indet) {
-                            if (countWrap) countWrap.style.display = verboseItems ? '' : 'none';
-                            if (nameEl) nameEl.style.display = verboseItems ? '' : 'none';
-                            if (barWrap) {
-                                if (verboseItems) barWrap.classList.remove('fm-progress-indeterminate');
-                                else barWrap.classList.add('fm-progress-indeterminate');
-                            }
-                        }
-                    }
-                    if (data.error) {
-                        failed = true;
-                        progressPopup.hideAndDestroy();
-                        fmUserNotice({ title: verb, message: data.error });
-                        return;
-                    }
-                    if (data.done) {
-                        if (!failed) {
-                            progressPopup.hideAndDestroy();
-                            if (this._onSuccess) this._onSuccess();
-                        }
-                        return;
-                    }
-                    if (data.indeterminate) {
-                        applyIndeterminateUi(data.msg || '');
-                        return;
-                    }
-                    if (data.fallback === 'php' && typeof data.total === 'number') {
-                        applyDeterminateUi(data.total);
-                        return;
-                    }
-                    if (typeof data.total === 'number' && data.total > 0 && indet) {
-                        applyDeterminateUi(data.total);
-                    }
-                    if (typeof data.n === 'number' && countEl && barEl && !indet) {
-                        const t = typeof data.total === 'number' && data.total > 0 ? data.total : total;
-                        if (t > 0) total = t;
-                        if (totalEl) totalEl.textContent = String(total);
-                        if (verboseItems) {
-                            if (countWrap) countWrap.style.display = '';
-                            if (barWrap) barWrap.classList.remove('fm-progress-indeterminate');
-                            if (nameEl) nameEl.style.display = '';
-                            countEl.textContent = String(data.n);
-                            if (nameEl) {
-                                nameEl.textContent = shortenMiddle(data.name || '', 48);
-                                nameEl.title = data.name || '';
-                            }
-                            barEl.style.width = (total > 0 ? Math.min(100, (data.n / total) * 100) : 0) + '%';
-                        }
-                    }
-                };
-
                 const readChunk = () => {
                     reader.read().then(result => {
                         if (result.value) buffer += decoder.decode(result.value, { stream: !result.done });
@@ -18152,359 +17966,45 @@ class FmCopyMovePopup extends FmPopup {
                         lines.forEach(processLine);
                         if (result.done) {
                             if (buffer) processLine(buffer);
+                            if (!finished) fail(lost);
                             return;
                         }
-                        if (!failed) readChunk();
+                        if (!finished) readChunk();
                     }).catch(() => {
-                        if (!failed) {
-                            failed = true;
-                            progressPopup.hideAndDestroy();
-                            fmUserNotice({ title: verb, message: verb + ' failed.' });
-                        }
+                        if (!finished) fail(lost);
                     });
                 };
                 readChunk();
             })
             .catch(() => {
-                progressPopup.hideAndDestroy();
-                fmUserNotice({ title: verb, message: verb + ' failed.' });
+                if (!finished) fail(title + ' failed.');
             });
     }
 
     /**
      * Same-folder duplicate (generated names): NDJSON stream like copy.
      * @param {string} pathIn - Path relative to root (POST `in`)
-     * @param {number} totalHint
-     * @param {boolean} startIndeterminate
      */
-    _runDuplicateStream(pathIn, totalHint, startIndeterminate) {
-        const verb = 'Duplicate';
-        const progressPopup = new FmPopup({
-            title: verb,
-            content:
-                '<div class="fm-copy-move-progress">' +
-                '<p class="fm-progress-label fm-copy-move-progress-label">Working\u2026</p>' +
-                '<p class="fm-copy-move-phase fm-hint"></p>' +
-                '<p class="fm-copy-move-count-wrap fm-hint">' +
-                '<span class="fm-copy-move-count">0</span> / <span class="fm-copy-move-total">0</span></p>' +
-                '<p class="fm-copy-move-name" title=""></p>' +
-                '<div class="fm-progress-wrap fm-copy-move-progress-wrap"><div class="fm-progress-bar fm-copy-move-progress-bar"></div></div>' +
-                '</div>',
-            buttons: [],
-            closeOnBackdrop: false,
-            closeOnEscape:   false,
-            maxWidth:        '460px'
-        });
-        progressPopup.show();
-
-        const labelEl   = progressPopup.querySelector('.fm-copy-move-progress-label');
-        const phaseEl   = progressPopup.querySelector('.fm-copy-move-phase');
-        const countWrap = progressPopup.querySelector('.fm-copy-move-count-wrap');
-        const countEl   = progressPopup.querySelector('.fm-copy-move-count');
-        const totalEl   = progressPopup.querySelector('.fm-copy-move-total');
-        const nameEl    = progressPopup.querySelector('.fm-copy-move-name');
-        const barEl     = progressPopup.querySelector('.fm-copy-move-progress-bar');
-        const barWrap   = progressPopup.querySelector('.fm-copy-move-progress-wrap');
-
-        let total  = totalHint > 0 ? totalHint : 0;
-        let indet  = !!startIndeterminate;
-        let failed = false;
-        let verboseItems = fmShouldShowVerboseItemProgress(null, totalHint);
-
-        const applyIndeterminateUi = (msg) => {
-            indet = true;
-            if (labelEl) labelEl.textContent = verb + ' (OS)\u2026';
-            if (phaseEl) phaseEl.textContent = msg || 'Please wait (this can take a while).';
-            if (countWrap) countWrap.style.display = 'none';
-            if (barWrap) barWrap.classList.add('fm-progress-indeterminate');
-            if (barEl) barEl.style.width = '';
-        };
-
-        const applyDeterminateUi = (t) => {
-            indet = false;
-            if (barWrap) barWrap.classList.remove('fm-progress-indeterminate');
-            total = t > 0 ? t : total;
-            if (labelEl) labelEl.textContent = verb + '\u2026';
-            if (phaseEl) phaseEl.textContent = '';
-            if (countWrap) countWrap.style.display = verboseItems ? '' : 'none';
-            if (totalEl) totalEl.textContent = String(total || 0);
-            if (countEl) countEl.textContent = '0';
-            if (barEl) barEl.style.width = '0%';
-            if (!verboseItems && barWrap) barWrap.classList.add('fm-progress-indeterminate');
-            if (nameEl) nameEl.style.display = verboseItems ? '' : 'none';
-        };
-
-        if (startIndeterminate) applyIndeterminateUi('');
-        else applyDeterminateUi(totalHint);
-
+    _runDuplicateStream(pathIn) {
         const form = new FormData();
         form.append('action', 'duplicate-stream');
         form.append('in', pathIn);
         this._names.forEach(n => form.append('names[]', n));
-
-        fetch(this._ajaxUrl, fmPostInit(form))
-            .then(response => {
-                if (!response.ok || !response.body) {
-                    progressPopup.hideAndDestroy();
-                    fmUserNotice({ title: verb, message: verb + ' failed.' });
-                    return;
-                }
-                const reader  = response.body.getReader();
-                const decoder = new TextDecoder();
-                let buffer    = '';
-
-                const processLine = (line) => {
-                    line = String(line || '').trim();
-                    if (!line) return;
-                    let data;
-                    try { data = JSON.parse(line); } catch (e) { return; }
-                    if (data && Object.prototype.hasOwnProperty.call(data, 'verbose_progress')) {
-                        verboseItems = !!data.verbose_progress;
-                        if (!indet) {
-                            if (countWrap) countWrap.style.display = verboseItems ? '' : 'none';
-                            if (nameEl) nameEl.style.display = verboseItems ? '' : 'none';
-                            if (barWrap) {
-                                if (verboseItems) barWrap.classList.remove('fm-progress-indeterminate');
-                                else barWrap.classList.add('fm-progress-indeterminate');
-                            }
-                        }
-                    }
-                    if (data.error) {
-                        failed = true;
-                        progressPopup.hideAndDestroy();
-                        fmUserNotice({ title: verb, message: data.error });
-                        return;
-                    }
-                    if (data.done) {
-                        if (!failed) {
-                            progressPopup.hideAndDestroy();
-                            if (this._onSuccess) this._onSuccess();
-                        }
-                        return;
-                    }
-                    if (data.indeterminate) {
-                        applyIndeterminateUi(data.msg || '');
-                        return;
-                    }
-                    if (data.fallback === 'php' && typeof data.total === 'number') {
-                        applyDeterminateUi(data.total);
-                        return;
-                    }
-                    if (typeof data.total === 'number' && data.total > 0 && indet) {
-                        applyDeterminateUi(data.total);
-                    }
-                    if (typeof data.n === 'number' && countEl && barEl && !indet) {
-                        const t = typeof data.total === 'number' && data.total > 0 ? data.total : total;
-                        if (t > 0) total = t;
-                        if (totalEl) totalEl.textContent = String(total);
-                        if (verboseItems) {
-                            if (countWrap) countWrap.style.display = '';
-                            if (barWrap) barWrap.classList.remove('fm-progress-indeterminate');
-                            if (nameEl) nameEl.style.display = '';
-                            countEl.textContent = String(data.n);
-                            if (nameEl) {
-                                nameEl.textContent = shortenMiddle(data.name || '', 48);
-                                nameEl.title = data.name || '';
-                            }
-                            barEl.style.width = (total > 0 ? Math.min(100, (data.n / total) * 100) : 0) + '%';
-                        }
-                    }
-                };
-
-                const readChunk = () => {
-                    reader.read().then(result => {
-                        if (result.value) buffer += decoder.decode(result.value, { stream: !result.done });
-                        const lines = buffer.split('\n');
-                        buffer = lines.pop() || '';
-                        lines.forEach(processLine);
-                        if (result.done) {
-                            if (buffer) processLine(buffer);
-                            return;
-                        }
-                        if (!failed) readChunk();
-                    }).catch(() => {
-                        if (!failed) {
-                            failed = true;
-                            progressPopup.hideAndDestroy();
-                            fmUserNotice({ title: verb, message: verb + ' failed.' });
-                        }
-                    });
-                };
-                readChunk();
-            })
-            .catch(() => {
-                progressPopup.hideAndDestroy();
-                fmUserNotice({ title: verb, message: verb + ' failed.' });
-            });
+        FmCopyMovePopup._followStream(this._ajaxUrl, form, 'Duplicate', 'Duplicating', this._onSuccess);
     }
 
     /**
      * Create a subfolder in the current directory and move selected items into it (NDJSON stream).
      * @param {string} pathIn - Relative to root (`POST in`)
      * @param {string} folderName - New folder basename
-     * @param {number} totalHint
-     * @param {boolean} startIndeterminate
      */
-    _runNewFolderFromSelectionStream(pathIn, folderName, totalHint, startIndeterminate) {
-        const verb = 'Move';
-        const progressPopup = new FmPopup({
-            title: verb,
-            content:
-                '<div class="fm-copy-move-progress">' +
-                '<p class="fm-progress-label fm-copy-move-progress-label">Working\u2026</p>' +
-                '<p class="fm-copy-move-phase fm-hint"></p>' +
-                '<p class="fm-copy-move-count-wrap fm-hint">' +
-                '<span class="fm-copy-move-count">0</span> / <span class="fm-copy-move-total">0</span></p>' +
-                '<p class="fm-copy-move-name" title=""></p>' +
-                '<div class="fm-progress-wrap fm-copy-move-progress-wrap"><div class="fm-progress-bar fm-copy-move-progress-bar"></div></div>' +
-                '</div>',
-            buttons: [],
-            closeOnBackdrop: false,
-            closeOnEscape:   false,
-            maxWidth:        '460px',
-        });
-        progressPopup.show();
-
-        const labelEl   = progressPopup.querySelector('.fm-copy-move-progress-label');
-        const phaseEl   = progressPopup.querySelector('.fm-copy-move-phase');
-        const countWrap = progressPopup.querySelector('.fm-copy-move-count-wrap');
-        const countEl   = progressPopup.querySelector('.fm-copy-move-count');
-        const totalEl   = progressPopup.querySelector('.fm-copy-move-total');
-        const nameEl    = progressPopup.querySelector('.fm-copy-move-name');
-        const barEl     = progressPopup.querySelector('.fm-copy-move-progress-bar');
-        const barWrap   = progressPopup.querySelector('.fm-copy-move-progress-wrap');
-
-        let total  = totalHint > 0 ? totalHint : 0;
-        let indet  = !!startIndeterminate;
-        let failed = false;
-        let verboseItems = fmShouldShowVerboseItemProgress(null, totalHint);
-
-        const applyIndeterminateUi = (msg) => {
-            indet = true;
-            if (labelEl) labelEl.textContent = verb + ' (OS)\u2026';
-            if (phaseEl) phaseEl.textContent = msg || 'Please wait (this can take a while).';
-            if (countWrap) countWrap.style.display = 'none';
-            if (barWrap) barWrap.classList.add('fm-progress-indeterminate');
-            if (barEl) barEl.style.width = '';
-        };
-
-        const applyDeterminateUi = (t) => {
-            indet = false;
-            if (barWrap) barWrap.classList.remove('fm-progress-indeterminate');
-            total = t > 0 ? t : total;
-            if (labelEl) labelEl.textContent = verb + '\u2026';
-            if (phaseEl) phaseEl.textContent = '';
-            if (countWrap) countWrap.style.display = verboseItems ? '' : 'none';
-            if (totalEl) totalEl.textContent = String(total || 0);
-            if (countEl) countEl.textContent = '0';
-            if (barEl) barEl.style.width = '0%';
-            if (!verboseItems && barWrap) barWrap.classList.add('fm-progress-indeterminate');
-            if (nameEl) nameEl.style.display = verboseItems ? '' : 'none';
-        };
-
-        if (startIndeterminate) applyIndeterminateUi('');
-        else applyDeterminateUi(totalHint);
-
+    _runNewFolderFromSelectionStream(pathIn, folderName) {
         const form = new FormData();
         form.append('action', 'new-folder-from-selection-stream');
         form.append('in', pathIn);
         form.append('name', folderName);
         this._names.forEach((n) => form.append('names[]', n));
-
-        fetch(this._ajaxUrl, fmPostInit(form))
-            .then((response) => {
-                if (!response.ok || !response.body) {
-                    progressPopup.hideAndDestroy();
-                    fmUserNotice({ title: 'New folder from selection', message: 'Could not complete the operation.' });
-                    return;
-                }
-                const reader  = response.body.getReader();
-                const decoder = new TextDecoder();
-                let buffer    = '';
-
-                const processLine = (line) => {
-                    line = String(line || '').trim();
-                    if (!line) return;
-                    let data;
-                    try { data = JSON.parse(line); } catch (e) { return; }
-                    if (data && Object.prototype.hasOwnProperty.call(data, 'verbose_progress')) {
-                        verboseItems = !!data.verbose_progress;
-                        if (!indet) {
-                            if (countWrap) countWrap.style.display = verboseItems ? '' : 'none';
-                            if (nameEl) nameEl.style.display = verboseItems ? '' : 'none';
-                            if (barWrap) {
-                                if (verboseItems) barWrap.classList.remove('fm-progress-indeterminate');
-                                else barWrap.classList.add('fm-progress-indeterminate');
-                            }
-                        }
-                    }
-                    if (data.error) {
-                        failed = true;
-                        progressPopup.hideAndDestroy();
-                        fmUserNotice({ title: 'New folder from selection', message: data.error });
-                        return;
-                    }
-                    if (data.done) {
-                        if (!failed) {
-                            progressPopup.hideAndDestroy();
-                            if (this._onSuccess) this._onSuccess();
-                        }
-                        return;
-                    }
-                    if (data.indeterminate) {
-                        applyIndeterminateUi(data.msg || '');
-                        return;
-                    }
-                    if (data.fallback === 'php' && typeof data.total === 'number') {
-                        applyDeterminateUi(data.total);
-                        return;
-                    }
-                    if (typeof data.total === 'number' && data.total > 0 && indet) {
-                        applyDeterminateUi(data.total);
-                    }
-                    if (typeof data.n === 'number' && countEl && barEl && !indet) {
-                        const t = typeof data.total === 'number' && data.total > 0 ? data.total : total;
-                        if (t > 0) total = t;
-                        if (totalEl) totalEl.textContent = String(total);
-                        if (verboseItems) {
-                            if (countWrap) countWrap.style.display = '';
-                            if (barWrap) barWrap.classList.remove('fm-progress-indeterminate');
-                            if (nameEl) nameEl.style.display = '';
-                            countEl.textContent = String(data.n);
-                            if (nameEl) {
-                                nameEl.textContent = shortenMiddle(data.name || '', 48);
-                                nameEl.title = data.name || '';
-                            }
-                            barEl.style.width = (total > 0 ? Math.min(100, (data.n / total) * 100) : 0) + '%';
-                        }
-                    }
-                };
-
-                const readChunk = () => {
-                    reader.read().then((result) => {
-                        if (result.value) buffer += decoder.decode(result.value, { stream: !result.done });
-                        const lines = buffer.split('\n');
-                        buffer = lines.pop() || '';
-                        lines.forEach(processLine);
-                        if (result.done) {
-                            if (buffer) processLine(buffer);
-                            return;
-                        }
-                        if (!failed) readChunk();
-                    }).catch(() => {
-                        if (!failed) {
-                            failed = true;
-                            progressPopup.hideAndDestroy();
-                            fmUserNotice({ title: 'New folder from selection', message: 'Operation failed.' });
-                        }
-                    });
-                };
-                readChunk();
-            })
-            .catch(() => {
-                progressPopup.hideAndDestroy();
-                fmUserNotice({ title: 'New folder from selection', message: 'Operation failed.' });
-            });
+        FmCopyMovePopup._followStream(this._ajaxUrl, form, 'New folder from selection', 'Moving', this._onSuccess);
     }
 
     /**
@@ -18552,41 +18052,7 @@ class FmCopyMovePopup extends FmPopup {
             _execAvailable: execOk,
         };
 
-        const useIndeterminateFirst = execOk;
-
-        if (!useIndeterminateFirst) {
-            const loadPopup = new FmPopup({
-                title:   'New folder from selection',
-                content: '<p>Counting items\u2026</p>',
-                buttons: [], closeOnBackdrop: false, closeOnEscape: false, maxWidth: '460px',
-            });
-            loadPopup.show();
-            const countForm = new FormData();
-            countForm.append('action', 'get-files-and-folders-count');
-            countForm.append('in', pathIn);
-            names.forEach((n) => countForm.append('names[]', n));
-            fetch(ajaxUrl, fmPostInit(countForm))
-                .then((r) => r.json())
-                .then((countData) => {
-                    loadPopup.hideAndDestroy();
-                    const total = (countData.status === 'success' && typeof countData.total === 'number')
-                        ? countData.total
-                        : names.length;
-                    FmCopyMovePopup.prototype._runNewFolderFromSelectionStream.call(
-                        ctx, pathIn, folderName, total, false
-                    );
-                })
-                .catch(() => {
-                    loadPopup.hideAndDestroy();
-                    FmCopyMovePopup.prototype._runNewFolderFromSelectionStream.call(
-                        ctx, pathIn, folderName, names.length, false
-                    );
-                });
-        } else {
-            FmCopyMovePopup.prototype._runNewFolderFromSelectionStream.call(
-                ctx, pathIn, folderName, 0, true
-            );
-        }
+        FmCopyMovePopup.prototype._runNewFolderFromSelectionStream.call(ctx, pathIn, folderName);
     }
 
     /**
@@ -18674,35 +18140,7 @@ class FmCopyMovePopup extends FmPopup {
             _execAvailable: execOk,
         };
 
-        const useIndeterminateFirst = execOk;
-
-        if (!useIndeterminateFirst) {
-            const loadPopup = new FmPopup({
-                title:   op === 'move' ? 'Move' : 'Copy',
-                content: '<p>Counting items\u2026</p>',
-                buttons: [], closeOnBackdrop: false, closeOnEscape: false, maxWidth: '460px'
-            });
-            loadPopup.show();
-            const countForm = new FormData();
-            countForm.append('action', 'get-files-and-folders-count');
-            countForm.append('in', pathIn);
-            names.forEach(n => countForm.append('names[]', n));
-            fetch(ajaxUrl, fmPostInit(countForm))
-                .then(r => r.json())
-                .then(countData => {
-                    loadPopup.hideAndDestroy();
-                    const total = (countData.status === 'success' && typeof countData.total === 'number')
-                        ? countData.total
-                        : names.length;
-                    FmCopyMovePopup.prototype._runCopyMoveStream.call(ctx, pathIn, destRel, total, false);
-                })
-                .catch(() => {
-                    loadPopup.hideAndDestroy();
-                    FmCopyMovePopup.prototype._runCopyMoveStream.call(ctx, pathIn, destRel, names.length, false);
-                });
-        } else {
-            FmCopyMovePopup.prototype._runCopyMoveStream.call(ctx, pathIn, destRel, 0, true);
-        }
+        FmCopyMovePopup.prototype._runCopyMoveStream.call(ctx, pathIn, destRel);
     }
 
     /**
@@ -18748,35 +18186,7 @@ class FmCopyMovePopup extends FmPopup {
             _execAvailable: execOk,
         };
 
-        const useIndeterminateFirst = execOk;
-
-        if (!useIndeterminateFirst) {
-            const loadPopup = new FmPopup({
-                title:   'Duplicate',
-                content: '<p>Counting items\u2026</p>',
-                buttons: [], closeOnBackdrop: false, closeOnEscape: false, maxWidth: '460px'
-            });
-            loadPopup.show();
-            const countForm = new FormData();
-            countForm.append('action', 'get-files-and-folders-count');
-            countForm.append('in', pathIn);
-            names.forEach(n => countForm.append('names[]', n));
-            fetch(ajaxUrl, fmPostInit(countForm))
-                .then(r => r.json())
-                .then(countData => {
-                    loadPopup.hideAndDestroy();
-                    const total = (countData.status === 'success' && typeof countData.total === 'number')
-                        ? countData.total
-                        : names.length;
-                    FmCopyMovePopup.prototype._runDuplicateStream.call(ctx, pathIn, total, false);
-                })
-                .catch(() => {
-                    loadPopup.hideAndDestroy();
-                    FmCopyMovePopup.prototype._runDuplicateStream.call(ctx, pathIn, names.length, false);
-                });
-        } else {
-            FmCopyMovePopup.prototype._runDuplicateStream.call(ctx, pathIn, 0, true);
-        }
+        FmCopyMovePopup.prototype._runDuplicateStream.call(ctx, pathIn);
     }
 }
 
@@ -18949,7 +18359,7 @@ class FmUploadPopup extends FmPopup {
                 '<input type="file" class="fm-upload-input-files fm-hidden" multiple aria-hidden="true">' +
                 '<input type="file" class="fm-upload-input-dir fm-hidden" multiple aria-hidden="true">' +
                 '<div class="fm-upload-queue-wrap"><div class="fm-upload-queue-title">Queued</div><div class="fm-upload-queue"></div></div>' +
-                '<p class="fm-upload-status fm-hidden" role="status"></p>',
+                '<p class="fm-upload-status" role="status">\u00a0</p>',
             buttons: [
                 { label: 'Cancel', close: true },
                 { label: 'Upload', primary: true, close: false, onClick: () => this._submitUpload() },
@@ -19599,7 +19009,6 @@ class FmUploadPopup extends FmPopup {
             });
         }
         if (statusEl) {
-            statusEl.style.display = '';
             statusEl.textContent = 'Ready — ' + pendingTuples.length + ' file(s) to upload.';
         }
 
@@ -21301,7 +20710,7 @@ class FmImageViewerPopup {
 
 if (typeof window !== 'undefined') {
     window.FmPopup                      = FmPopup;
-    window.FmIndeterminateProgressPopup = FmIndeterminateProgressPopup;
+    window.FmProgressPopup              = FmProgressPopup;
     window.FmNoticePopup                = FmNoticePopup;
     window.fmUserNotice                 = fmUserNotice;
     window.fmToast                      = fmToast;
@@ -27970,6 +27379,7 @@ document.getElementById('fm-table-config-btn').addEventListener('click', () => {
                 const showServerErr = (msg, passProblem) => {
                     if (opsErr) {
                         opsErr.textContent = msg;
+                        opsErr.title = msg;
                         opsErr.style.display = 'block';
                     }
                     syncPassBar(p);
