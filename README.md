@@ -6,7 +6,7 @@ Manage files directly from your browser — without installing WordPress, Larave
 
 ### One PHP file. No installation. No database.
 
-Current version: **1.8.0** — see [CHANGELOG.md](CHANGELOG.md)
+Current version: **1.8.1** — see [CHANGELOG.md](CHANGELOG.md)
 
 ## Why SoloFileManager?
 
@@ -177,7 +177,8 @@ Current version: **1.8.0** — see [CHANGELOG.md](CHANGELOG.md)
 - Compress / extract archives; big archives show files done and keep going when the hosting drops a long request (the dialog then waits for the result); entries that would land outside the root folder (links, `..`, absolute paths) are skipped and listed
 - Change permissions (chmod) for folders and files, including recursive 0755 / 0644 style fixes
 - Convert encoding of text files (selected files, search results, or every text file in a folder with a name mask and "only not UTF-8"): detects BOM, UTF-8, UTF-16 and guesses legacy encodings (Windows-1251, KOI8-R, CP866, Windows-1252, ARMSCII-8), shows the file before and after, converts to UTF-8 or another encoding with optional BOM and LF / CRLF line endings, replacing the file or saving a copy next to it. Needs the `iconv` or `mbstring` PHP extension
-- Upload (large files in parts, with retries on connection problems; asks Replace / Skip / Keep both when names already exist), get info, copy paths
+- Upload (large files in parts, with retries on connection problems; asks Replace / Skip / Keep both when names already exist), get info (for several selected items: count, total size with everything inside, file types, modified range, permissions), copy paths
+- Popups can be moved by dragging their title bar (mouse or touch); double-click the title bar to centre a popup again
 - Download files, or folders and multiple items as ZIP / TAR / TAR.GZ — the browser download starts immediately while the archive is built; failures show the real reason
 - Configuration popup (columns, permissions display, folder-size behavior, heavy file-ops mode)
 - Change password from the UI (updates `$PASSWORD_HASH` in the same PHP file when writable)
@@ -225,7 +226,7 @@ The `tests/` folder is for development only (it is not included in release archi
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). Latest: **1.8.0** — one progress window for every long job (items done of the total, percent, current file, elapsed time, also for the server's own `rm` / `cp` / `unzip` / `tar`), and popups that no longer jump when progress or error messages appear.
+See [CHANGELOG.md](CHANGELOG.md). Latest: **1.8.1** — popups can be moved by their title bar, Get info shows a summary for several selected items, and actions on more than about 1,000 selected items no longer handle only the first ~1,000.
 
 ## License
 

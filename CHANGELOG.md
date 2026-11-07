@@ -2,6 +2,23 @@
 
 All notable changes to SoloFileManager are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.8.1] - 2026-11-07
+
+### Added
+
+- Popups can be moved: drag the title bar (mouse or touch). A moved popup stays where it was put, also when it grows, and stays inside the window; double-click the title bar to centre it again. Every popup opens centred
+- Get info for several selected items (also in search results): number of folders, files and links, total size with everything inside the folders, how many files and folders they hold in total, file types (the 8 most common, the full list on hover), modified range, permissions and the folder they are in. Large selections show how far the counting got
+- Server info shows PHP's `max_input_vars`
+
+### Fixed
+
+- Actions on more than about 1,000 selected items (delete forever, move to Trash, restore, copy, move, archive, permissions, download) handled only the first ~1,000: PHP's `max_input_vars` (1000 on most hosts) silently drops the rest of the form. Long selections are now sent as one field. This happens with large pages ("Items per page" 1,000 / 5,000 / All) and large search results
+- Copy, move and delete of many single files in auto file ops mode took minutes (one OS command per file, each waited at least 0.25 s, since 1.8.0); plain files are now handled in PHP and OS commands are checked more often while they run. A copied file keeps its modified time and permissions
+- After saving a setting in Configuration (or Terminal settings, the password) the page could still show the old value for a few seconds on hosts with PHP OPcache; the cached script is now refreshed right after the file is written
+- Get info of one folder took a second or more on large folders: the size and the counts of what it holds were found by two separate passes (`du`, then a second request). They now come in the same answer from one pass. The folder count no longer includes the folder itself
+- Every request (Info, folder list, folder size, any action) spent about 0.3 s before doing its work on Windows: it started four programs to see which archive tools the server has, and checked the default password twice (each check is deliberately slow). Both answers are now kept in the session: the tools are checked again after 10 minutes and whenever Server info is opened. On XAMPP for Windows Info of a file now takes about 25 ms instead of 330 ms
+- After a hard refresh (or the first visit) the toolbar could be cut off on the right with no "More" (⋯) button: it was measured before the icon font had arrived, and the icons are wider once it has. The toolbar is measured again when the fonts have loaded
+
 ## [1.8.0] - 2026-11-07
 
 ### Changed

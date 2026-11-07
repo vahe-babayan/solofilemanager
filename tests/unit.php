@@ -153,6 +153,10 @@ section('Sessions');
 check('session name is SOLOFM_ + 16 hex', (bool)preg_match('/^SOLOFM_[0-9a-f]{16}$/', fmSessionName()));
 check('password fingerprint differs per hash', fmPasswordFingerprint('a') !== fmPasswordFingerprint('b'));
 check('password fingerprint is stable', fmPasswordFingerprint('a') === fmPasswordFingerprint('a'));
+$adminHash = password_hash('admin', PASSWORD_DEFAULT);
+$otherHash = password_hash('not-admin-123', PASSWORD_DEFAULT);
+check('default password found, also when asked again',
+    fmPasswordIsDefault($adminHash) && fmPasswordIsDefault($adminHash) && !fmPasswordIsDefault($otherHash) && !fmPasswordIsDefault($otherHash) && !fmPasswordIsDefault(''));
 
 section('Folder listing');
 file_put_contents($root . '/sub/big.bin', str_repeat('x', 1234));
@@ -460,6 +464,19 @@ try {
     $gzErr = $e->getMessage();
 }
 check('gzip in PHP: a missing source is an error and writes nothing', $gzErr !== '' && !file_exists($base . '/missing.tar.gz'), $gzErr);
+
+section('Long selections in one field');
+check('fm_lists put back as arrays, other fields kept, short lists merged',
+    fmUnpackPostLists(['action' => 'x', 'names' => ['a'], 'fm_lists' => json_encode(['names' => ['b', 'c'], 'ids' => ['1', 2]])])
+    === ['action' => 'x', 'names' => ['a', 'b', 'c'], 'ids' => ['1', '2']]);
+check('fm_lists refused: not JSON, bad key, nested values',
+    fmUnpackPostLists(['fm_lists' => '{oops']) === null
+    && fmUnpackPostLists(['fm_lists' => json_encode(['action' => ['x'], 'Bad-Key' => ['y']])]) === null
+    && fmUnpackPostLists(['fm_lists' => json_encode(['names' => [['nested']]])]) === null
+    && fmUnpackPostLists(['fm_lists' => json_encode(['names' => 'text'])]) === null);
+
+check('Get info types: most files first, ties by name, no extension as ""',
+    fmInfoTypes(['txt' => 3, 'jpg' => 5, '' => 1, 'png' => 3]) === [['jpg', 5], ['png', 3], ['txt', 3], ['', 1]]);
 
 section('Progress of OS commands');
 $osLines = [

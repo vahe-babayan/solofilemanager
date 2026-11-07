@@ -8,7 +8,7 @@ declare(strict_types=1);
  */
 
 /** Product version (semver). Shown in UI / server info. */
-const SOLOFILEMANAGER_VERSION = '1.8.0';
+const SOLOFILEMANAGER_VERSION = '1.8.1';
 
 // Set max execution time to 1 day (86400 seconds)
 @set_time_limit(86400);
@@ -107,7 +107,7 @@ $isUnixLikeShell = $isLinux || $isMacOS;
 
 fmIpAllowlistEnforce();
 
-$serverCapabilities = fmServerCapabilities();
+$serverCapabilities = fmServerCapabilities(($_GET['action'] ?? '') === 'get-server-info');
 
 // =========================
 // Universal helpers & capability probe
@@ -834,8 +834,10 @@ function fmFileOpsAllowPhpFallback(): bool {
 }
 
 /**
- * Per-request cached environment (PHP extensions + light shell probes when exec() works).
+ * Environment (PHP extensions + shell probes when exec() works), kept in the session for 10 minutes:
+ * the four probes start processes, about 200 ms per request on Windows.
  *
+ * @param bool $fresh Probe again even when the session has a recent answer (Server info)
  * @throws RuntimeException
  * @return array{
  *   exec_available: bool,
@@ -851,13 +853,23 @@ function fmFileOpsAllowPhpFallback(): bool {
  *   shell_unzip: bool
  * }
  */
-function fmServerCapabilities(): array {
+function fmServerCapabilities(bool $fresh = false): array {
     static $cached = null;
     if ($cached !== null) {
         return $cached;
     }
     global $isLinux, $isWindows, $isMacOS;
     $execOk = fmIsExecAvailable();
+    $sig = hash('sha256', PHP_VERSION . '|' . PHP_OS . '|' . ($execOk ? '1' : '0') . '|' . (string)getenv('PATH'));
+    $useSession = PHP_SAPI !== 'cli' && !headers_sent();
+    if ($useSession) {
+        ensureSession();
+        $saved = $_SESSION['fm_caps'] ?? null;
+        if (!$fresh && is_array($saved) && ($saved['sig'] ?? '') === $sig && is_array($saved['caps'] ?? null)
+            && (int)($saved['at'] ?? 0) > time() - 600) {
+            return $cached = $saved['caps'];
+        }
+    }
     $shellZip = false;
     $shellTar = false;
     $shellGzip = false;
@@ -885,6 +897,9 @@ function fmServerCapabilities(): array {
         'shell_gzip'     => $shellGzip,
         'shell_unzip'    => $shellUnzip,
     ];
+    if ($useSession) {
+        $_SESSION['fm_caps'] = ['sig' => $sig, 'at' => time(), 'caps' => $cached];
+    }
     return $cached;
 }
 
@@ -1027,6 +1042,36 @@ function fmCsrfToken(): string {
  *
  * @return bool
  */
+/**
+ * POST fields with the lists from `fm_lists` (JSON {"names": [...], "paths": [...]}) put back as normal arrays.
+ * The client packs long `name[]` lists into that one field because PHP silently drops every field past
+ * max_input_vars (1000 by default). Null when the field is not a JSON object of string lists.
+ *
+ * @param array<string, mixed> $post
+ * @return array<string, mixed>|null
+ */
+function fmUnpackPostLists(array $post): ?array {
+    $lists = json_decode((string)($post['fm_lists'] ?? ''), true);
+    if (!is_array($lists)) {
+        return null;
+    }
+    unset($post['fm_lists']);
+    foreach ($lists as $key => $values) {
+        if (!is_string($key) || !preg_match('/^[a-z_]{1,40}$/', $key) || !is_array($values)) {
+            return null;
+        }
+        $clean = [];
+        foreach ($values as $v) {
+            if (!is_string($v) && !is_int($v)) {
+                return null;
+            }
+            $clean[] = (string)$v;
+        }
+        $post[$key] = array_merge(isset($post[$key]) && is_array($post[$key]) ? $post[$key] : [], $clean);
+    }
+    return $post;
+}
+
 function fmCsrfRequestIsValid(): bool {
     ensureSession();
     $expected = $_SESSION['fm_csrf'] ?? '';
@@ -1476,9 +1521,27 @@ function isAuthed(bool $enableAuth): bool {
 
 /**
  * True when the configured hash still matches the shipped default password "admin".
+ * The answer is kept per hash for the request and in the session: password_verify() costs about 60 ms.
  */
 function fmPasswordIsDefault(string $passwordHash): bool {
-    return $passwordHash !== '' && password_verify('admin', $passwordHash);
+    static $known = [];
+    if ($passwordHash === '') {
+        return false;
+    }
+    if (isset($known[$passwordHash])) {
+        return $known[$passwordHash];
+    }
+    $key = hash('sha256', $passwordHash);
+    $active = session_status() === PHP_SESSION_ACTIVE;
+    $saved = $active ? ($_SESSION['fm_pw_default'] ?? null) : null;
+    if (is_array($saved) && ($saved['hash'] ?? '') === $key && is_bool($saved['default'] ?? null)) {
+        return $known[$passwordHash] = $saved['default'];
+    }
+    $isDefault = password_verify('admin', $passwordHash);
+    if ($active) {
+        $_SESSION['fm_pw_default'] = ['hash' => $key, 'default' => $isDefault];
+    }
+    return $known[$passwordHash] = $isDefault;
 }
 
 /**
@@ -1499,12 +1562,16 @@ function fmWriteScriptContents(string $newSrc): array {
     $replaced = @rename($tmp, $path);
     if (!$replaced) {
         // Windows often cannot rename over an existing file.
-        if (@copy($tmp, $path)) {
+        if (!@copy($tmp, $path)) {
             @unlink($tmp);
-            return ['ok' => true];
+            return ['ok' => false, 'reason' => 'replace_failed'];
         }
         @unlink($tmp);
-        return ['ok' => false, 'reason' => 'replace_failed'];
+    }
+    // With OPcache the next request would still run the old compiled script for a few seconds (the page reloads
+    // right after a setting is saved and showed the old value).
+    if (function_exists('opcache_invalidate')) {
+        @opcache_invalidate($path, true);
     }
     return ['ok' => true];
 }
@@ -3201,6 +3268,15 @@ function copyPathPhp(string $src, string $dst, string $rootDir, int &$count, cal
         }
         if (!@copy($src, $dst)) {
             return false;
+        }
+        // Like cp -a: the copy keeps the modified time and the permissions.
+        $mtime = @filemtime($src);
+        if ($mtime !== false) {
+            @touch($dst, $mtime);
+        }
+        $perms = @fileperms($src);
+        if ($perms !== false) {
+            @chmod($dst, $perms & 07777);
         }
         $count++;
         $onProgress($count, $dst);
@@ -5181,6 +5257,148 @@ function fmJobProgress(callable $send, string $rootDir, int $total): array {
 }
 
 /**
+ * File types of a summary, most common first: [[ext, files], ...] ('' = no extension), at most 500 entries.
+ *
+ * @param array<string, int> $counts
+ * @return list<array{0: string, 1: int}>
+ */
+function fmInfoTypes(array $counts): array {
+    $list = [];
+    foreach ($counts as $ext => $n) {
+        $list[] = [(string)$ext, (int)$n];
+    }
+    usort($list, static fn(array $a, array $b): int => $b[1] <=> $a[1] ?: strcmp($a[0], $b[0]));
+    return array_slice($list, 0, 500);
+}
+
+/**
+ * Size and contents of one folder in one PHP walk (Get info): files and folders inside it (the folder itself not
+ * counted) and their total size. Nested folder links are not followed, as in the other walks.
+ *
+ * @return array{size: int, files: int, folders: int}
+ */
+function fmFolderStats(string $dir, string $rootDir): array {
+    $stats = ['size' => 0, 'files' => 0, 'folders' => 0];
+    if (!pathInsideRoot($dir, $rootDir) || !is_dir($dir)) {
+        return $stats;
+    }
+    $dir = rtrim($dir, '/');
+    foreach (fmArchiveWalkPath($dir, basename($dir)) as [$abs, , $isDir]) {
+        if ($isDir) {
+            if ($abs !== $dir) {
+                $stats['folders']++;
+            }
+            continue;
+        }
+        $stats['files']++;
+        $stats['size'] += (int)(@filesize($abs) ?: 0);
+    }
+    return $stats;
+}
+
+/**
+ * Summary of several selected items (Get info for a selection) in one walk: counts, size, everything inside the
+ * folders, file types, modified range, permissions, common location. Links are counted but not measured; nested
+ * folder links are not followed (as in the other walks). $progress(int $done, int $total, int $scanned) runs often.
+ *
+ * @param list<string> $paths absolute paths
+ * @return array<string, mixed>
+ */
+function fmMultiInfo(array $paths, string $rootDir, callable $progress): array {
+    $rootNorm = rtrim(normPath(safeRealpath($rootDir)), '/');
+    $info = [
+        'count' => 0, 'files' => 0, 'folders' => 0, 'links' => 0, 'missing' => 0,
+        'size' => 0, 'inside_files' => 0, 'inside_folders' => 0,
+        'location' => null, 'modified_min' => null, 'modified_max' => null,
+        'permissions' => [], 'permissions_more' => false, 'types' => [],
+    ];
+    $types = [];
+    $parents = [];
+    $mMin = null;
+    $mMax = null;
+    $scanned = 0;
+    $total = count($paths);
+    $note = static function (string $path) use (&$info, &$mMin, &$mMax): void {
+        $m = @filemtime($path);
+        if ($m !== false) {
+            $mMin = $mMin === null ? $m : min($mMin, $m);
+            $mMax = $mMax === null ? $m : max($mMax, $m);
+        }
+        $p = @fileperms($path);
+        if ($p !== false) {
+            $s = substr(sprintf('%o', $p), -4);
+            if (!in_array($s, $info['permissions'], true)) {
+                if (count($info['permissions']) < 4) {
+                    $info['permissions'][] = $s;
+                } else {
+                    $info['permissions_more'] = true;
+                }
+            }
+        }
+    };
+    $countFile = static function (string $path) use (&$info, &$types): void {
+        $info['size'] += (int)(@filesize($path) ?: 0);
+        $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+        $types[$ext] = ($types[$ext] ?? 0) + 1;
+    };
+    foreach ($paths as $i => $raw) {
+        $raw = rtrim(normPath($raw), '/');
+        $parentReal = rtrim(normPath(safeRealpath(dirname($raw))), '/');
+        if ($raw === '' || !pathInsideRoot($parentReal, $rootDir)) {
+            $info['missing']++;
+            continue;
+        }
+        $isLink = fmIsLinkPath($raw);
+        if (!$isLink && (!file_exists($raw) || !pathInsideRoot(safeRealpath($raw), $rootDir))) {
+            $info['missing']++;
+            continue;
+        }
+        $info['count']++;
+        $parents[$parentReal] = true;
+        $note($raw);
+        if ($isLink) {
+            $info['links']++;
+        } elseif (is_dir($raw)) {
+            $info['folders']++;
+            foreach (fmArchiveWalkPath($raw, basename($raw)) as [$abs, , $isDir]) {
+                if ($abs === $raw) {
+                    continue;
+                }
+                if ($isDir) {
+                    $info['inside_folders']++;
+                } else {
+                    $info['inside_files']++;
+                    $countFile($abs);
+                }
+                if (++$scanned % 200 === 0) {
+                    $progress($i, $total, $scanned);
+                }
+            }
+        } else {
+            $info['files']++;
+            $countFile($raw);
+        }
+        $progress($i + 1, $total, $scanned);
+    }
+    if (count($parents) === 1) {
+        $parent = (string)array_key_first($parents);
+        $info['location'] = $parent === $rootNorm ? '' : ltrim(substr($parent, strlen($rootNorm)), '/');
+    }
+    $info['modified_min'] = $mMin !== null ? date('Y-m-d H:i', $mMin) : null;
+    $info['modified_max'] = $mMax !== null ? date('Y-m-d H:i', $mMax) : null;
+    $info['types'] = fmInfoTypes($types);
+    return $info;
+}
+
+/**
+ * A plain file (not a folder, not a link): copy / move / delete it in PHP even in auto mode, starting an OS
+ * command for one file only costs time (thousands of selected files would take minutes).
+ */
+function fmIsPlainFile(string $path): bool {
+    return is_file($path) && !fmIsLinkPath($path);
+}
+
+/**
  * The path in one line of verbose output of rm / cp / unzip / tar / xcopy (one line = one entry done), or null for
  * headers and summaries. GNU tools quote with '' or ‘’ depending on the locale; cp gives "'src' -> 'dst'".
  */
@@ -5294,6 +5512,8 @@ function fmRunArchiver(string $cmd, callable $onLine, callable $tick): array {
             $onLine($line);
         }
     };
+    // Short commands (one file) end within milliseconds: check often at first, then every 250 ms.
+    $wait = 5000;
     while (true) {
         $st = proc_get_status($proc);
         $read();
@@ -5302,7 +5522,8 @@ function fmRunArchiver(string $cmd, callable $onLine, callable $tick): array {
             break;
         }
         $tick();
-        usleep(250000);
+        usleep($wait);
+        $wait = min(250000, $wait * 2);
     }
     $read();
     if (trim($buf) !== '') {
@@ -5878,6 +6099,17 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && !fmCsrfRequestIsValid()) {
     jsonOut(['status' => 'error', 'msg' => 'Security token is missing or expired. Reload the page and try again.']);
 }
 
+if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && isset($_POST['fm_lists'])) {
+    // Long selections (names[], paths[], ids[]...) come as one JSON field: PHP drops fields past max_input_vars.
+    $unpacked = fmUnpackPostLists($_POST);
+    if ($unpacked === null) {
+        http_response_code(400);
+        jsonOut(['status' => 'error', 'msg' => 'Invalid list of items in the request.']);
+    }
+    $_POST = $unpacked;
+    unset($unpacked);
+}
+
 if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && $_POST === [] && $_FILES === []) {
     // PHP drops the whole body when it exceeds post_max_size, so the request would otherwise fall through to the HTML page.
     $postMax = fmIniSizeToBytes((string)ini_get('post_max_size'));
@@ -6190,10 +6422,15 @@ if (isset($_GET['action']) && $_GET['action'] === 'get-info' && isset($_GET['pat
     if ((!$outside && !pathInsideRoot($path, $ROOT_DIR)) || (!file_exists($path) && !$outside)) jsonOut(['status' => 'error', 'msg' => 'Not found']);
     $name = $link !== null ? $linkName : basename($path);
     $isDir = is_dir($path) || $shortcutFolder || ($outside && !empty($shortcutDir));
+    // A folder: size and contents in one walk, so the popup gets everything in one answer (no du, no second request).
+    $folderStats = null;
     if ($outside) {
         $size = null;
+    } elseif ($isDir) {
+        $folderStats = fmFolderStats($path, $ROOT_DIR);
+        $size = $folderStats['size'];
     } else {
-        $size = $isDir ? getFolderSize($path, $ROOT_DIR) : (int) (@filesize($path) ?: 0);
+        $size = (int) (@filesize($path) ?: 0);
     }
     $statPath = ($link !== null && !empty($link['link_shortcut'])) ? $linkPath : $path;
     $modified = @filemtime($statPath);
@@ -6211,10 +6448,47 @@ if (isset($_GET['action']) && $_GET['action'] === 'get-info' && isset($_GET['pat
         'extension'   => $ext,
         'permissions' => $permissions
     ] + ($link ?? []);
+    if ($folderStats !== null) {
+        $out['files_count'] = $folderStats['files'];
+        $out['folders_count'] = $folderStats['folders'];
+    }
     if (!$isDir && !$outside) {
         $out['encoding'] = fmEncodingFileInfo($link !== null ? $linkPath : $path, $ROOT_DIR);
     }
     jsonOut($out);
+}
+
+// Get info for several selected items: NDJSON {n, total, scanned} while walking, {tick} when quiet, {done, info}.
+if (isset($_POST['action']) && $_POST['action'] === 'get-info-multi' && isset($_POST['paths']) && is_array($_POST['paths'])) {
+    $paths = array_values(array_filter(array_map('strval', $_POST['paths']), 'strlen'));
+    if (!$paths) {
+        jsonOut(['status' => 'error', 'msg' => 'Nothing selected']);
+    }
+    @set_time_limit(0);
+    while (ob_get_level()) {
+        @ob_end_flush();
+    }
+    header('Content-Type: application/x-ndjson');
+    header('Cache-Control: no-cache');
+    fm_ob_implicit_flush_enable();
+    $send = static function (array $payload): void {
+        echo json_encode($payload, JSON_UNESCAPED_SLASHES) . "\n";
+        if (ob_get_level()) {
+            ob_flush();
+        }
+        flush();
+    };
+    $send(['n' => 0, 'total' => count($paths), 'scanned' => 0]);
+    $started = microtime(true);
+    $lastSent = $started;
+    $info = fmMultiInfo($paths, $ROOT_DIR, static function (int $n, int $total, int $scanned) use ($send, &$lastSent): void {
+        if (microtime(true) - $lastSent >= 0.25) {
+            $lastSent = microtime(true);
+            $send(['n' => $n, 'total' => $total, 'scanned' => $scanned]);
+        }
+    });
+    $send(['done' => true, 'info' => $info]);
+    exit;
 }
 
 // -----------------------------------------------------------------------------
@@ -6233,6 +6507,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'get-server-info') {
         'server_software'      => (string)($_SERVER['SERVER_SOFTWARE'] ?? ''),
         'os'                   => PHP_OS,
         'memory_limit'         => (string)ini_get('memory_limit'),
+        'max_input_vars'       => (string)ini_get('max_input_vars'),
         'max_execution_time'   => (string)ini_get('max_execution_time'),
         'upload_max_filesize'  => (string)ini_get('upload_max_filesize'),
         'post_max_size'        => (string)ini_get('post_max_size'),
@@ -7613,7 +7888,8 @@ if (isset($_POST['action']) && $_POST['action'] === 'copy-move-stream' && isset(
             }
         }
 
-        if ($tryShell) {
+        // One plain file: PHP is as good as the OS command and much faster than starting one per file.
+        if ($tryShell && !($allowPhpFallback && fmIsPlainFile($srcPath))) {
             $base = $count;
             $itemTotal = $itemTotals[$name] ?? 1;
             $ok = $operation === 'move'
@@ -7783,7 +8059,8 @@ if (isset($_POST['action']) && $_POST['action'] === 'new-folder-from-selection-s
             }
         }
 
-        if ($tryShell) {
+        // One plain file: PHP is as good as the OS command and much faster than starting one per file.
+        if ($tryShell && !($allowPhpFallback && fmIsPlainFile($srcPath))) {
             $base = $count;
             $itemTotal = $itemTotals[$name] ?? 1;
             $ok = osMoveEntry($srcPath, $dstPath, $ROOT_DIR, $tick);
@@ -7905,7 +8182,8 @@ if (isset($_POST['action']) && $_POST['action'] === 'duplicate-stream' && isset(
             }
         }
 
-        if ($tryShell) {
+        // One plain file: PHP is as good as the OS command and much faster than starting one per file.
+        if ($tryShell && !($allowPhpFallback && fmIsPlainFile($srcPath))) {
             $base = $count;
             $itemTotal = $itemTotals[$name] ?? 1;
             $ok = osCopyEntry($srcPath, $dstPath, $ROOT_DIR, $osLines($count, $itemTotal), $tick);
@@ -8467,7 +8745,13 @@ if (isset($_POST['action']) && $_POST['action'] === 'delete-stream' && isset($_P
     };
 
     foreach ($names as $fullPath) {
-        if ($deleteMode === 'auto') {
+        // One plain file: unlink() in PHP, an OS command per file would only cost time.
+        if ($deleteMode === 'auto' && fmIsPlainFile($fullPath)) {
+            if (!deletePathWithProgress($fullPath, $ROOT_DIR, $count, $phpProgress)) {
+                $failed = $fullPath;
+                break;
+            }
+        } elseif ($deleteMode === 'auto') {
             if (!$osDelete($fullPath)) {
                 $send(['total' => $deleteEstimate, 'n' => $count, 'fallback' => 'php']);
                 if (!deletePathWithProgress($fullPath, $ROOT_DIR, $count, $phpProgress)) {
@@ -9243,6 +9527,21 @@ html:has(.fm-table-wrapper) body {
 
 .fm-popup-container .fm-popup-header.fm-popup-header--no-close {
     padding-right: 20px;
+}
+
+/* Popups move by their title bar (FmPopup._bindDrag). */
+.fm-popup-container .fm-popup-header--draggable {
+    cursor: move;
+    touch-action: none;
+    user-select: none;
+}
+.fm-popup-container .fm-popup-header--draggable .fm-popup-close,
+.fm-popup-container .fm-popup-header--draggable button {
+    cursor: pointer;
+}
+body.fm-popup-dragging,
+body.fm-popup-dragging * {
+    user-select: none !important;
 }
 
 .fm-popup-container .fm-popup-content {
@@ -11082,6 +11381,18 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
 
 .fm-info-loading--folder {
     min-height: 329px;
+}
+
+.fm-info-loading--multi {
+    min-height: 260px;
+}
+
+/* One line in the info table, the full text in the tooltip (e.g. many file types). */
+.fm-info-table td.fm-info-ellipsis {
+    max-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 .fm-info-loading--server {
@@ -13057,7 +13368,48 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
          * @returns {RequestInit}
          */
         function fmPostInit(body) {
-            return { method: 'POST', body, headers: { 'X-CSRF-Token': fm_csrf_token } };
+            return { method: 'POST', body: fmPackLongLists(body), headers: { 'X-CSRF-Token': fm_csrf_token } };
+        }
+        /** Lists with more fields than this go as one JSON field (PHP drops fields past max_input_vars, often 1000). */
+        const FM_LIST_FIELDS_PACK_ABOVE = 200;
+        /**
+         * Long "name[]" lists of a FormData (selected items) packed into one field `fm_lists` = JSON
+         * {"names": [...], ...}; the server puts them back (fmUnpackPostLists). Files and short forms are unchanged.
+         * @param {*} body
+         * @returns {*}
+         */
+        function fmPackLongLists(body) {
+            if (typeof FormData === 'undefined' || !(body instanceof FormData)) return body;
+            const lists = {};
+            let count = 0;
+            for (const [k, v] of body.entries()) {
+                if (k.endsWith('[]') && typeof v === 'string') {
+                    (lists[k.slice(0, -2)] = lists[k.slice(0, -2)] || []).push(v);
+                    count++;
+                }
+            }
+            if (count <= FM_LIST_FIELDS_PACK_ABOVE) return body;
+            const out = new FormData();
+            for (const [k, v] of body.entries()) {
+                if (!(k.endsWith('[]') && typeof v === 'string')) out.append(k, v);
+            }
+            out.append('fm_lists', JSON.stringify(lists));
+            return out;
+        }
+        /**
+         * The same for the hidden fields of a plain form submit (downloads).
+         * @param {Array<[string, string]>} fields
+         * @returns {Array<[string, string]>}
+         */
+        function fmPackLongListFields(fields) {
+            const listed = fields.filter(([k]) => String(k).endsWith('[]'));
+            if (listed.length <= FM_LIST_FIELDS_PACK_ABOVE) return fields;
+            const lists = {};
+            listed.forEach(([k, v]) => {
+                const key = String(k).slice(0, -2);
+                (lists[key] = lists[key] || []).push(String(v));
+            });
+            return fields.filter(([k]) => !String(k).endsWith('[]')).concat([['fm_lists', JSON.stringify(lists)]]);
         }
         const fm_instance_id = <?php echo json_encode(fmInstanceId()); ?>;
         /**
@@ -13833,6 +14185,8 @@ class FmPopup {
             className: '',
             maxWidth: '400px',
             animationDuration: 200,
+            /** Title bar can be dragged to move the popup (see _bindDrag). */
+            draggable: true,
             parent: document.body,
             parentPopup: null,
             onBeforeShow: null,
@@ -13991,6 +14345,7 @@ class FmPopup {
         root.querySelectorAll('.fm-popup-close').forEach(closeEl => {
             closeEl.addEventListener('click', () => this.hideAndDestroy());
         });
+        this._bindDrag(root);
 
         root.querySelectorAll('[data-fm-popup-btn]').forEach(btnEl => {
             btnEl.addEventListener('click', (e) => {
@@ -14082,6 +14437,7 @@ class FmPopup {
         if (this.options.onBeforeShow) {
             this.options.onBeforeShow.call(this);
         }
+        this._recentre();
         this.el.classList.add('show');
         document.addEventListener('keydown', this._boundHandleKeydown, this._keydownUseCapture);
         this.isVisible = true;
@@ -14102,10 +14458,95 @@ class FmPopup {
     }
 
     /**
+     * Move the popup by dragging its title bar (mouse or touch). A moved popup keeps its place, also when its
+     * height changes, and is kept inside the window; a double click on the title bar centres it again.
+     * @param {HTMLElement} root
+     * @returns {void}
+     */
+    _bindDrag(root) {
+        const header = root.querySelector('.fm-popup-header');
+        if (!header || this.options.draggable === false) return;
+        header.classList.add('fm-popup-header--draggable');
+        const onControl = (e) => !!(e.target && e.target.closest
+            && e.target.closest('button, a, input, select, textarea, .fm-popup-close, [role="button"]'));
+        let drag = null;
+        header.addEventListener('pointerdown', (e) => {
+            if (e.button !== 0 || onControl(e) || !this.containerEl) return;
+            e.preventDefault();
+            const r = this.containerEl.getBoundingClientRect();
+            this._placeAt(r.left, r.top);
+            drag = { id: e.pointerId, dx: e.clientX - r.left, dy: e.clientY - r.top };
+            try { header.setPointerCapture(e.pointerId); } catch (err) { /* pointer already gone */ }
+            document.body.classList.add('fm-popup-dragging');
+        });
+        header.addEventListener('pointermove', (e) => {
+            if (drag && e.pointerId === drag.id) this._placeAt(e.clientX - drag.dx, e.clientY - drag.dy);
+        });
+        const stop = (e) => {
+            if (!drag || e.pointerId !== drag.id) return;
+            drag = null;
+            try { header.releasePointerCapture(e.pointerId); } catch (err) { /* already released */ }
+            document.body.classList.remove('fm-popup-dragging');
+        };
+        header.addEventListener('pointerup', stop);
+        header.addEventListener('pointercancel', stop);
+        header.addEventListener('dblclick', (e) => {
+            if (!onControl(e)) this._recentre();
+        });
+    }
+
+    /**
+     * Put the popup's top-left corner at (x, y) inside the window (8 px margin) and keep it there.
+     * @param {number} x
+     * @param {number} y
+     * @returns {void}
+     */
+    _placeAt(x, y) {
+        const c = this.containerEl;
+        if (!c || typeof window === 'undefined') return;
+        const maxX = Math.max(8, window.innerWidth - c.offsetWidth - 8);
+        const maxY = Math.max(8, window.innerHeight - c.offsetHeight - 8);
+        c.style.left = Math.round(Math.min(Math.max(8, x), maxX)) + 'px';
+        c.style.top = Math.round(Math.min(Math.max(8, y), maxY)) + 'px';
+        c.style.transform = 'none';
+        if (this._moved) return;
+        this._moved = true;
+        // Growing content or a smaller window must not push a moved popup off the screen.
+        this._keepOnScreen = () => {
+            const r = c.getBoundingClientRect();
+            this._placeAt(r.left, r.top);
+        };
+        if (typeof ResizeObserver === 'function') {
+            this._moveObserver = new ResizeObserver(this._keepOnScreen);
+            this._moveObserver.observe(c);
+        }
+        window.addEventListener('resize', this._keepOnScreen);
+    }
+
+    /** Back to the centred position of the stylesheet. */
+    _recentre() {
+        const c = this.containerEl;
+        if (c) {
+            c.style.left = '';
+            c.style.top = '';
+            c.style.transform = '';
+        }
+        if (this._moveObserver) {
+            this._moveObserver.disconnect();
+            this._moveObserver = null;
+        }
+        if (this._keepOnScreen) {
+            window.removeEventListener('resize', this._keepOnScreen);
+            this._keepOnScreen = null;
+        }
+        this._moved = false;
+    }
+
+    /**
      * Show when `ready` settles, or after `delayMs` if it takes longer: a normal answer opens the popup already
      * filled instead of growing from a loading line (centred popups jump when their height changes).
      * @param {Promise<*>} ready
-     * @param {number} [delayMs=600] - Covers a normal request (about 350 ms on XAMPP for Windows)
+     * @param {number} [delayMs=600] - Covers a normal request, also on a slow host
      * @returns {void}
      */
     showWhenReady(ready, delayMs = 600) {
@@ -14141,6 +14582,17 @@ class FmPopup {
         this.el.classList.remove('fade');
         document.removeEventListener('keydown', this._boundHandleKeydown, this._keydownUseCapture);
         this.isVisible = false;
+        document.body.classList.remove('fm-popup-dragging');
+        // Keep the place while it fades out; show() centres it again.
+        if (this._moveObserver) {
+            this._moveObserver.disconnect();
+            this._moveObserver = null;
+        }
+        if (this._keepOnScreen) {
+            window.removeEventListener('resize', this._keepOnScreen);
+            this._keepOnScreen = null;
+        }
+        this._moved = false;
 
         setTimeout(() => {
             if (this.el) {
@@ -16359,7 +16811,8 @@ class FmGetInfoPopup extends FmPopup {
                     return;
                 }
                 this._setContent(this._buildContent(data));
-                if (data.type === 'folder' && !data.link_outside) {
+                // Older servers send folder counts separately.
+                if (data.type === 'folder' && !data.link_outside && typeof data.files_count !== 'number') {
                     this._fetchCounts(data.name, data.path);
                 }
             })
@@ -16439,8 +16892,9 @@ class FmGetInfoPopup extends FmPopup {
         rows.push(['Size', FmPopup.escapeHtml(sizeLabel), '']);
 
         if (isFolder && !data.link_outside) {
-            rows.push(['Files',   spinner, ' class="fm-info-files-count"']);
-            rows.push(['Folders', spinner, ' class="fm-info-folders-count"']);
+            const known = typeof data.files_count === 'number';
+            rows.push(['Files',   known ? Number(data.files_count).toLocaleString() : spinner, ' class="fm-info-files-count"']);
+            rows.push(['Folders', known ? Number(data.folders_count).toLocaleString() : spinner, ' class="fm-info-folders-count"']);
         }
 
         rows.push(['Modified',    FmPopup.escapeHtml(data.modified    || '\u2014'), '']);
@@ -16488,6 +16942,155 @@ class FmGetInfoPopup extends FmPopup {
         const prefix = r + '/';
         if (!f.startsWith(prefix)) return null;
         return f.slice(prefix.length);
+    }
+}
+
+/**
+ * Get info for several selected items: a summary from `get-info-multi` (counts, total size with folder contents,
+ * file types, modified range, permissions, location). The server walks the folders and reports progress, so the
+ * loading line shows how far it got for large selections.
+ *
+ * @example
+ *   new FmGetInfoMultiPopup({ paths: ['/site/a.txt', '/site/docs'], rootDir: '/site', ajaxUrl: '/fm.php' }).show();
+ */
+class FmGetInfoMultiPopup extends FmPopup {
+    /**
+     * @param {Object} options
+     * @param {string[]} options.paths - Absolute paths of the selected items
+     * @param {string} options.rootDir
+     * @param {string} options.ajaxUrl
+     */
+    constructor(options = {}) {
+        const { paths = [], rootDir, ajaxUrl, ...rest } = options;
+        super({
+            title:    'Info: ' + paths.length.toLocaleString() + ' items',
+            content:  '<div class="fm-info-loading fm-info-loading--multi ta-c"><span class="fm-spinner"></span> ' +
+                '<span class="fm-info-multi-progress">Counting\u2026</span></div>',
+            buttons:  [{ label: 'OK', primary: true, close: true }],
+            maxWidth: '520px',
+            ...rest
+        });
+        this._paths   = paths;
+        this._rootDir = rootDir || '';
+        this._ajaxUrl = ajaxUrl;
+    }
+
+    /** @override Opens with the summary, or with the counting line when it takes longer. */
+    show() {
+        this.showWhenReady(this._fetchAndRender());
+    }
+
+    async _fetchAndRender() {
+        const form = new FormData();
+        form.append('action', 'get-info-multi');
+        this._paths.forEach((p) => form.append('paths[]', p));
+        const fail = (msg) => this._setContent('<p class="ta-c fm-error-text">' + FmPopup.escapeHtml(msg) + '</p>');
+        try {
+            const response = await requireAuthFetch(this._ajaxUrl, fmPostInit(form));
+            if (!response.ok || !response.body) {
+                fail('Could not get info (HTTP ' + response.status + ').');
+                return;
+            }
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            let info = null;
+            const handle = (line) => {
+                if (!line.trim()) return;
+                let d;
+                try { d = JSON.parse(line); } catch (e) { return; }
+                if (d.status === 'error') {
+                    fail(d.msg || 'Could not get info');
+                    info = false;
+                } else if (d.done) {
+                    info = d.info || {};
+                } else if (typeof d.n === 'number') {
+                    const el = this.el && this.el.querySelector('.fm-info-multi-progress');
+                    if (el) {
+                        el.textContent = 'Counting\u2026 ' + d.n.toLocaleString() + ' of ' + Number(d.total || 0).toLocaleString() + ' items' +
+                            (d.scanned ? ' \u00b7 ' + d.scanned.toLocaleString() + ' inside' : '');
+                    }
+                }
+            };
+            for (;;) {
+                const { value, done } = await reader.read();
+                if (value) {
+                    buffer += decoder.decode(value, { stream: !done });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop() || '';
+                    lines.forEach(handle);
+                }
+                if (done) {
+                    handle(buffer);
+                    break;
+                }
+            }
+            if (info === false) return;
+            if (!info) {
+                fail('Could not get info: the connection was lost.');
+                return;
+            }
+            this._setContent(this._buildContent(info));
+        } catch (e) {
+            fail('Could not get info');
+        }
+    }
+
+    _buildContent(d) {
+        const esc = FmPopup.escapeHtml;
+        const num = (n) => Number(n || 0).toLocaleString();
+        const plural = (n, one, many) => num(n) + ' ' + (Number(n) === 1 ? one : many);
+        const parts = [];
+        if (d.folders) parts.push(plural(d.folders, 'folder', 'folders'));
+        if (d.files) parts.push(plural(d.files, 'file', 'files'));
+        if (d.links) parts.push(plural(d.links, 'link', 'links') + ' (not measured)');
+        const selected = plural(d.count, 'item', 'items') + (parts.length ? ' (' + parts.join(', ') + ')' : '');
+        const location = d.location === null || d.location === undefined
+            ? 'Different folders'
+            : (d.location === '' ? '/ (root)' : '/' + d.location);
+        const size = FmGetInfoPopup._bytesToSize(Number(d.size) || 0) + ' (' + num(d.size) + ' bytes)';
+        const allFiles = (Number(d.files) || 0) + (Number(d.inside_files) || 0);
+        const allFolders = (Number(d.folders) || 0) + (Number(d.inside_folders) || 0);
+        const contains = plural(allFiles, 'file', 'files') + ', ' + plural(allFolders, 'folder', 'folders');
+        const types = FmGetInfoMultiPopup._typesText(Array.isArray(d.types) ? d.types : []);
+        const modified = !d.modified_min ? '\u2014' : (d.modified_min === d.modified_max ? d.modified_min : d.modified_min + ' \u2013 ' + d.modified_max);
+        const perms = Array.isArray(d.permissions) ? d.permissions : [];
+        const permissions = perms.length === 0 ? '\u2014'
+            : (perms.length === 1 && !d.permissions_more ? perms[0] : 'Mixed: ' + perms.join(', ') + (d.permissions_more ? ', \u2026' : ''));
+        const rows = [
+            ['Selected', esc(selected), ''],
+            ['Location', esc(location), ''],
+            ['Total size', esc(size), ''],
+            ['In total', esc(contains), ''],
+            ['Types', esc(types.short), ' class="fm-info-ellipsis" title="' + FmPopup.escapeAttr(types.full) + '"'],
+            ['Modified', esc(modified), ''],
+            ['Permissions', esc(permissions), ''],
+        ];
+        if (d.missing) rows.push(['Not found', esc(plural(d.missing, 'item', 'items') + ' (moved, deleted or outside the root)'), '']);
+        return '<table class="fm-info-table">' + rows.map(([label, value, attr]) =>
+            `<tr><th>${esc(label)}</th><td${attr}>${value}</td></tr>`).join('') + '</table>';
+    }
+
+    /**
+     * The 8 most common types and the rest: {short: one line for the table, full: every type for the tooltip}.
+     * @param {Array<[string, number]>} types - most common first ('' = no extension)
+     * @returns {{ short: string, full: string }}
+     */
+    static _typesText(types) {
+        if (!types.length) return { short: 'No files', full: '' };
+        const label = ([ext, n]) => (ext === '' ? 'no extension' : ext) + ' ' + Number(n).toLocaleString();
+        const shown = types.slice(0, 8).map(label);
+        const rest = types.slice(8);
+        if (rest.length) {
+            const restFiles = rest.reduce((a, [, n]) => a + Number(n), 0);
+            shown.push('+' + rest.length.toLocaleString() + ' more type' + (rest.length === 1 ? '' : 's') + ' (' + restFiles.toLocaleString() + ' files)');
+        }
+        return { short: shown.join(' \u00b7 '), full: types.map(label).join(', ') };
+    }
+
+    _setContent(html) {
+        const contentEl = this.el && this.el.querySelector('.fm-popup-content');
+        if (contentEl) contentEl.innerHTML = html;
     }
 }
 
@@ -16624,6 +17227,7 @@ class FmServerInfoPopup extends FmPopup {
             )],
             ['Upload max filesize',   esc(data.upload_max_filesize)],
             ['Post max size',         esc(data.post_max_size)],
+            ['Max input vars',        esc(data.max_input_vars)],
             ['File manager root',     esc(data.root_path)],
             ['Status files',          FmServerInfoPopup._stateDirLine(data)],
             ['Disk (root volume)',    diskLine],
@@ -22022,7 +22626,7 @@ class FmFileManagerTable extends FmTable {
         { id: 'copy-relative-path', icon: 'bi-clipboard2',       title: 'Copy relative path', needSelection: true, priority: 4 },
         { id: 'rename',            icon: 'bi-input-cursor-text',   title: 'Rename',            needSelection: true,  singleOnly: true, separatorBefore: true, priority: 2 },
         { id: 'bulk-rename',       icon: 'bi-input-cursor',        title: 'Bulk rename',       needSelection: true,  priority: 3 },
-        { id: 'get-info',          icon: 'bi-info-circle',         title: 'Get info',          needSelection: true,  singleOnly: true, priority: 2 },
+        { id: 'get-info',          icon: 'bi-info-circle',         title: 'Get info',          needSelection: true,  priority: 2 },
         { id: 'change-permissions', icon: 'bi-shield-lock',        title: 'Change permissions', needSelection: true, priority: 3 },
         { id: 'convert-encoding',  icon: 'bi-translate',           title: 'Convert encoding',  needSelection: false, priority: 3 },
         { id: 'compress',          icon: 'bi-arrows-collapse',     title: 'Archive',           needSelection: true,  separatorBefore: true, priority: 2 },
@@ -23596,15 +24200,26 @@ class FmFileManagerTable extends FmTable {
         this.rows = size ? all.slice(this._page * size, (this._page + 1) * size) : all;
         super.render();
         this._fitToolbar();
-        if (!this._toolbarFitObserver && typeof ResizeObserver !== 'undefined' && this.container) {
+        if (!this._toolbarFitLater) {
             let frame = 0;
+            this._toolbarFitLater = () => {
+                cancelAnimationFrame(frame);
+                frame = requestAnimationFrame(() => this._fitToolbar());
+            };
+            // The icon font and the text font arrive after the first render on an uncached load and widen the buttons.
+            if (document.fonts) {
+                document.fonts.ready.then(this._toolbarFitLater);
+                document.fonts.addEventListener('loadingdone', this._toolbarFitLater);
+            }
+            window.addEventListener('load', this._toolbarFitLater);
+        }
+        if (!this._toolbarFitObserver && typeof ResizeObserver !== 'undefined' && this.container) {
             let lastWidth = 0;
             this._toolbarFitObserver = new ResizeObserver(() => {
                 const w = this.container.clientWidth;
                 if (w === lastWidth) return;
                 lastWidth = w;
-                cancelAnimationFrame(frame);
-                frame = requestAnimationFrame(() => this._fitToolbar());
+                this._toolbarFitLater();
             });
             this._toolbarFitObserver.observe(this.container);
         }
@@ -24239,6 +24854,7 @@ class FmFileManagerTable extends FmTable {
             case 'bulk-rename':       return this._handleBulkRename({ selectedRows });
             case 'get-info':          return this._handleGetInfo({
                 selectedRow,
+                selectedRows,
                 getInfoForCurrentFolder: !!(payload && payload.getInfoForCurrentFolder),
             });
             case 'change-permissions': return this._handleChangePermissions({ selectedRows });
@@ -24935,7 +25551,13 @@ class FmFileManagerTable extends FmTable {
      * @param {boolean} [param0.getInfoForCurrentFolder] - If true, show info for {@link #_currentPath}
      * @returns {void}
      */
-    _handleGetInfo({ selectedRow, getInfoForCurrentFolder } = {}) {
+    _handleGetInfo({ selectedRow, selectedRows, getInfoForCurrentFolder } = {}) {
+        const several = (selectedRows || []).filter((r) => r && r.name);
+        if (!getInfoForCurrentFolder && several.length > 1) {
+            const paths = several.map((r) => this._rowPhysicalPath(r)).filter(Boolean);
+            new FmGetInfoMultiPopup({ paths, rootDir: this._rootDir, ajaxUrl: this._ajaxUrl }).show();
+            return;
+        }
         let fullPath;
         if (getInfoForCurrentFolder) {
             fullPath = this._currentPath.replace(/\/$/, '');
@@ -25150,7 +25772,7 @@ class FmFileManagerTable extends FmTable {
             form.action = url;
             form.target = frameName;
             form.style.display = 'none';
-            fields.concat([['dl_token', token], ['csrf_token', fm_csrf_token]]).forEach(([name, value]) => {
+            fmPackLongListFields(fields).concat([['dl_token', token], ['csrf_token', fm_csrf_token]]).forEach(([name, value]) => {
                 const input = document.createElement('input');
                 input.type = 'hidden';
                 input.name = name;
@@ -26043,8 +26665,11 @@ class FmFileManagerTable extends FmTable {
             return this._folderNavigatePath(payload.selectedRow) === null;
         }
 
-        if (actionId === 'rename' || actionId === 'get-info' || actionId === 'open-location') {
+        if (actionId === 'rename' || actionId === 'open-location') {
             if (!single || !payload.selectedRow) return true;
+        }
+        if (actionId === 'get-info' && !selected.some((r) => r && r.name)) {
+            return true;
         }
 
         if (actionId === 'delete' && this._inTrashView()) {

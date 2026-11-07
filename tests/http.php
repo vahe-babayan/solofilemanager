@@ -46,7 +46,8 @@ installCopy('b', 'pass-B-12345');
 installCopy('c', 'pass-C-12345', ['$FM_ALLOWED_IPS = [];' => "\$FM_ALLOWED_IPS = ['10.0.0.1'];"]);
 
 $server = proc_open(
-    [PHP_BINARY, '-d', 'session.save_path=' . $sessions, '-S', '127.0.0.1:' . $port, '-t', $www],
+    // max_input_vars as on most hosts: long selections must still arrive in full (fm_lists).
+    [PHP_BINARY, '-d', 'session.save_path=' . $sessions, '-d', 'max_input_vars=1000', '-S', '127.0.0.1:' . $port, '-t', $www],
     [0 => ['pipe', 'r'], 1 => ['file', $base . '/server.log', 'w'], 2 => ['file', $base . '/server.log', 'a']],
     $pipes
 );
@@ -138,6 +139,12 @@ try {
     check('POST without CSRF token refused (403)', $st === 403 && !is_dir($dirA . '/no-csrf'), "status {$st}");
     $br->post($u('a'), ['action' => 'create-new-folder', 'in' => '', 'name' => 'with-csrf']);
     check('POST with CSRF token works', is_dir($dirA . '/with-csrf'));
+    $br->req($u('a'));
+    [, $page] = $br->req($u('a'));
+    [, $body] = $br->req($u('a') . '?action=get-server-info');
+    $capsFresh = (json_decode($body, true) ?: [])['capabilities'] ?? [];
+    check('server capabilities kept in the session match a fresh probe',
+        isset($capsFresh['exec_available']) && strpos($page, 'const fm_exec_available = ' . ($capsFresh['exec_available'] ? 'true' : 'false') . ';') !== false, $body);
     [$st] = (new Browser())->req($u('a') . '?action=get-server-info');
     check('API without login refused (401)', $st === 401, "status {$st}");
 
@@ -392,6 +399,70 @@ try {
             && !empty(end($lines)['done']) && is_file($root . '/job/pack/p/c.txt'), $body);
         rmTree($root . '/job');
     }
+
+    section('Long selections (max_input_vars)');
+    mkdir($dirA . '/many', 0775, true);
+    $manyNames = [];
+    for ($i = 1; $i <= 1500; $i++) {
+        $manyNames[] = sprintf('f%04d.txt', $i);
+        file_put_contents($dirA . '/many/' . end($manyNames), 'x');
+    }
+    [, $body] = $br->post($u('a'), ['action' => 'get-files-and-folders-count', 'in' => 'many', 'names[]' => $manyNames]);
+    $plain = preg_match('/\{"status".*\}/s', $body, $m) ? (json_decode($m[0], true) ?: []) : [];
+    check('PHP itself drops fields past max_input_vars (1,500 names[] fields)',
+        strpos($body, 'Input variables exceeded') !== false || (($plain['total'] ?? 0) > 0 && ($plain['total'] ?? 0) < 1500), substr($body, 0, 200));
+    [, $body] = $br->post($u('a'), ['action' => 'get-files-and-folders-count', 'in' => 'many', 'fm_lists' => json_encode(['names' => $manyNames])]);
+    $packed = json_decode($body, true) ?: [];
+    check('the same list in fm_lists arrives in full', ($packed['total'] ?? 0) === 1500, $body);
+    [, $body] = $br->post($u('a'), ['action' => 'get-files-and-folders-count', 'in' => 'many', 'fm_lists' => '{"names": "not a list"}']);
+    check('a broken fm_lists is refused', strpos($body, 'Invalid list') !== false, $body);
+    [, $body] = $br->post($u('a'), ['action' => 'delete-stream', 'in' => 'many', 'fm_lists' => json_encode(['names' => $manyNames])]);
+    clearstatcache();
+    check('delete forever of 1,500 selected files removes all of them', count(glob($dirA . '/many/*') ?: []) === 0 && strpos($body, '"done":true') !== false, substr($body, -200));
+    rmTree($dirA . '/many');
+    mkdir($dirA . '/keep/dest', 0775, true);
+    file_put_contents($dirA . '/keep/old.txt', 'old');
+    touch($dirA . '/keep/old.txt', strtotime('2020-05-06 07:08:09'));
+    foreach (['a' => $br, 'b' => $brB] as $copy => $who) {
+        $root = $copy === 'a' ? $dirA : $dirB;
+        if ($copy === 'b') {
+            mkdir($root . '/keep/dest', 0775, true);
+            file_put_contents($root . '/keep/old.txt', 'old');
+            touch($root . '/keep/old.txt', strtotime('2020-05-06 07:08:09'));
+        }
+        $who->post($u($copy), ['action' => 'copy-move-stream', 'operation' => 'copy', 'in' => 'keep', 'dest' => 'keep/dest', 'names[]' => 'old.txt']);
+        clearstatcache();
+        check("copy of one file keeps its modified time ($copy)", @filemtime($root . '/keep/dest/old.txt') === strtotime('2020-05-06 07:08:09'));
+        rmTree($root . '/keep');
+    }
+
+    section('Get info for several items');
+    mkdir($dirA . '/info/sub/inner', 0775, true);
+    file_put_contents($dirA . '/info/a.txt', str_repeat('a', 100));
+    file_put_contents($dirA . '/info/b.jpg', str_repeat('b', 200));
+    file_put_contents($dirA . '/info/sub/c.txt', str_repeat('c', 50));
+    file_put_contents($dirA . '/info/sub/d.png', str_repeat('d', 30));
+    file_put_contents($outside . '/secret.txt', 'x');
+    $infoOf = static function (string $body) use ($ndjson): array {
+        $lines = $ndjson($body);
+        $last = end($lines) ?: [];
+        return !empty($last['done']) ? (array)$last['info'] : [];
+    };
+    [, $body] = $br->post($u('a'), ['action' => 'get-info-multi', 'paths[]' => [$dirA . '/info/a.txt', $dirA . '/info/b.jpg', $dirA . '/info/sub', $outside . '/secret.txt']]);
+    $inf = $infoOf($body);
+    check('summary: counts, size with folder contents, inside counts, location, outside path not counted',
+        ($inf['count'] ?? 0) === 3 && $inf['files'] === 2 && $inf['folders'] === 1 && $inf['size'] === 380
+        && $inf['inside_files'] === 2 && $inf['inside_folders'] === 1 && $inf['location'] === 'info' && $inf['missing'] === 1, $body);
+    check('summary: types most common first', ($inf['types'][0] ?? null) === ['txt', 2] && count($inf['types']) === 3, json_encode($inf['types'] ?? null));
+    [, $body] = $br->req($u('a') . '?action=get-info&path=' . rawurlencode($dirA . '/info/sub'));
+    $one = json_decode($body, true) ?: [];
+    check('Get info of a folder: size and what it holds in one answer (the folder itself not counted)',
+        ($one['size'] ?? null) === 80 && ($one['files_count'] ?? null) === 2 && ($one['folders_count'] ?? null) === 1, $body);
+    [, $body] = $br->post($u('a'), ['action' => 'get-info-multi', 'paths[]' => [$dirA . '/info/a.txt', $dirA . '/info/sub/c.txt']]);
+    $inf = $infoOf($body);
+    check('summary of items from different folders has no single location', ($inf['count'] ?? 0) === 2 && $inf['location'] === null && !empty($inf['modified_min']), $body);
+    rmTree($dirA . '/info');
+    @unlink($outside . '/secret.txt');
 
     section('Convert encoding');
     $ruText = "Бюджет на 2026 год утверждён.\nОтчёт готов, счёт оплачен.\n";
