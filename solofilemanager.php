@@ -8,7 +8,7 @@ declare(strict_types=1);
  */
 
 /** Product version (semver). Shown in UI / server info. */
-const SOLOFILEMANAGER_VERSION = '1.8.2';
+const SOLOFILEMANAGER_VERSION = '1.9.0';
 
 // Set max execution time to 1 day (86400 seconds)
 @set_time_limit(86400);
@@ -3784,6 +3784,189 @@ function fmSearchGlobToRegex(string $glob): string {
     return $out;
 }
 
+// =========================
+// Include / exclude rules (Archive, Download as archive, Extract)
+// =========================
+
+const FM_RULES_MAX = 100;
+const FM_RULES_MAX_BYTES = 4096;
+
+/**
+ * Compile the Include / Exclude fields of an archive filter.
+ * Masks work like .gitignore (case ignored): * = any text but "/", ** = anything, ? = one character; a mask without
+ * "/" matches the name at any depth, with "/" the path from the top ("/" in front ties it to the top), a "/" at the
+ * end means folders only. In regex mode every line is a PCRE matched against the path (folders end with "/").
+ *
+ * @return array{ok: true, rules: ?array{include: list<array>, exclude: list<array>}}|array{ok: false, msg: string}
+ */
+function fmPathRulesParse(string $include, string $exclude, bool $regex): array {
+    $rules = ['include' => [], 'exclude' => []];
+    $count = 0;
+    foreach (['include' => $include, 'exclude' => $exclude] as $field => $text) {
+        $label = $field === 'include' ? 'Include' : 'Exclude';
+        if (strlen($text) > FM_RULES_MAX_BYTES) {
+            return ['ok' => false, 'msg' => $label . ': the rules are longer than ' . FM_RULES_MAX_BYTES . ' bytes.'];
+        }
+        foreach (preg_split('/\r\n|\r|\n/', $text) ?: [] as $i => $line) {
+            $parts = $regex ? [$line] : explode(',', $line);
+            foreach ($parts as $part) {
+                $part = trim($part);
+                if ($part === '' || $part[0] === '#') {
+                    continue;
+                }
+                if (++$count > FM_RULES_MAX) {
+                    return ['ok' => false, 'msg' => 'Too many rules (at most ' . FM_RULES_MAX . ').'];
+                }
+                $rule = $regex ? fmPathRuleFromRegex($part) : fmPathRuleFromMask($part);
+                if ($rule === null) {
+                    $err = error_get_last();
+                    $why = $err ? preg_replace('/^preg_match\(\):\s*/', '', (string)$err['message']) : 'invalid pattern';
+                    return ['ok' => false, 'msg' => $label . ', line ' . ($i + 1) . ': ' . ($regex ? 'invalid regular expression (' . $why . ')' : 'invalid mask') . '.'];
+                }
+                $rules[$field][] = $rule;
+            }
+        }
+    }
+    return ['ok' => true, 'rules' => $count ? $rules : null];
+}
+
+/** @return array{re: string, dirOnly: bool, onName: bool}|null */
+function fmPathRuleFromMask(string $mask): ?array {
+    $dirOnly = substr($mask, -1) === '/';
+    $mask = rtrim($mask, '/');
+    $anchored = $mask !== '' && $mask[0] === '/';
+    $mask = ltrim($mask, '/');
+    if ($mask === '') {
+        return null;
+    }
+    $chars = preg_split('//u', $mask, -1, PREG_SPLIT_NO_EMPTY);
+    if ($chars === false) {
+        return null;
+    }
+    $re = '';
+    $n = count($chars);
+    for ($i = 0; $i < $n; $i++) {
+        $ch = $chars[$i];
+        if ($ch === '*' && ($chars[$i + 1] ?? '') === '*') {
+            $i++;
+            if (($chars[$i + 1] ?? '') === '/') {
+                $i++;
+                $re .= '(?:.*/)?';
+            } else {
+                $re .= '.*';
+            }
+        } elseif ($ch === '*') {
+            $re .= '[^/]*';
+        } elseif ($ch === '?') {
+            $re .= '[^/]';
+        } else {
+            $re .= preg_quote($ch, '~');
+        }
+    }
+    return ['re' => '~^' . $re . '$~iu', 'dirOnly' => $dirOnly, 'onName' => !$anchored && strpos($mask, '/') === false];
+}
+
+/** @return array{re: string, dirOnly: bool, onName: bool}|null */
+function fmPathRuleFromRegex(string $pattern): ?array {
+    $re = "\x01" . $pattern . "\x01iu";
+    error_clear_last();
+    if (@preg_match($re, '') === false) {
+        return null;
+    }
+    return ['re' => $re, 'dirOnly' => false, 'onName' => false, 'regex' => true];
+}
+
+/** Whether one of $list matches the item itself (not its folders). $rel: path from the top, no trailing "/". */
+function fmPathRulesHit(array $list, string $rel, bool $isDir): bool {
+    foreach ($list as $r) {
+        if ($r['dirOnly'] && !$isDir) {
+            continue;
+        }
+        if (!empty($r['regex'])) {
+            $subject = $rel . ($isDir ? '/' : '');
+        } else {
+            $subject = $r['onName'] ? basename($rel) : $rel;
+        }
+        if (preg_match($r['re'], $subject) === 1) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/** Whether a rule of $list matches the item or one of the folders it is in. */
+function fmPathRulesHitAny(array $list, string $rel, bool $isDir): bool {
+    if ($list === []) {
+        return false;
+    }
+    $parts = explode('/', $rel);
+    $prefix = '';
+    foreach ($parts as $i => $p) {
+        $prefix = $i ? $prefix . '/' . $p : $p;
+        if (fmPathRulesHit($list, $prefix, $i < count($parts) - 1 || $isDir)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Whether a file is kept (or a folder is kept as a whole): not excluded (itself or a folder above it), and Include is
+ * empty or matches it or a folder above it. A folder that is not kept as a whole can still be needed for what is inside.
+ */
+function fmPathRulesMatch(array $rules, string $rel, bool $isDir): bool {
+    $rel = trim(str_replace('\\', '/', $rel), '/');
+    if ($rel === '' || fmPathRulesHitAny($rules['exclude'], $rel, $isDir)) {
+        return false;
+    }
+    return $rules['include'] === [] || fmPathRulesHitAny($rules['include'], $rel, $isDir);
+}
+
+/**
+ * Filter a flat entry list (archive contents): files by fmPathRulesMatch, folders when kept as a whole or when a kept
+ * entry is inside them.
+ *
+ * @param list<array{name: string, kind: string}> $entries name without a trailing "/"
+ * @return array{kept: list<array>, skipped: list<string>}
+ */
+function fmPathRulesFilterEntries(array $rules, array $entries): array {
+    $keep = [];
+    $needed = [];
+    foreach ($entries as $i => $e) {
+        $rel = trim(str_replace('\\', '/', (string)$e['name']), '/');
+        if ($rel !== '' && fmPathRulesMatch($rules, $rel, $e['kind'] === 'dir')) {
+            $keep[$i] = true;
+            for ($p = dirname($rel); $p !== '.' && $p !== '' && $p !== '/'; $p = dirname($p)) {
+                $needed[$p] = true;
+            }
+        }
+    }
+    $kept = [];
+    $skipped = [];
+    foreach ($entries as $i => $e) {
+        $rel = trim(str_replace('\\', '/', (string)$e['name']), '/');
+        $ok = isset($keep[$i]) || ($e['kind'] === 'dir' && isset($needed[$rel]) && !fmPathRulesHitAny($rules['exclude'], $rel, true));
+        if ($ok) {
+            $kept[] = $e;
+        } else {
+            $skipped[] = (string)$e['name'];
+        }
+    }
+    return ['kept' => $kept, 'skipped' => $skipped];
+}
+
+/**
+ * Rules from a request (rules_include, rules_exclude, rules_regex): null when none are set; a bad rule ends the
+ * request through $fail.
+ */
+function fmPathRulesFromRequest(array $req, callable $fail): ?array {
+    $r = fmPathRulesParse((string)($req['rules_include'] ?? ''), (string)($req['rules_exclude'] ?? ''), (string)($req['rules_regex'] ?? '') === '1');
+    if (!$r['ok']) {
+        $fail('Filter: ' . $r['msg']);
+    }
+    return $r['rules'];
+}
+
 function fmSearchNameMatches(array $c, string $name): bool {
     if ($c['name'] === '') {
         return true;
@@ -5290,15 +5473,16 @@ function fmJobProgress(callable $send, string $rootDir, int $total): array {
 }
 
 /**
- * File types of a summary, most common first: [[ext, files], ...] ('' = no extension), at most 500 entries.
+ * File types of a summary, most common first: [[ext, files, bytes], ...] ('' = no extension), at most 500 entries.
  *
  * @param array<string, int> $counts
- * @return list<array{0: string, 1: int}>
+ * @param array<string, int> $sizes total bytes per extension
+ * @return list<array{0: string, 1: int, 2: int}>
  */
-function fmInfoTypes(array $counts): array {
+function fmInfoTypes(array $counts, array $sizes = []): array {
     $list = [];
     foreach ($counts as $ext => $n) {
-        $list[] = [(string)$ext, (int)$n];
+        $list[] = [(string)$ext, (int)$n, (int)($sizes[$ext] ?? 0)];
     }
     usort($list, static fn(array $a, array $b): int => $b[1] <=> $a[1] ?: strcmp($a[0], $b[0]));
     return array_slice($list, 0, 500);
@@ -5306,16 +5490,18 @@ function fmInfoTypes(array $counts): array {
 
 /**
  * Size and contents of one folder in one PHP walk (Get info): files and folders inside it (the folder itself not
- * counted) and their total size. Nested folder links are not followed, as in the other walks.
+ * counted), their total size and the file types (fmInfoTypes). Nested folder links are not followed, as in the other walks.
  *
- * @return array{size: int, files: int, folders: int}
+ * @return array{size: int, files: int, folders: int, types: list<array{0: string, 1: int, 2: int}>}
  */
 function fmFolderStats(string $dir, string $rootDir): array {
-    $stats = ['size' => 0, 'files' => 0, 'folders' => 0];
+    $stats = ['size' => 0, 'files' => 0, 'folders' => 0, 'types' => []];
     if (!pathInsideRoot($dir, $rootDir) || !is_dir($dir)) {
         return $stats;
     }
     $dir = rtrim($dir, '/');
+    $counts = [];
+    $sizes = [];
     foreach (fmArchiveWalkPath($dir, basename($dir)) as [$abs, , $isDir]) {
         if ($isDir) {
             if ($abs !== $dir) {
@@ -5323,9 +5509,14 @@ function fmFolderStats(string $dir, string $rootDir): array {
             }
             continue;
         }
+        $size = (int)(@filesize($abs) ?: 0);
+        $ext = strtolower(pathinfo($abs, PATHINFO_EXTENSION));
+        $counts[$ext] = ($counts[$ext] ?? 0) + 1;
+        $sizes[$ext] = ($sizes[$ext] ?? 0) + $size;
         $stats['files']++;
-        $stats['size'] += (int)(@filesize($abs) ?: 0);
+        $stats['size'] += $size;
     }
+    $stats['types'] = fmInfoTypes($counts, $sizes);
     return $stats;
 }
 
@@ -5346,6 +5537,7 @@ function fmMultiInfo(array $paths, string $rootDir, callable $progress): array {
         'permissions' => [], 'permissions_more' => false, 'types' => [],
     ];
     $types = [];
+    $typeSizes = [];
     $parents = [];
     $mMin = null;
     $mMax = null;
@@ -5369,10 +5561,12 @@ function fmMultiInfo(array $paths, string $rootDir, callable $progress): array {
             }
         }
     };
-    $countFile = static function (string $path) use (&$info, &$types): void {
-        $info['size'] += (int)(@filesize($path) ?: 0);
+    $countFile = static function (string $path) use (&$info, &$types, &$typeSizes): void {
+        $size = (int)(@filesize($path) ?: 0);
+        $info['size'] += $size;
         $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
         $types[$ext] = ($types[$ext] ?? 0) + 1;
+        $typeSizes[$ext] = ($typeSizes[$ext] ?? 0) + $size;
     };
     foreach ($paths as $i => $raw) {
         $raw = rtrim(normPath($raw), '/');
@@ -5419,7 +5613,7 @@ function fmMultiInfo(array $paths, string $rootDir, callable $progress): array {
     }
     $info['modified_min'] = $mMin !== null ? date('Y-m-d H:i', $mMin) : null;
     $info['modified_max'] = $mMax !== null ? date('Y-m-d H:i', $mMax) : null;
-    $info['types'] = fmInfoTypes($types);
+    $info['types'] = fmInfoTypes($types, $typeSizes);
     return $info;
 }
 
@@ -5797,40 +5991,105 @@ function fmStreamCommandToClient(array $argv, string $cwd, string $downloadName,
  * @param string[] $names
  * @return Generator<array{0: string, 1: string, 2: bool}>
  */
-function fmArchiveWalk(string $dir, array $names): Generator {
+function fmArchiveWalk(string $dir, array $names, ?array $rules = null): Generator {
     foreach ($names as $n) {
-        yield from fmArchiveWalkPath($dir . '/' . $n, $n);
+        $pending = [];
+        $whole = false;
+        // Items from search results ("docs/a.txt"): the folders above them count for the rules too.
+        $parent = dirname($n);
+        if ($rules !== null && $parent !== '.' && $parent !== '') {
+            if (fmPathRulesHitAny($rules['exclude'], $parent, true)) {
+                FmArchiveFilterLog::skip($n, is_dir($dir . '/' . $n));
+                continue;
+            }
+            $whole = fmPathRulesHitAny($rules['include'], $parent, true);
+        }
+        yield from fmArchiveWalkPath($dir . '/' . $n, $n, $rules, $pending, $whole);
     }
 }
 
 /**
+ * With $rules: excluded items (and everything in an excluded folder) are left out without being walked; with
+ * Include set, a folder comes out only right before the first kept item inside it ($pending holds the folders
+ * waiting for one), unless the folder itself is included as a whole ($whole).
+ *
+ * @param list<array{0: string, 1: string, 2: bool}> $pending
  * @return Generator<array{0: string, 1: string, 2: bool}>
  */
-function fmArchiveWalkPath(string $abs, string $rel): Generator {
+function fmArchiveWalkPath(string $abs, string $rel, ?array $rules = null, array &$pending = [], bool $whole = false): Generator {
     $isLink = fmIsLinkPath($abs);
-    if (is_dir($abs)) {
+    $isDir = is_dir($abs);
+    if ($rules !== null && ($isDir || is_file($abs))) {
+        if (fmPathRulesHit($rules['exclude'], $rel, $isDir)) {
+            FmArchiveFilterLog::skip($rel, $isDir);
+            return;
+        }
+        $whole = $whole || $rules['include'] === [] || fmPathRulesHit($rules['include'], $rel, $isDir);
+    }
+    if ($isDir) {
         // Nested folder links (symlink / junction): do not follow (cycles).
         if ($isLink && strpos($rel, '/') !== false) {
             FmDlStatus::skip($rel . '/', 'linked folder');
             return;
         }
-        yield [$abs, $rel, true];
+        $mark = null;
+        if ($rules === null || $whole) {
+            foreach ($pending as $p) {
+                yield $p;
+            }
+            $pending = [];
+            yield [$abs, $rel, true];
+        } else {
+            $pending[] = [$abs, $rel, true];
+            $mark = count($pending);
+        }
         $entries = @scandir($abs);
         if ($entries === false) {
             FmDlStatus::skip($rel . '/', 'folder not readable');
+            if ($mark !== null && count($pending) === $mark) {
+                array_pop($pending);
+            }
             return;
         }
         foreach ($entries as $e) {
             if ($e !== '.' && $e !== '..') {
-                yield from fmArchiveWalkPath($abs . '/' . $e, $rel . '/' . $e);
+                yield from fmArchiveWalkPath($abs . '/' . $e, $rel . '/' . $e, $rules, $pending, $whole);
             }
+        }
+        if ($mark !== null && count($pending) === $mark) {
+            array_pop($pending);
         }
         return;
     }
     if (is_file($abs)) {
+        if ($rules !== null) {
+            if (!$whole) {
+                FmArchiveFilterLog::skip($rel, false);
+                return;
+            }
+            foreach ($pending as $p) {
+                yield $p;
+            }
+            $pending = [];
+        }
         yield [$abs, $rel, false];
     } elseif ($isLink) {
         FmDlStatus::skip($rel, 'broken link');
+    }
+}
+
+/** Items left out by the archive filter in this request (excluded items, files not included). */
+final class FmArchiveFilterLog {
+    /** @var int */
+    public static $count = 0;
+    /** @var list<string> */
+    public static $names = [];
+
+    public static function skip(string $rel, bool $isDir): void {
+        self::$count++;
+        if (count(self::$names) < 20) {
+            self::$names[] = $rel . ($isDir ? '/' : '');
+        }
     }
 }
 
@@ -5871,9 +6130,9 @@ function fmZipCentralEntry(string $name, int $flags, int $method, array $dos, in
  *
  * @param string[] $names
  */
-function fmStreamZip(string $dir, array $names, FmStreamOut $out): void {
+function fmStreamZip(string $dir, array $names, FmStreamOut $out, ?array $rules = null): void {
     $central = [];
-    foreach (fmArchiveWalk($dir, $names) as [$abs, $rel, $isDir]) {
+    foreach (fmArchiveWalk($dir, $names, $rules) as [$abs, $rel, $isDir]) {
         $dos = fmZipDosTime((int)(@filemtime($abs) ?: time()));
         $offset = $out->position();
         if ($isDir) {
@@ -5970,8 +6229,8 @@ function fmTarWriteHeader(FmStreamOut $out, string $name, int $mode, int $size, 
  *
  * @param string[] $names
  */
-function fmStreamTar(string $dir, array $names, FmStreamOut $out, ?callable $onFile = null): void {
-    foreach (fmArchiveWalk($dir, $names) as [$abs, $rel, $isDir]) {
+function fmStreamTar(string $dir, array $names, FmStreamOut $out, ?callable $onFile = null, ?array $rules = null): void {
+    foreach (fmArchiveWalk($dir, $names, $rules) as [$abs, $rel, $isDir]) {
         $mtime = (int)(@filemtime($abs) ?: time());
         $perms = @fileperms($abs);
         if ($isDir) {
@@ -6058,6 +6317,12 @@ function fmDownloadArchiveHandlePost(string $rootDir, bool $isUnixLikeShell, boo
     if ($names === []) {
         fmDownloadFail(400, 'None of the selected items exist any more.');
     }
+    $rules = fmPathRulesFromRequest($_POST, static function (string $msg): void {
+        fmDownloadFail(400, $msg);
+    });
+    if ($rules !== null && !fmFileOpsAllowPhpFallback()) {
+        fmDownloadFail(400, 'A filter needs the PHP archive writer, but file ops mode is OS only. Download without the filter, or set $FM_FILE_OPS_MODE to "auto".');
+    }
 
     $mime = [
         'zip' => 'application/zip',
@@ -6067,7 +6332,8 @@ function fmDownloadArchiveHandlePost(string $rootDir, bool $isUnixLikeShell, boo
 
     $osError = '';
     // PHP reads Windows pipes at only a few MB/s, so the PHP writer is much faster there; tar.exe is for OS-only mode.
-    $tryOs = !$isWindows || fmFileOpsMode() === 'os';
+    // With a filter only the PHP writer is used: the OS tools would apply their own pattern rules.
+    $tryOs = (!$isWindows || fmFileOpsMode() === 'os') && $rules === null;
     if ($tryOs && fmFileOpsTryShell() && fmIsProcOpenAvailable()) {
         $argv = fmDownloadArchiveOsCommand($type, $names, $isUnixLikeShell, $isWindows);
         if ($argv !== null) {
@@ -6092,9 +6358,9 @@ function fmDownloadArchiveHandlePost(string $rootDir, bool $isUnixLikeShell, boo
     $out = new FmStreamOut($type === 'gzip');
     try {
         if ($type === 'zip') {
-            fmStreamZip($dir, $names, $out);
+            fmStreamZip($dir, $names, $out, $rules);
         } else {
-            fmStreamTar($dir, $names, $out);
+            fmStreamTar($dir, $names, $out, null, $rules);
         }
         $out->finish();
         FmDlStatus::done();
@@ -6497,6 +6763,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'get-info' && isset($_GET['pat
     if ($folderStats !== null) {
         $out['files_count'] = $folderStats['files'];
         $out['folders_count'] = $folderStats['folders'];
+        $out['types'] = $folderStats['types'];
     }
     if (!$isDir && !$outside) {
         $out['encoding'] = fmEncodingFileInfo($link !== null ? $linkPath : $path, $ROOT_DIR);
@@ -7092,7 +7359,8 @@ if (isset($_POST['action']) && $_POST['action'] === 'compress' && isset($_POST['
         FmDlStatus::items($n);
         FmDlStatus::done();
         $send(['n' => $n, 'name' => '']);
-        $send(['done' => true]);
+        $filtered = FmArchiveFilterLog::$count;
+        $send(['done' => true] + ($filtered > 0 ? ['filtered' => $filtered] : []));
         exit;
     };
     // Shell archivers: every file they report counts as progress; nothing reported for 5 s sends a "tick", so
@@ -7177,6 +7445,10 @@ if (isset($_POST['action']) && $_POST['action'] === 'compress' && isset($_POST['
         }
     }
     if (count($names) === 0) $sendError('No valid items to archive');
+    $rules = fmPathRulesFromRequest($_POST, $sendError);
+    if ($rules !== null && !fmFileOpsAllowPhpFallback()) {
+        $sendError('A filter needs PHP archiving, but file ops mode is OS only. Archive without the filter, or set $FM_FILE_OPS_MODE to "auto".');
+    }
 
     // Overwrite only when the UI confirmed (checkbox + "Are you sure").
     $overwrite = isset($_POST['overwrite']) && ((string)$_POST['overwrite'] === '1' || (string)$_POST['overwrite'] === 'true');
@@ -7203,7 +7475,8 @@ if (isset($_POST['action']) && $_POST['action'] === 'compress' && isset($_POST['
     $total = is_int($providedTotal) && $providedTotal > 0 ? $providedTotal : 0;
     $itemCounts = null; // compute lazily only if we need PHP fallback progress
 
-    $tryShell         = fmFileOpsTryShell();
+    // With a filter the PHP builders do the work: the OS archivers would apply their own pattern rules.
+    $tryShell         = fmFileOpsTryShell() && $rules === null;
     $allowPhpFallback = fmFileOpsAllowPhpFallback();
 
     $send(['total' => $total, 'n' => 0, 'name' => '']);
@@ -7390,33 +7663,22 @@ if (isset($_POST['action']) && $_POST['action'] === 'compress' && isset($_POST['
                 $send(['phase' => 'adding', 'msg' => 'Adding files and folders structure…']);
                 // Size of each entry in the order added: close() reports entries done, the percent shown is bytes done.
                 $entrySizes = [];
-                foreach ($names as $n) {
-                    $full = $dir . '/' . $n;
-                    if (is_file($full)) {
-                        $zip->addFile($full, $n);
-                        $entrySizes[] = (int)@filesize($full);
-                        $processed++;
-                        $sendProgress();
-                    } elseif (is_dir($full)) {
-                        $it = new RecursiveIteratorIterator(
-                            new RecursiveDirectoryIterator($full, RecursiveDirectoryIterator::SKIP_DOTS)
-                        );
-                        foreach ($it as $fi) {
-                            $path = $fi->getPathname();
-                            $local = $n . '/' . substr($path, strlen($dir . '/' . $n) + 1);
-                            $local = str_replace('\\', '/', $local);
-
-                            if ($fi->isDir()) {
-                                $zip->addEmptyDir($local);
-                                $entrySizes[] = 0;
-                                continue;
-                            }
-                            $zip->addFile($path, $local);
-                            $entrySizes[] = (int)$fi->getSize();
-                            $processed++;
-                            $sendProgress();
-                        }
+                // Same walk as the streaming writers: links to folders are not followed, the filter applies.
+                foreach (fmArchiveWalk($dir, $names, $rules) as [$abs, $local, $isDir]) {
+                    if ($isDir) {
+                        $zip->addEmptyDir($local);
+                        $entrySizes[] = 0;
+                        continue;
                     }
+                    $zip->addFile($abs, $local);
+                    $entrySizes[] = (int)@filesize($abs);
+                    $processed++;
+                    $sendProgress();
+                }
+                if ($entrySizes === []) {
+                    $zip->close();
+                    @unlink($destPath);
+                    $sendError($rules !== null ? 'Nothing matches the filter: no archive was created.' : 'No valid items to archive');
                 }
 
                 $send(['n' => $processed, 'name' => '']);
@@ -7459,10 +7721,14 @@ if (isset($_POST['action']) && $_POST['action'] === 'compress' && isset($_POST['
                     fmStreamTar($dir, $names, $out, static function () use (&$processed, $sendProgress) {
                         $processed++;
                         $sendProgress();
-                    });
+                    }, $rules);
                     $out->finish();
                 } finally {
                     fclose($fh);
+                }
+                if ($rules !== null && $processed === 0) {
+                    @unlink($destPath);
+                    $sendError('Nothing matches the filter: no archive was created.');
                 }
                 $send(['n' => $processed]);
             }
@@ -7542,6 +7808,11 @@ if (isset($_POST['action']) && $_POST['action'] === 'extract' && isset($_POST['i
     if (count($archives) === 0) {
         $sendError('No supported archives selected (use .zip, .tar, or .tar.gz / .tgz)');
     }
+    $rules = fmPathRulesFromRequest($_POST, $sendError);
+    if ($rules !== null && !$allowPhpFallback) {
+        $sendError('A filter needs PHP extraction, but file ops mode is OS only. Extract without the filter, or set $FM_FILE_OPS_MODE to "auto".');
+    }
+    $filteredOut = 0;
 
     foreach ($archives as &$a) {
         $a['entryCount'] = max(1, fmCountArchiveEntries($a['path'], $a['type']));
@@ -7739,6 +8010,20 @@ if (isset($_POST['action']) && $_POST['action'] === 'extract' && isset($_POST['i
                 $sendError($base . ' has more than ' . FM_ARCHIVE_MAX_ENTRIES . ' entries; refusing to extract.');
             }
             $split = fmArchiveSplitEntries($listed, $destDir, $ROOT_DIR);
+            if ($rules !== null) {
+                // Only the checked (safe) entries that pass the filter, written in PHP like the "skip unsafe" case.
+                $filtered = fmPathRulesFilterEntries($rules, $split['safe']);
+                if ($filtered['kept'] === []) {
+                    $sendError('Nothing in ' . $base . ' matches the filter; nothing was extracted.');
+                }
+                foreach ($split['unsafe'] as $u) {
+                    $skipped[] = $base . ': ' . $u;
+                }
+                $filteredOut += count($filtered['skipped']);
+                $send(['n' => $processed, 'total' => $grandTotal, 'phase' => 'php', 'msg' => 'Extracting in PHP with the filter: ' . $base]);
+                $phpExtractOne($apath, $destDir, $atype, $entryCount, $filtered['kept']);
+                continue;
+            }
             if ($split['unsafe'] !== []) {
                 if ($split['safe'] === []) {
                     $sendError('Nothing extracted from ' . $base . ': all entries are links or would be written outside this folder.');
@@ -7779,11 +8064,86 @@ if (isset($_POST['action']) && $_POST['action'] === 'extract' && isset($_POST['i
             'highlight'     => array_values(array_unique($highlightNames)),
             'skipped'       => array_slice($skipped, 0, 20),
             'skipped_count' => count($skipped),
-        ]);
+        ] + ($filteredOut > 0 ? ['filtered' => $filteredOut] : []));
     } catch (Throwable $e) {
         $sendError($e->getMessage());
     }
     exit;
+}
+
+// What an archive filter keeps: of the selected items (Archive, Download as archive) or inside archives (Extract).
+if (isset($_POST['action']) && $_POST['action'] === 'archive-filter-preview' && isset($_POST['in'], $_POST['names']) && is_array($_POST['names'])) {
+    $dirIn = (string)$_POST['in'];
+    $dir = safeRealpath($dirIn !== '' ? $ROOT_DIR . '/' . trim($dirIn, '/') : $ROOT_DIR);
+    if (!pathInsideRoot($dir, $ROOT_DIR) || !is_dir($dir)) {
+        jsonOut(['status' => 'error', 'msg' => 'The folder no longer exists.']);
+    }
+    $rules = fmPathRulesFromRequest($_POST, static function (string $msg): void {
+        jsonOut(['status' => 'error', 'msg' => $msg]);
+    });
+    if ($rules === null) {
+        jsonOut(['status' => 'error', 'msg' => 'No rules to check.']);
+    }
+    if ((string)($_POST['validate_only'] ?? '') === '1') {
+        jsonOut(['status' => 'success']);
+    }
+    @set_time_limit(180);
+    $names = array_values(array_filter(array_map('fmRequestItemName', (array)$_POST['names']), static fn($n) => $n !== null && file_exists($dir . '/' . $n)));
+    $kept = 0;
+    $keptSize = 0;
+    $keptNames = [];
+    $partial = false;
+    $started = microtime(true);
+    $tooLong = static fn(int $seen): bool => $seen >= 200000 || microtime(true) - $started > 120;
+    if ((string)($_POST['mode'] ?? '') === 'archive') {
+        $skipped = 0;
+        $skippedNames = [];
+        $seen = 0;
+        foreach ($names as $n) {
+            $type = fmArchiveTypeFromBasename(basename($n));
+            $listed = $type !== null ? fmArchiveListEntries($dir . '/' . $n, $type) : null;
+            if ($listed === null) {
+                jsonOut(['status' => 'error', 'msg' => 'Could not read the contents of ' . $n . '.']);
+            }
+            $f = fmPathRulesFilterEntries($rules, fmArchiveSplitEntries($listed, $dir, $ROOT_DIR)['safe']);
+            $prefix = count($names) > 1 ? $n . ': ' : '';
+            foreach ($f['kept'] as $e) {
+                $kept++;
+                if (count($keptNames) < 20) {
+                    $keptNames[] = $prefix . $e['name'] . ($e['kind'] === 'dir' ? '/' : '');
+                }
+            }
+            foreach ($f['skipped'] as $s) {
+                $skipped++;
+                if (count($skippedNames) < 20) {
+                    $skippedNames[] = $prefix . $s;
+                }
+            }
+            $seen += count($listed);
+            if ($tooLong($seen)) {
+                $partial = true;
+                break;
+            }
+        }
+        jsonOut(['status' => 'success', 'kept' => $kept, 'kept_size' => null, 'skipped' => $skipped,
+            'kept_names' => $keptNames, 'skipped_names' => $skippedNames, 'partial' => $partial]);
+    }
+    $seen = 0;
+    foreach (fmArchiveWalk($dir, $names, $rules) as [$abs, $rel, $isDir]) {
+        $kept++;
+        if (!$isDir) {
+            $keptSize += (int)@filesize($abs);
+        }
+        if (count($keptNames) < 20) {
+            $keptNames[] = $rel . ($isDir ? '/' : '');
+        }
+        if ($tooLong(++$seen + FmArchiveFilterLog::$count)) {
+            $partial = true;
+            break;
+        }
+    }
+    jsonOut(['status' => 'success', 'kept' => $kept, 'kept_size' => $keptSize, 'skipped' => FmArchiveFilterLog::$count,
+        'kept_names' => $keptNames, 'skipped_names' => FmArchiveFilterLog::$names, 'partial' => $partial]);
 }
 
 if (isset($_POST['action']) && $_POST['action'] === 'get-files-and-folders-count') {
@@ -7808,6 +8168,20 @@ if (isset($_POST['action']) && $_POST['action'] === 'get-files-and-folders-count
     $dir   = $dirIn !== '' ? $ROOT_DIR . '/' . trim($dirIn, '/') : $ROOT_DIR;
     $dir   = safeRealpath($dir);
     if (!pathInsideRoot($dir, $ROOT_DIR)) jsonOut(['status' => 'error', 'msg' => 'Invalid path']);
+
+    $rules = fmPathRulesFromRequest($_POST, static function (string $msg): void {
+        jsonOut(['status' => 'error', 'msg' => $msg, 'files' => 0, 'folders' => 0, 'total' => 0]);
+    });
+    if ($rules !== null) {
+        // Archiving with a filter counts files as it adds them, so the total is the files that will be added.
+        $names = array_values(array_filter(array_map('fmRequestItemName', (array)$_POST['names']), static fn($n) => $n !== null && file_exists($dir . '/' . $n)));
+        $files = 0;
+        $folders = 0;
+        foreach (fmArchiveWalk($dir, $names, $rules) as [, , $isDir]) {
+            $isDir ? $folders++ : $files++;
+        }
+        jsonOut(['status' => 'success', 'files' => $files, 'folders' => $folders, 'total' => $files, 'filtered' => FmArchiveFilterLog::$count]);
+    }
 
     $totalFiles = 0;
     $totalFolders = 0;
@@ -8611,6 +8985,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'trash-move' && isset($_POST
     $relDir = fmRelFromRoot($dir, $ROOT_DIR);
     $errors = [];
     $ok     = [];
+    $ids    = [];
     foreach ($_POST['names'] as $raw) {
         $name = fmRequestItemName($raw);
         if ($name === null) {
@@ -8626,15 +9001,19 @@ if (isset($_POST['action']) && $_POST['action'] === 'trash-move' && isset($_POST
             $errors[] = $name . ': already in trash';
             continue;
         }
-        if (fmTrashStore($src, $relDir === '' ? $name : $relDir . '/' . $name, $ROOT_DIR) === null) {
+        $id = fmTrashStore($src, $relDir === '' ? $name : $relDir . '/' . $name, $ROOT_DIR);
+        if ($id === null) {
             $errors[] = $name . ': move to Trash failed (permission denied or file in use)';
             continue;
         }
         $ok[] = $name;
+        $ids[] = $id;
     }
     jsonOut([
         'status' => count($ok) > 0 && count($errors) === 0 ? 'success' : (count($ok) > 0 ? 'partial' : 'error'),
         'ok'     => $ok,
+        // Trash ids of the moved items (same order as ok): Undo restores exactly these.
+        'ids'    => $ids,
         'errors' => $errors,
     ]);
 }
@@ -9891,64 +10270,98 @@ body.fm-popup-dragging * {
     padding: 0;
 }
 
-/* Top-right toasts (fmToast) */
+/* Toasts (fmToast): bottom centre, dark like a snackbar, newest at the bottom; the colour strip tells the kind. */
 .fm-toast-stack {
     position: fixed;
-    top: 12px;
-    right: 12px;
+    left: 50%;
+    bottom: calc(18px + env(safe-area-inset-bottom, 0px));
     z-index: 11000;
     display: flex;
     flex-direction: column;
-    align-items: flex-end;
+    align-items: center;
     gap: 8px;
-    max-width: min(380px, calc(100vw - 24px));
+    width: min(520px, calc(100vw - 24px));
+    transform: translateX(-50%);
     pointer-events: none;
 }
 
 .fm-toast {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    box-sizing: border-box;
+    width: 100%;
     pointer-events: auto;
-    padding: 10px 14px;
+    padding: 10px 12px 10px 14px;
+    border-left: 4px solid #6ea8fe;
     border-radius: 8px;
+    background: #2b2f33;
+    color: #f1f3f5;
     font-size: 13px;
     line-height: 1.45;
-    box-shadow: 0 4px 18px rgba(0, 0, 0, 0.14);
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.28);
     cursor: pointer;
     opacity: 0;
-    transform: translateX(16px);
+    transform: translateY(14px);
     transition: opacity 0.2s ease, transform 0.2s ease;
 }
 
 .fm-toast--visible {
     opacity: 1;
-    transform: translateX(0);
+    transform: translateY(0);
 }
 
 .fm-toast--success {
-    background: #ecfdf3;
-    border: 1px solid #a3e4b8;
-    color: #0f5132;
+    border-left-color: #51cf66;
 }
 
 .fm-toast--info {
-    background: #e7f1ff;
-    border: 1px solid #9ec5fe;
-    color: #052c65;
+    border-left-color: #6ea8fe;
 }
 
 .fm-toast--warning {
-    background: #fff8e6;
-    border: 1px solid #ffe69c;
-    color: #664d03;
+    border-left-color: #ffc107;
+}
+
+.fm-toast-body {
+    flex: 1 1 auto;
+    min-width: 0;
 }
 
 .fm-toast-title {
     display: block;
-    margin-bottom: 4px;
+    margin-bottom: 2px;
     font-weight: 600;
 }
 
 .fm-toast-msg {
     display: block;
+    overflow-wrap: anywhere;
+}
+
+.fm-toast-action {
+    flex: 0 0 auto;
+    padding: 5px 12px;
+    border: 0;
+    border-radius: 4px;
+    background: transparent;
+    color: #8bb9fe;
+    font: inherit;
+    font-weight: 700;
+    letter-spacing: .02em;
+    text-transform: uppercase;
+    cursor: pointer;
+}
+.fm-toast-action:hover,
+.fm-toast-action:focus-visible {
+    background: rgba(255, 255, 255, 0.1);
+    outline: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .fm-toast {
+        transition: none;
+    }
 }
 
 /* Skipped files list after a download (FmDownloadTracker) */
@@ -11441,6 +11854,51 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     text-overflow: ellipsis;
 }
 
+/* Types cell of Get info: the most common types on one line, then "Details" (FmTypesPopup.cellHtml). */
+.fm-info-table .fm-info-types {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    min-width: 0;
+}
+.fm-info-table td:has(> .fm-info-types) {
+    max-width: 0;
+}
+.fm-info-table .fm-info-types-short {
+    flex: 1 1 auto;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.fm-info-table .fm-info-types-all {
+    flex: 0 0 auto;
+    font-size: 12px;
+}
+.fm-types-popup .fm-types-scroll {
+    max-height: 55vh;
+    overflow-y: auto;
+}
+.fm-types-popup .fm-types-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+.fm-types-popup .fm-types-table th,
+.fm-types-popup .fm-types-table td {
+    padding: 4px 8px;
+    border-bottom: 1px solid #eee;
+}
+.fm-types-popup .fm-types-table th {
+    position: sticky;
+    top: 0;
+    background: #fff;
+    text-align: left;
+}
+.fm-types-popup .fm-types-table .ta-r {
+    text-align: right;
+}
+
 .fm-info-loading--server {
     min-height: 760px;
 }
@@ -12849,9 +13307,57 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
     color: #777;
 }
 
-/* Popups are at most 90vh high: the file list and the preview share the height left above ~740px. */
+/* Name filter, Check all / none and the pages of the list: one line of fixed height. */
+.fm-convert-encoding-popup .fm-enc-tools {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    height: 26px;
+    margin-bottom: 6px;
+    font-size: 12px;
+}
+.fm-convert-encoding-popup .fm-enc-name-filter {
+    flex: 0 1 240px;
+    min-width: 120px;
+    height: 24px;
+    padding: 2px 8px;
+    font-size: 12px;
+}
+.fm-convert-encoding-popup .fm-enc-tools .fm-link-btn {
+    flex-shrink: 0;
+    font-size: 12px;
+}
+.fm-convert-encoding-popup .fm-enc-pager {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: auto;
+    white-space: nowrap;
+    color: #555;
+}
+.fm-convert-encoding-popup .fm-enc-page-btn {
+    width: 24px;
+    height: 22px;
+    padding: 0;
+    border: 1px solid rgba(0, 0, 0, .15);
+    border-radius: 4px;
+    background: #fff;
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+}
+.fm-convert-encoding-popup .fm-enc-page-btn[hidden] {
+    display: inline-block;
+    visibility: hidden;
+}
+.fm-convert-encoding-popup .fm-enc-page-btn:disabled {
+    opacity: .4;
+    cursor: default;
+}
+
+/* Popups are at most 90vh high: the file list and the preview share the height left above ~772px. */
 .fm-convert-encoding-popup .fm-enc-list-wrap {
-    height: clamp(166px, calc(176px + (90vh - 740px) * .7), 520px);
+    height: clamp(150px, calc(160px + (90vh - 772px) * .7), 504px);
     overflow: auto;
     border: 1px solid rgba(0, 0, 0, .1);
     border-radius: 4px;
@@ -13281,6 +13787,149 @@ button.fm-popup-action-button.fm-popup-btn-disabled,
 /* One-field forms: the error line is always there (empty), see fmFieldError(). */
 .fm-popup-container .fm-popup-content .fm-field-error {
     margin: 6px 0 0;
+    min-height: 1.5em;
+    line-height: 1.5;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* "?" next to mask / regex options (fmPatternHelpButton) and the help popup (FmPatternHelpPopup). */
+.fm-help-q {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    width: 18px;
+    height: 18px;
+    margin: 0 0 0 6px;
+    padding: 0;
+    border: 1px solid #b9b9b9;
+    border-radius: 50%;
+    background: #fff;
+    color: #666;
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1;
+    cursor: pointer;
+    vertical-align: middle;
+}
+.fm-help-q:hover {
+    color: #b00020;
+    border-color: #b00020;
+}
+.fm-help-q:focus-visible {
+    outline: 2px solid #b00020;
+    outline-offset: 1px;
+}
+.fm-find-popup .fm-find-row .fm-help-q,
+.fm-bulk-rename-popup .fm-br-find-opts .fm-help-q {
+    margin-left: -8px;
+}
+.fm-convert-encoding-popup .fm-enc-scan-row .fm-help-q {
+    margin: 0 0 7px -10px;
+}
+.fm-link-btn {
+    padding: 0;
+    border: 0;
+    background: none;
+    color: #b00020;
+    font: inherit;
+    text-decoration: underline;
+    cursor: pointer;
+}
+.fm-help-popup .fm-help-body {
+    font-size: 13px;
+    line-height: 1.45;
+}
+.fm-help-popup .fm-help-h {
+    margin: 18px 0 6px;
+    padding: 2px 4px;
+    font-size: 14px;
+    border-radius: 4px;
+}
+.fm-help-popup .fm-help-flash {
+    animation: fm-help-flash 1.6s ease-out;
+}
+@keyframes fm-help-flash {
+    0%, 30% { background: #ffe3e6; }
+    100% { background: transparent; }
+}
+.fm-help-popup .fm-help-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 4px 0;
+}
+.fm-help-popup .fm-help-table td {
+    padding: 3px 6px;
+    border-bottom: 1px solid #eee;
+    vertical-align: top;
+}
+.fm-help-popup .fm-help-table td:first-child {
+    width: 42%;
+}
+.fm-help-popup code {
+    white-space: nowrap;
+    padding: 0 3px;
+    border-radius: 3px;
+    background: #f3f3f3;
+    font-size: 12px;
+}
+.fm-help-popup .fm-help-links {
+    margin: 4px 0 0;
+    padding-left: 18px;
+}
+
+/* Archive filter (FmArchiveFilter): collapsed by default, fixed-height result and error lines. */
+.fm-arch-filter {
+    margin: 10px 0;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    padding: 6px 10px;
+}
+.fm-arch-filter-summary {
+    cursor: pointer;
+    font-size: 13px;
+    user-select: none;
+}
+.fm-arch-filter-badge {
+    color: #b00020;
+    font-weight: 600;
+}
+.fm-arch-filter-body {
+    margin-top: 8px;
+}
+.fm-arch-filter-field {
+    display: block;
+    margin: 0 0 6px;
+    font-size: 12px;
+}
+.fm-arch-filter-field > span {
+    display: block;
+    margin-bottom: 2px;
+}
+.fm-popup-container .fm-popup-content textarea.fm-arch-filter-include,
+.fm-popup-container .fm-popup-content textarea.fm-arch-filter-exclude {
+    width: 100%;
+    box-sizing: border-box;
+    resize: vertical;
+    min-height: 44px;
+    font-family: inherit;
+    font-size: 12px;
+}
+.fm-arch-filter-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+.fm-popup-container .fm-popup-content .fm-arch-filter-help {
+    margin: 6px 0 0;
+    min-height: 3em;
+}
+.fm-popup-container .fm-popup-content .fm-arch-filter-result {
+    margin: 4px 0 0;
     min-height: 1.5em;
     line-height: 1.5;
     white-space: nowrap;
@@ -13870,6 +14519,172 @@ function fmFieldError(el, msg) {
     el.textContent = text || '\u00a0';
     el.title = text;
     el.classList.toggle('fm-field-error--on', !!text);
+}
+
+/**
+ * Include / exclude filter of Archive, Download as archive and Extract: a collapsed section with two rule fields,
+ * a regex switch, "Check" (archive-filter-preview) and a reserved error line. The rules are checked on the server
+ * before the job starts, so a bad rule is shown here instead of after the popup closed.
+ */
+class FmArchiveFilter {
+    static html() {
+        return '<details class="fm-arch-filter">' +
+            '<summary class="fm-arch-filter-summary">Filter (include / exclude) <span class="fm-arch-filter-badge"></span></summary>' +
+            '<div class="fm-arch-filter-body">' +
+            '<label class="fm-arch-filter-field"><span>Include only</span>' +
+            '<textarea class="fm-input fm-arch-filter-include" rows="2" spellcheck="false" autocomplete="off" placeholder="*.php, src/"></textarea></label>' +
+            '<label class="fm-arch-filter-field"><span>Exclude</span>' +
+            '<textarea class="fm-input fm-arch-filter-exclude" rows="2" spellcheck="false" autocomplete="off" placeholder="*.log, node_modules/, .git/"></textarea></label>' +
+            '<div class="fm-arch-filter-row"><span><label class="fm-option-label"><input type="checkbox" class="fm-arch-filter-regex"> Regular expressions</label>' +
+            fmPatternHelpButton('filter') + '</span>' +
+            '<button type="button" class="fm-btn secondary fm-arch-filter-check">Check</button></div>' +
+            '<p class="fm-hint fm-arch-filter-help"></p>' +
+            '<p class="fm-hint fm-arch-filter-result">\u00a0</p>' +
+            '<p class="fm-field-error fm-arch-filter-error">\u00a0</p>' +
+            '</div></details>';
+    }
+
+    /**
+     * @param {HTMLElement} root - The popup element holding FmArchiveFilter.html()
+     * @param {{ mode: 'selection'|'archive', ajaxUrl: string, pathIn: () => string, names: () => string[] }} opts
+     */
+    constructor(root, opts) {
+        this._opts = opts;
+        this._q = (sel) => root && root.querySelector(sel);
+        this._validated = false;
+        this._checkReq = 0;
+        const update = () => {
+            this._validated = false;
+            this._checkReq += 1;
+            fmFieldError(this._q('.fm-arch-filter-error'), '');
+            this._setResult('\u00a0', '');
+            this._syncText();
+        };
+        ['.fm-arch-filter-include', '.fm-arch-filter-exclude'].forEach((sel) => {
+            const el = this._q(sel);
+            if (el) el.addEventListener('input', update);
+        });
+        const re = this._q('.fm-arch-filter-regex');
+        if (re) re.addEventListener('change', update);
+        const btn = this._q('.fm-arch-filter-check');
+        if (btn) btn.addEventListener('click', () => this.check());
+        this._syncText();
+    }
+
+    _setResult(text, title) {
+        const el = this._q('.fm-arch-filter-result');
+        if (!el) return;
+        el.textContent = text;
+        el.title = title || '';
+    }
+
+    _ruleCount() {
+        const v = this.values();
+        const split = (t) => t.split(/\r?\n/).flatMap((l) => (v.regex ? [l] : l.split(','))).map((s) => s.trim()).filter((s) => s && s[0] !== '#');
+        return split(v.include).length + split(v.exclude).length;
+    }
+
+    _syncText() {
+        const n = this._ruleCount();
+        const badge = this._q('.fm-arch-filter-badge');
+        if (badge) badge.textContent = n ? '\u00b7 ' + n + (n === 1 ? ' rule' : ' rules') : '';
+        const help = this._q('.fm-arch-filter-help');
+        if (help) {
+            help.textContent = (this.values().regex
+                ? 'One regular expression per line, matched against the path inside the archive (folders end with "/"); case is ignored.'
+                : 'One mask per line or comma separated: * any text, ** any folders, ? one character; "name/" is a folder with all in it; with "/" inside it is a path from the top.') +
+                ' Exclude wins. With a filter the work is done in PHP.';
+        }
+    }
+
+    /** @returns {{ include: string, exclude: string, regex: boolean }} */
+    values() {
+        const inc = this._q('.fm-arch-filter-include');
+        const exc = this._q('.fm-arch-filter-exclude');
+        const re = this._q('.fm-arch-filter-regex');
+        return { include: inc ? inc.value : '', exclude: exc ? exc.value : '', regex: !!(re && re.checked) };
+    }
+
+    hasRules() {
+        return this._ruleCount() > 0;
+    }
+
+    /** @param {FormData|Array<[string, string]>} target */
+    static appendTo(target, v) {
+        if (!v || (!v.include.trim() && !v.exclude.trim())) return;
+        const add = (k, val) => (Array.isArray(target) ? target.push([k, val]) : target.append(k, val));
+        add('rules_include', v.include);
+        add('rules_exclude', v.exclude);
+        add('rules_regex', v.regex ? '1' : '0');
+    }
+
+    _form(extra) {
+        const form = new FormData();
+        form.append('action', 'archive-filter-preview');
+        form.append('mode', this._opts.mode);
+        form.append('in', this._opts.pathIn());
+        this._opts.names().forEach((n) => form.append('names[]', n));
+        FmArchiveFilter.appendTo(form, this.values());
+        Object.keys(extra || {}).forEach((k) => form.append(k, extra[k]));
+        return form;
+    }
+
+    /**
+     * Before the job: true when there are no rules or the server accepts them; a bad rule opens the section and
+     * shows the reason.
+     * @returns {Promise<boolean>}
+     */
+    async validate() {
+        if (!this.hasRules() || this._validated) return true;
+        try {
+            const d = await requireAuthFetch(this._opts.ajaxUrl, fmPostInit(this._form({ validate_only: '1' }))).then((r) => r.json());
+            if (d && d.status === 'success') {
+                this._validated = true;
+                return true;
+            }
+            this._showError((d && d.msg) || 'The filter rules could not be checked.');
+        } catch (e) {
+            this._showError('The filter rules could not be checked.');
+        }
+        return false;
+    }
+
+    _showError(msg) {
+        const details = this._q('.fm-arch-filter');
+        if (details) details.open = true;
+        fmFieldError(this._q('.fm-arch-filter-error'), msg);
+    }
+
+    /** "Check": how many items the filter keeps and skips, with the first names on hover. */
+    async check() {
+        if (!this.hasRules()) {
+            this._showError('Enter a mask in Include or Exclude first.');
+            return;
+        }
+        fmFieldError(this._q('.fm-arch-filter-error'), '');
+        this._setResult('Checking\u2026', '');
+        const req = ++this._checkReq;
+        let d = null;
+        try {
+            d = await requireAuthFetch(this._opts.ajaxUrl, fmPostInit(this._form())).then((r) => r.json());
+        } catch (e) { /* shown below */ }
+        if (req !== this._checkReq) return;
+        if (!d || d.status !== 'success') {
+            this._setResult('\u00a0', '');
+            this._showError((d && d.msg) || 'Could not check the filter.');
+            return;
+        }
+        this._validated = true;
+        const num = (n) => Number(n || 0).toLocaleString();
+        const size = typeof d.kept_size === 'number' ? ' (' + FmFileManagerTable.bytesToSize(d.kept_size) + ')' : '';
+        const more = (list, n) => (list.length < n ? '\n\u2026' : '');
+        const kept = Array.isArray(d.kept_names) ? d.kept_names : [];
+        const skipped = Array.isArray(d.skipped_names) ? d.skipped_names : [];
+        this._setResult((d.partial ? 'At least ' : '') + 'Kept: ' + num(d.kept) + (Number(d.kept) === 1 ? ' item' : ' items') + size +
+            ' \u00b7 skipped: ' + num(d.skipped) + (Number(d.kept) === 0 ? ' \u2014 nothing matches' : ''),
+            (kept.length ? 'Kept:\n' + kept.join('\n') + more(kept, d.kept) : 'Nothing kept') +
+            (skipped.length ? '\n\nSkipped:\n' + skipped.join('\n') + more(skipped, d.skipped) : ''));
+    }
 }
 
 function shortenMiddle(str, maxLen) {
@@ -14971,6 +15786,148 @@ function fmUserNotice(opts) {
 }
 
 /**
+ * Small "?" that opens FmPatternHelpPopup at one section (clicks are handled by one listener on document).
+ * Keep it outside <label> and <summary>: a click there would also toggle the checkbox / the section.
+ * @param {string} section - One of FmPatternHelpPopup.SECTIONS
+ * @returns {string}
+ */
+function fmPatternHelpButton(section) {
+    return '<button type="button" class="fm-help-q" data-fm-help="' + FmPopup.escapeAttr(section) + '" ' +
+        'title="Help: masks and regular expressions" aria-label="Help: masks and regular expressions">?</button>';
+}
+
+/** Help about masks and regular expressions: what each field accepts, examples, which engine matches, links. */
+class FmPatternHelpPopup extends FmPopup {
+    constructor(section = 'masks', options = {}) {
+        super({
+            title: 'Masks and regular expressions',
+            className: 'fm-help-popup',
+            maxWidth: '640px',
+            content: FmPatternHelpPopup._html(),
+            buttons: [{ label: 'OK', primary: true, close: true }],
+            closeOnBackdrop: true,
+            closeOnEscape: true,
+            onAfterShow() {
+                this._goTo(section);
+            },
+            ...options,
+        });
+    }
+
+    /** @param {string} section */
+    static open(section) {
+        new FmPatternHelpPopup(FmPatternHelpPopup.SECTIONS.includes(section) ? section : 'masks').show();
+    }
+
+    _goTo(section) {
+        const content = this.el && this.el.querySelector('.fm-popup-content');
+        const head = this.el && this.el.querySelector('#fm-help-' + section);
+        if (!content || !head) return;
+        content.scrollTop = Math.max(0, head.getBoundingClientRect().top - content.getBoundingClientRect().top + content.scrollTop - 8);
+        head.classList.remove('fm-help-flash');
+        void head.offsetWidth;
+        head.classList.add('fm-help-flash');
+    }
+
+    static _html() {
+        const esc = FmPopup.escapeHtml;
+        const c = (s) => '<code>' + esc(s) + '</code>';
+        const h = (id, text) => '<h3 class="fm-help-h" id="fm-help-' + id + '">' + esc(text) + '</h3>';
+        const table = (rows) => '<table class="fm-help-table"><tbody>' +
+            rows.map(([a, b]) => '<tr><td>' + a + '</td><td>' + b + '</td></tr>').join('') + '</tbody></table>';
+        const link = (url, text) => '<a href="' + FmPopup.escapeAttr(url) + '" target="_blank" rel="noopener noreferrer">' + esc(text) + '</a>';
+        return '<div class="fm-help-body">' +
+            '<p class="fm-hint mt-0">A <strong>mask</strong> is a simple pattern with <code>*</code> and <code>?</code>. ' +
+            'A <strong>regular expression</strong> (regex) is a more powerful pattern language: use it when a mask is not enough.</p>' +
+
+            h('masks', 'Masks') +
+            table([
+                [c('*'), 'any text (also none)'],
+                [c('?'), 'exactly one character'],
+                [c('*.jpg'), 'names ending with .jpg'],
+                [c('report-????.pdf'), 'report-2026.pdf, report-0001.pdf…'],
+            ]) +
+            '<p class="fm-hint">In Find, a wildcard must match the <strong>whole</strong> name ("Name contains the text" finds it anywhere).</p>' +
+
+            h('convert-mask', 'Convert encoding: file names') +
+            '<p>Several masks separated by <code>;</code>, e.g. ' + c('*.txt;*.php;*.html') + '. Empty means all text files.</p>' +
+
+            h('filter', 'Archive filter (Archive, Download as archive, Extract)') +
+            '<p>Masks work like <code>.gitignore</code>, one per line or separated by commas; lines starting with <code>#</code> are notes. Case is ignored.</p>' +
+            table([
+                [c('*.log'), 'a name at any depth (also inside folders)'],
+                [c('node_modules/'), 'a folder (the "/" at the end) with everything in it'],
+                [c('/build/'), 'only the build folder at the top'],
+                [c('src/*.tmp'), 'with "/" inside: a path from the top; * stays inside one folder'],
+                [c('src/**/*.map'), '** goes through any number of folders (also none)'],
+            ]) +
+            '<p class="fm-hint">Exclude always wins. With Include, only matching files (and the folders on their way) are kept. ' +
+            'In "Regular expressions" mode each line is a regex matched against the path inside the archive; folders end with "/": ' +
+            c('^cache/') + ', ' + c('\\.(log|tmp)$') + ', ' + c('(^|/)\\.git/') + '.</p>' +
+
+            h('regex', 'Regular expressions: the basics') +
+            table([
+                [c('.'), 'any one character; ' + c('\\.') + ' is a real dot'],
+                [c('*') + ' ' + c('+') + ' ' + c('?'), 'the item before it: 0 or more, 1 or more, optional'],
+                [c('{2,4}'), 'the item before it 2 to 4 times'],
+                [c('^') + ' ' + c('$'), 'start and end (of the name, the line or the path)'],
+                [c('[abc]') + ' ' + c('[a-z]') + ' ' + c('[^abc]'), 'one of these characters / a range / anything but these'],
+                [c('\\d') + ' ' + c('\\w') + ' ' + c('\\s'), 'a digit / a letter, digit or _ / a space or tab'],
+                [c('\\b'), 'a word boundary'],
+                [c('(…)'), 'a group: used as $1, $2 in Bulk rename'],
+                [c('a|b'), 'a or b'],
+            ]) +
+            '<p class="fm-hint">Special characters <code>. * + ? ^ $ ( ) [ ] { } | \\</code> need a <code>\\</code> in front to mean themselves. ' +
+            'Without <code>^</code> and <code>$</code> a regex matches anywhere in the text.</p>' +
+
+            h('find-name', 'Find: name') +
+            table([
+                [c('^IMG_\\d{4}\\.jpe?g$'), 'IMG_0001.jpg, IMG_2026.jpeg'],
+                [c('\\.(bak|old|tmp)$'), 'backup and temporary files'],
+                [c('^(?!.*\\.min\\.js$).*\\.js$'), '.js files except .min.js'],
+            ]) +
+
+            h('find-text', 'Find: text inside files') +
+            '<p>The regex is tried on each line of the file (one line at a time).</p>' +
+            table([
+                [c('TODO|FIXME'), 'lines with TODO or FIXME'],
+                [c("^\\s*define\\('DB_"), "lines that start with define('DB_ (spaces allowed)"],
+                [c('\\b\\d{3}-\\d{4}\\b'), 'numbers like 555-0199'],
+            ]) +
+
+            h('bulk-rename', 'Bulk rename') +
+            '<p>Find is a regex, Replace may use ' + c('$1') + ', ' + c('$2') + '… for the groups and ' + c('$&') + ' for the whole match.</p>' +
+            table([
+                [c('^(\\d{4})-(\\d{2})-(\\d{2})') + ' \u2192 ' + c('$3.$2.$1'), '2026-11-07 photo.jpg \u2192 07.11.2026 photo.jpg'],
+                [c('\\s+') + ' \u2192 ' + c('_'), 'spaces to underscores'],
+                [c('(.*)\\.jpeg$') + ' \u2192 ' + c('$1.jpg'), 'change .jpeg to .jpg'],
+            ]) +
+
+            h('engines', 'Which engine and case') +
+            '<p>Find, the Archive filter and Convert encoding are matched on the server with PHP (PCRE). Bulk rename runs in the browser ' +
+            '(JavaScript regular expressions). The basics above work the same in both; advanced syntax can differ.</p>' +
+            '<p>Find and Bulk rename have an "Ignore case" box; the Archive filter always ignores case.</p>' +
+
+            h('links', 'Learn more and test') +
+            '<ul class="fm-help-links">' +
+            '<li>' + link('https://www.php.net/manual/en/reference.pcre.pattern.syntax.php', 'PCRE syntax (php.net)') + ' \u2014 Find, Archive filter</li>' +
+            '<li>' + link('https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Regular_expressions', 'JavaScript regular expressions (MDN)') + ' \u2014 Bulk rename</li>' +
+            '<li>' + link('https://regex101.com/', 'regex101.com') + ' \u2014 try a regex on your own examples (choose PCRE2, or ECMAScript for Bulk rename)</li>' +
+            '</ul>' +
+            '</div>';
+    }
+}
+FmPatternHelpPopup.SECTIONS = ['masks', 'convert-mask', 'filter', 'regex', 'find-name', 'find-text', 'bulk-rename', 'engines', 'links'];
+
+document.addEventListener('click', (e) => {
+    const btn = e.target && e.target.closest ? e.target.closest('[data-fm-help]') : null;
+    if (!btn) return;
+    e.preventDefault();
+    e.stopPropagation();
+    FmPatternHelpPopup.open(btn.getAttribute('data-fm-help') || 'masks');
+});
+
+/**
  * Password-confirmed Terminal settings: Standard / Manual / Advanced flags in the PHP file.
  * @param {{ ajaxUrl?: string, onSaved?: () => void, here?: boolean, manual?: boolean, advanced?: boolean }} opts
  */
@@ -15130,9 +16087,11 @@ function fmShowTerminalHereTogglePopup(opts) {
 }
 
 /**
- * Short non-blocking toast (top-right). Use when modal notices are suppressed or for lightweight success.
- * @param {{ message: string, title?: string, variant?: 'success'|'info'|'warning', duration?: number }} opts
- *   duration: ms before auto-hide (default 3800); 0 keeps the toast until close() or a click.
+ * Short non-blocking toast (bottom centre, at most 3 at a time). Only for results that are not visible otherwise.
+ * @param {{ message: string, title?: string, variant?: 'success'|'info'|'warning', duration?: number,
+ *   action?: { label: string, onClick: () => void, ctrlZ?: boolean } }} opts
+ *   duration: ms before auto-hide (default 3800); 0 keeps the toast until close() or a click. A toast with an action
+ *   (e.g. Undo) waits while the mouse is over it; with ctrlZ, Ctrl+Z (Cmd+Z) runs the newest such action.
  * @returns {{ update: (message: string) => void, close: () => void }|null}
  */
 function fmToast(opts) {
@@ -15156,14 +16115,30 @@ function fmToast(opts) {
         ? '<strong class="fm-toast-title">' + FmPopup.escapeHtml(String(opts.title)) + '</strong>'
         : '';
     const msgHtml = '<span class="fm-toast-msg">' + FmPopup.escapeHtml(String(opts.message)) + '</span>';
-    el.innerHTML = titleHtml + msgHtml;
+    const action = opts.action && typeof opts.action.onClick === 'function' ? opts.action : null;
+    const actionHtml = action
+        ? '<button type="button" class="fm-toast-action"' + (action.ctrlZ ? ' title="Ctrl+Z"' : '') + '>' +
+            FmPopup.escapeHtml(String(action.label || 'Undo')) + '</button>'
+        : '';
+    el.innerHTML = '<div class="fm-toast-body">' + titleHtml + msgHtml + '</div>' + actionHtml;
     el.title = 'Click to dismiss';
 
     stack.appendChild(el);
+    // Keep the stack short: the oldest toasts go first.
+    const all = [...stack.querySelectorAll('.fm-toast:not(.fm-toast--leaving)')];
+    all.slice(0, Math.max(0, all.length - 3)).forEach((old) => {
+        old.classList.add('fm-toast--leaving');
+        old.classList.remove('fm-toast--visible');
+        if (old._fmRunAction) fmToast._ctrlZ = fmToast._ctrlZ.filter((f) => f !== old._fmRunAction);
+        window.setTimeout(() => { if (old.parentNode) old.parentNode.removeChild(old); }, 220);
+    });
 
     let hideTimer = 0;
+    let runAction = null;
     const removeEl = () => {
+        el.classList.add('fm-toast--leaving');
         el.classList.remove('fm-toast--visible');
+        if (runAction) fmToast._ctrlZ = fmToast._ctrlZ.filter((f) => f !== runAction);
         window.setTimeout(() => {
             if (el.parentNode) el.parentNode.removeChild(el);
         }, 220);
@@ -15174,8 +16149,28 @@ function fmToast(opts) {
     });
 
     const duration = typeof opts.duration === 'number' ? opts.duration : 3800;
-    if (duration > 0) {
-        hideTimer = window.setTimeout(removeEl, duration);
+    const startTimer = () => {
+        window.clearTimeout(hideTimer);
+        if (duration > 0) hideTimer = window.setTimeout(removeEl, duration);
+    };
+    startTimer();
+    if (action) {
+        let ran = false;
+        runAction = () => {
+            if (ran) return;
+            ran = true;
+            window.clearTimeout(hideTimer);
+            removeEl();
+            action.onClick();
+        };
+        el._fmRunAction = runAction;
+        el.addEventListener('mouseenter', () => window.clearTimeout(hideTimer));
+        el.addEventListener('mouseleave', startTimer);
+        el.querySelector('.fm-toast-action').addEventListener('click', (e) => {
+            e.stopPropagation();
+            runAction();
+        });
+        if (action.ctrlZ) fmToast._ctrlZ.push(runAction);
     }
     el.addEventListener('click', () => {
         window.clearTimeout(hideTimer);
@@ -15192,6 +16187,15 @@ function fmToast(opts) {
         },
     };
 }
+/** Actions of the visible toasts that Ctrl+Z runs (newest last). */
+fmToast._ctrlZ = [];
+document.addEventListener('keydown', (e) => {
+    if (!fmToast._ctrlZ.length || !(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || e.key.toLowerCase() !== 'z') return;
+    const tag = document.activeElement && document.activeElement.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || document.querySelector('.fm-js-popup.show')) return;
+    e.preventDefault();
+    fmToast._ctrlZ[fmToast._ctrlZ.length - 1]();
+});
 
 /**
  * Follows one native browser download via `download-status` polling to report readable failure reasons.
@@ -15401,6 +16405,7 @@ class FmSearchPopup extends FmPopup {
                 opt('regex', 'Regular expression', f.match) +
                 '</select>' +
                 '<label class="fm-find-check"><input type="checkbox" class="fm-find-icase"' + (f.icase ? ' checked' : '') + '> Ignore case</label>' +
+                fmPatternHelpButton('find-name') +
                 '</div>' +
                 '<label class="fm-find-content-label"><span>Contains text</span><input type="text" name="fm-find-content" class="fm-input" autocomplete="off" ' +
                 'placeholder="Text inside files (optional)" value="' + attr(f.content) + '"></label>' +
@@ -15410,6 +16415,7 @@ class FmSearchPopup extends FmPopup {
                 opt('regex', 'Regular expression (one line)', f.contentMatch) +
                 '</select>' +
                 '<label class="fm-find-check"><input type="checkbox" class="fm-find-content-icase"' + (f.contentIcase ? ' checked' : '') + '> Ignore case</label>' +
+                fmPatternHelpButton('find-text') +
                 '</div>' +
                 '<div class="fm-find-grid">' +
                 '<label class="fm-find-field"><span>Type</span><select class="fm-find-type">' +
@@ -15794,6 +16800,7 @@ class FmDeletePopup extends FmPopup {
      * @param {boolean} [options.inTrashTree] - Deleting from Trash: only permanent delete
      * @param {boolean} [options.defaultDeleteForever] - e.g. Shift+Delete pre-checks "Delete forever"
      * @param {(names: string[]) => void} [options.onSuccess]
+     * @param {(restoredNames: string[]) => void} [options.onUndo] - After Undo in the "Moved to Trash" toast
      * @param {boolean} [options.execAvailable]
      */
     constructor(options = {}) {
@@ -15805,6 +16812,7 @@ class FmDeletePopup extends FmPopup {
             inTrashTree,
             defaultDeleteForever,
             onSuccess,
+            onUndo,
             execAvailable,
             ...rest
         } = options;
@@ -15858,6 +16866,7 @@ class FmDeletePopup extends FmPopup {
         this._names = list;
         this._inTrashTree = inT;
         this._onSuccess = onSuccess || null;
+        this._onUndo = onUndo || null;
         this._execAvailable = execOk;
 
         if (!foreverUi && this.el) {
@@ -15902,10 +16911,51 @@ class FmDeletePopup extends FmPopup {
                     return;
                 }
                 if (typeof onDone === 'function') onDone(data.ok || names);
+                const ids = Array.isArray(data.ids) ? data.ids : [];
+                if (ids.length) FmDeletePopup._undoToast(this._ajaxUrl, ids, data.ok || [], this._onUndo);
             })
             .catch(() => {
                 fmUserNotice({ title: 'Trash', message: 'Move to Trash failed.' });
             });
+    }
+
+    /**
+     * "Moved to Trash" toast with Undo: restores exactly the items of this move (their trash ids), back where they were.
+     * @param {string} ajaxUrl
+     * @param {string[]} ids - Trash ids from trash-move
+     * @param {string[]} names - The moved names (for the message)
+     * @param {((restoredNames: string[]) => void)|null} onUndo - After the restore (reload the list)
+     */
+    static _undoToast(ajaxUrl, ids, names, onUndo) {
+        const what = names.length === 1 ? '"' + String(names[0]).split('/').pop() + '"' : ids.length.toLocaleString() + ' items';
+        fmToast({
+            title: 'Trash',
+            message: 'Moved to Trash: ' + what,
+            variant: 'info',
+            duration: 8000,
+            action: {
+                label: 'Undo',
+                ctrlZ: true,
+                onClick: () => {
+                    const form = new FormData();
+                    form.append('action', 'trash-restore');
+                    ids.forEach((id) => form.append('ids[]', id));
+                    fetch(ajaxUrl, fmPostInit(form))
+                        .then((r) => r.json())
+                        .then((d) => {
+                            const errs = Array.isArray(d.errors) ? d.errors : [];
+                            if (errs.length) fmUserNotice({ title: 'Undo', message: 'Some items could not be restored: ' + errs.join('; ') });
+                            const restored = Array.isArray(d.restored) ? d.restored : [];
+                            const renamed = restored.filter((r) => r.renamed).map((r) => r.name);
+                            if (renamed.length) {
+                                fmToast({ title: 'Undo', variant: 'info', message: 'Restored as ' + renamed.join(', ') + ' (the name was taken).' });
+                            }
+                            if (restored.length && typeof onUndo === 'function') onUndo(restored.map((r) => r.name));
+                        })
+                        .catch(() => fmUserNotice({ title: 'Undo', message: 'Could not restore the items from Trash.' }));
+                },
+            },
+        });
     }
 
     /**
@@ -16074,6 +17124,7 @@ class FmCompressPopup extends FmPopup {
                 '<label class="fm-option-label"><input type="radio" name="fm-compress-type" class="fm-compress-type" value="zip" checked> ZIP</label> ' +
                 '<label class="fm-option-label"><input type="radio" name="fm-compress-type" class="fm-compress-type" value="tar"> TAR</label> ' +
                 '<label class="fm-option-label"><input type="radio" name="fm-compress-type" class="fm-compress-type" value="gzip"> GZIP</label></p>' +
+                FmArchiveFilter.html() +
                 compressHintIntro +
                 '<div class="fm-option-hint" role="status"><span class="fm-option-hint-text"></span></div>',
             buttons: [
@@ -16081,6 +17132,9 @@ class FmCompressPopup extends FmPopup {
                 { label: 'Archive', primary: true, close: false, onClick: () => this._handleCreate() }
             ],
             onAfterShow() {
+                this._filter = new FmArchiveFilter(this.el, {
+                    mode: 'selection', ajaxUrl: this._ajaxUrl, pathIn: () => this._pathIn(), names: () => this._names,
+                });
                 this._bindCompressForm();
             },
             ...rest
@@ -16318,6 +17372,17 @@ class FmCompressPopup extends FmPopup {
         const allowOverwrite = !!(this._archiveExists && this.querySelector('.fm-compress-override') && this.querySelector('.fm-compress-override').checked);
         if (this._archiveExists && !allowOverwrite) return;
 
+        if (this._filter && this._filter.hasRules() && !this._filterOk) {
+            this._filter.validate().then((ok) => {
+                if (!ok) return;
+                this._filterOk = true;
+                this._handleCreate();
+                this._filterOk = false;
+            });
+            return;
+        }
+        this._rules = this._filter ? this._filter.values() : null;
+
         if (allowOverwrite && !this._pendingOverwriteOk) {
             const existing = (this._existingArchiveNames && this._existingArchiveNames.length)
                 ? this._existingArchiveNames
@@ -16362,12 +17427,14 @@ class FmCompressPopup extends FmPopup {
             busyPopup.show();
 
             let idx = 0;
+            let filteredAll = 0;
             const onDone = this._onSuccess;
             const archiveNamesForHook = jobs.map(j => j.archiveName);
             const nextJob = () => {
                 if (idx >= jobs.length) {
                     busyPopup.hideAndDestroy();
                     if (onDone) onDone(archiveNamesForHook);
+                    FmCompressPopup._filteredToast(filteredAll);
                     return;
                 }
                 const job = jobs[idx++];
@@ -16376,6 +17443,7 @@ class FmCompressPopup extends FmPopup {
                 busyPopup.setName('');
                 this._runCompressJob(busyPopup, job.archiveName, [job.itemName], type, allowOverwrite).then((r) => {
                     if (r.ok) {
+                        filteredAll += r.filtered || 0;
                         nextJob();
                         return;
                     }
@@ -16409,12 +17477,18 @@ class FmCompressPopup extends FmPopup {
             busyPopup.hideAndDestroy();
             if (r.ok) {
                 if (onSuccessCb) onSuccessCb([withArchiveExt(archiveNameForRequest)]);
+                FmCompressPopup._filteredToast(r.filtered || 0);
                 return;
             }
             fmUserNotice({ title: 'Archive', message: r.error });
             // The archive may still have been finished: show the folder as it is now.
             if (r.unknown && onSuccessCb) onSuccessCb([withArchiveExt(archiveNameForRequest)]);
         });
+    }
+
+    /** After a filtered archive: how many items the filter left out. */
+    static _filteredToast(n) {
+        if (n > 0) fmToast({ variant: 'info', title: 'Archive', message: n.toLocaleString() + (n === 1 ? ' item was' : ' items were') + ' left out by the filter.' });
     }
 
     /** Progress popup for archive jobs. */
@@ -16439,6 +17513,7 @@ class FmCompressPopup extends FmPopup {
             cf.append('mode', 'files');
             cf.append('in', this._pathIn());
             names.forEach((n) => cf.append('names[]', n));
+            FmArchiveFilter.appendTo(cf, this._rules);
             const c = await fetch(this._ajaxUrl, fmPostInit(cf)).then((r) => r.json());
             if (c && c.status === 'success') total = typeof c.files === 'number' ? c.files : (typeof c.total === 'number' ? c.total : total);
         } catch (e) { /* the server counts nothing then; progress shows files done only */ }
@@ -16455,6 +17530,7 @@ class FmCompressPopup extends FmPopup {
         form.append('overwrite', allowOverwrite ? '1' : '0');
         form.append('dl_token', token);
         names.forEach((n) => form.append('names[]', n));
+        FmArchiveFilter.appendTo(form, this._rules);
 
         // Files done fill the bar while files are added; the compressing step (gzip, PHP zip) fills it again by its percent.
         const showFiles = (n, name) => {
@@ -16481,7 +17557,7 @@ class FmCompressPopup extends FmPopup {
                 let d;
                 try { d = JSON.parse(line); } catch (e) { return; }
                 if (d.error) result = { ok: false, error: String(d.error) };
-                else if (d.done) result = { ok: true };
+                else if (d.done) result = { ok: true, filtered: Number(d.filtered) || 0 };
                 else if (typeof d.pct === 'number') showPct(d.pct, d.msg);
                 else if (typeof d.n === 'number' && d.n > 0) showFiles(d.n, d.name || '');
                 else if (d.msg) busyPopup.setPhase(d.msg);
@@ -16593,6 +17669,7 @@ class FmExtractPopup extends FmPopup {
                 'Each archive is unpacked into a subfolder named like the file (without .zip, .tar, or .tar.gz). ' +
                 'That folder must not exist yet, unless it is completely empty.</p>' +
                 '<hr class="fm-popup-divider" aria-hidden="true">' +
+                FmArchiveFilter.html() +
                 extractIntro +
                 '<div class="fm-option-hint" role="status"><span class="fm-option-hint-text"></span></div>',
             buttons: [
@@ -16600,6 +17677,9 @@ class FmExtractPopup extends FmPopup {
                 { label: 'Extract', primary: true, close: false, onClick: () => this._handleExtract() }
             ],
             onAfterShow() {
+                this._filter = new FmArchiveFilter(this.el, {
+                    mode: 'archive', ajaxUrl: this._ajaxUrl, pathIn: () => this._pathIn(), names: () => this._names,
+                });
                 this._bindExtractForm();
             },
             ...rest
@@ -16630,12 +17710,21 @@ class FmExtractPopup extends FmPopup {
     }
 
     _handleExtract() {
+        if (this._filter && this._filter.hasRules() && !this._filterOk) {
+            this._filter.validate().then((ok) => {
+                if (!ok) return;
+                this._filterOk = true;
+                this._handleExtract();
+            });
+            return;
+        }
         const sepEl     = this.querySelector('.fm-extract-separate');
         const separate  = !!(sepEl && sepEl.checked);
         const onSuccessCb = this._onSuccess;
         const pathIn    = this._pathIn();
         const names     = this._names;
         const ajaxUrl   = this._ajaxUrl;
+        const rules     = this._filter ? this._filter.values() : null;
 
         this.hideAndDestroy();
 
@@ -16649,6 +17738,7 @@ class FmExtractPopup extends FmPopup {
         form.append('in', pathIn);
         form.append('separate_folders', separate ? '1' : '0');
         names.forEach(n => form.append('names[]', n));
+        FmArchiveFilter.appendTo(form, rules);
 
         fetch(ajaxUrl, fmPostInit(form))
             .then(response => {
@@ -16678,6 +17768,10 @@ class FmExtractPopup extends FmPopup {
                         finished = true;
                         waitPopup.hideAndDestroy();
                         if (onSuccessCb) onSuccessCb();
+                        const filtered = Number(data.filtered) || 0;
+                        if (filtered > 0) {
+                            fmToast({ variant: 'info', title: 'Extract', message: filtered.toLocaleString() + (filtered === 1 ? ' entry was' : ' entries were') + ' left out by the filter.' });
+                        }
                         const skippedCount = Number(data.skipped_count) || 0;
                         if (skippedCount > 0) {
                             const list = (Array.isArray(data.skipped) ? data.skipped : []).join('\n');
@@ -16941,6 +18035,7 @@ class FmGetInfoPopup extends FmPopup {
             const known = typeof data.files_count === 'number';
             rows.push(['Files',   known ? Number(data.files_count).toLocaleString() : spinner, ' class="fm-info-files-count"']);
             rows.push(['Folders', known ? Number(data.folders_count).toLocaleString() : spinner, ' class="fm-info-folders-count"']);
+            if (Array.isArray(data.types)) rows.push(['Types', FmTypesPopup.cellHtml(data.types), '']);
         }
 
         rows.push(['Modified',    FmPopup.escapeHtml(data.modified    || '\u2014'), '']);
@@ -17098,7 +18193,6 @@ class FmGetInfoMultiPopup extends FmPopup {
         const allFiles = (Number(d.files) || 0) + (Number(d.inside_files) || 0);
         const allFolders = (Number(d.folders) || 0) + (Number(d.inside_folders) || 0);
         const contains = plural(allFiles, 'file', 'files') + ', ' + plural(allFolders, 'folder', 'folders');
-        const types = FmGetInfoMultiPopup._typesText(Array.isArray(d.types) ? d.types : []);
         const modified = !d.modified_min ? '\u2014' : (d.modified_min === d.modified_max ? d.modified_min : d.modified_min + ' \u2013 ' + d.modified_max);
         const perms = Array.isArray(d.permissions) ? d.permissions : [];
         const permissions = perms.length === 0 ? '\u2014'
@@ -17108,7 +18202,7 @@ class FmGetInfoMultiPopup extends FmPopup {
             ['Location', esc(location), ''],
             ['Total size', esc(size), ''],
             ['In total', esc(contains), ''],
-            ['Types', esc(types.short), ' class="fm-info-ellipsis" title="' + FmPopup.escapeAttr(types.full) + '"'],
+            ['Types', FmTypesPopup.cellHtml(Array.isArray(d.types) ? d.types : []), ''],
             ['Modified', esc(modified), ''],
             ['Permissions', esc(permissions), ''],
         ];
@@ -17131,7 +18225,8 @@ class FmGetInfoMultiPopup extends FmPopup {
             const restFiles = rest.reduce((a, [, n]) => a + Number(n), 0);
             shown.push('+' + rest.length.toLocaleString() + ' more type' + (rest.length === 1 ? '' : 's') + ' (' + restFiles.toLocaleString() + ' files)');
         }
-        return { short: shown.join(' \u00b7 '), full: types.map(label).join(', ') };
+        const full = types.map((t) => label(t) + (typeof t[2] === 'number' ? ' (' + FmGetInfoPopup._bytesToSize(t[2]) + ')' : '')).join(', ');
+        return { short: shown.join(' \u00b7 '), full };
     }
 
     _setContent(html) {
@@ -17139,6 +18234,60 @@ class FmGetInfoMultiPopup extends FmPopup {
         if (contentEl) contentEl.innerHTML = html;
     }
 }
+
+/**
+ * Every file type of a Get info (one folder or several items) as a table: type, files, size and share of the size.
+ * The Types cell of Get info (cellHtml) has a "Details" button; one listener on document opens this popup.
+ */
+class FmTypesPopup extends FmPopup {
+    /** @param {Array<[string, number, number]>} types - most common first ('' = no extension) */
+    constructor(types = [], options = {}) {
+        super({
+            title: 'File types',
+            className: 'fm-types-popup',
+            maxWidth: '520px',
+            content: FmTypesPopup._tableHtml(types),
+            buttons: [{ label: 'OK', primary: true, close: true }],
+            closeOnBackdrop: true,
+            closeOnEscape: true,
+            ...options,
+        });
+    }
+
+    /** Types cell of the Get info tables: the most common types on one line, full list on hover, "Details" button. */
+    static cellHtml(types) {
+        const t = FmGetInfoMultiPopup._typesText(types);
+        const button = types.length
+            ? '<button type="button" class="fm-link-btn fm-info-types-all" data-fm-types="' + FmPopup.escapeAttr(JSON.stringify(types)) + '">Details</button>'
+            : '';
+        return '<div class="fm-info-types"><span class="fm-info-types-short" title="' + FmPopup.escapeAttr(t.full) + '">' +
+            FmPopup.escapeHtml(t.short) + '</span>' + button + '</div>';
+    }
+
+    static _tableHtml(types) {
+        const esc = FmPopup.escapeHtml;
+        const files = types.reduce((a, t) => a + Number(t[1] || 0), 0);
+        const bytes = types.reduce((a, t) => a + Number(t[2] || 0), 0);
+        const rows = types.map(([ext, n, size]) => '<tr><td>' + (ext === '' ? '<em>no extension</em>' : esc(ext)) + '</td>' +
+            '<td class="ta-r">' + Number(n).toLocaleString() + '</td>' +
+            '<td class="ta-r">' + esc(FmGetInfoPopup._bytesToSize(Number(size) || 0)) + '</td>' +
+            '<td class="ta-r">' + (bytes > 0 ? (Number(size || 0) * 100 / bytes).toFixed(1) + '%' : '\u2014') + '</td></tr>').join('');
+        return '<p class="fm-hint mt-0">' + types.length.toLocaleString() + (types.length === 1 ? ' type' : ' types') + ', ' +
+            files.toLocaleString() + (files === 1 ? ' file' : ' files') + ', ' + esc(FmGetInfoPopup._bytesToSize(bytes)) + '. Most files first.' +
+            (types.length >= 500 ? ' Only the 500 most common types are listed.' : '') + '</p>' +
+            '<div class="fm-types-scroll"><table class="fm-types-table"><thead><tr><th>Type</th><th class="ta-r">Files</th><th class="ta-r">Size</th><th class="ta-r">Share of size</th></tr></thead>' +
+            '<tbody>' + rows + '</tbody></table></div>';
+    }
+}
+
+document.addEventListener('click', (e) => {
+    const btn = e.target && e.target.closest ? e.target.closest('[data-fm-types]') : null;
+    if (!btn) return;
+    e.preventDefault();
+    let types = [];
+    try { types = JSON.parse(btn.getAttribute('data-fm-types') || '[]'); } catch (err) { /* shown empty */ }
+    new FmTypesPopup(Array.isArray(types) ? types : []).show();
+});
 
 /**
  * FmServerInfoPopup – shows PHP / OS / disk / limits from `get-server-info`.
@@ -18895,6 +20044,7 @@ class FmDownloadArchivePopup extends FmPopup {
                 '<label class="fm-option-label"><input type="radio" name="fm-download-archive-type" class="fm-download-archive-type" value="zip" checked> ZIP</label> ' +
                 '<label class="fm-option-label"><input type="radio" name="fm-download-archive-type" class="fm-download-archive-type" value="tar"> TAR</label> ' +
                 '<label class="fm-option-label"><input type="radio" name="fm-download-archive-type" class="fm-download-archive-type" value="gzip"> GZIP</label></p>' +
+                FmArchiveFilter.html() +
                 '<p class="mb-0 fm-hint">' +
                 FmPopup.escapeHtml(hint) +
                 '</p>',
@@ -18903,6 +20053,12 @@ class FmDownloadArchivePopup extends FmPopup {
                 { label: 'Download', primary: true, close: false, onClick: () => this._submitDownloadArchive() },
             ],
             onAfterShow() {
+                this._filter = new FmArchiveFilter(this.el, {
+                    mode: 'selection',
+                    ajaxUrl: this._ajaxUrl,
+                    pathIn: () => (this._currentPath === this._rootDir ? '' : this._currentPath.slice(this._rootDir.length + 1)),
+                    names: () => this._names,
+                });
                 this._bindDownloadArchiveForm();
             },
             ...rest,
@@ -18962,10 +20118,19 @@ class FmDownloadArchivePopup extends FmPopup {
             fmUserNotice({ variant: 'warning', title: 'Download', message: 'Enter a valid archive name.' });
             return;
         }
+        if (this._filter && this._filter.hasRules() && !this._filterOk) {
+            this._filter.validate().then((ok) => {
+                if (!ok) return;
+                this._filterOk = true;
+                this._submitDownloadArchive();
+            });
+            return;
+        }
         const archiveName = prefix + ext;
+        const rules = this._filter ? this._filter.values() : null;
         const cb = this._onConfirm;
         this.hideAndDestroy(null, () => {
-            if (cb) cb({ archiveName, archiveType: type });
+            if (cb) cb({ archiveName, archiveType: type, rules });
         });
     }
 }
@@ -20107,6 +21272,7 @@ class FmConvertEncodingPopup extends FmPopup {
                 '. Binary files and links are left out.</p>' +
                 '<div class="fm-enc-scan-row">' +
                 '<label class="fm-enc-field fm-enc-mask-label"><span>File names</span><input type="text" class="fm-input fm-enc-mask" autocomplete="off" placeholder="All files, or e.g. *.txt;*.php;*.html"></label>' +
+                fmPatternHelpButton('convert-mask') +
                 '<label class="fm-enc-check"><input type="checkbox" class="fm-enc-recursive" checked> Include subfolders</label>' +
                 '<label class="fm-enc-check"><input type="checkbox" class="fm-enc-not-utf8" checked> Only files that are not UTF-8</label>' +
                 '<button type="button" class="fm-search-bar-btn fm-enc-scan-btn"></button>' +
@@ -20118,8 +21284,16 @@ class FmConvertEncodingPopup extends FmPopup {
             '<div class="fm-enc-progress" hidden><div class="fm-enc-progress-bar"><span></span></div>' +
             '<button type="button" class="fm-search-bar-btn fm-enc-stop-btn"><i class="bi bi-stop-circle" aria-hidden="true"></i> Stop</button></div></div>' +
             '<div class="fm-enc-summary"></div>' +
+            '<div class="fm-enc-tools">' +
+            '<input type="search" class="fm-input fm-enc-name-filter" autocomplete="off" placeholder="Filter by name" aria-label="Show only files whose path contains this text">' +
+            '<button type="button" class="fm-link-btn fm-enc-check-all" title="Check every file in the list (all pages)">Check all</button>' +
+            '<button type="button" class="fm-link-btn fm-enc-check-none" title="Uncheck every file in the list (all pages)">Check none</button>' +
+            '<span class="fm-enc-pager"><button type="button" class="fm-enc-page-btn fm-enc-page-prev" aria-label="Previous page">\u2039</button>' +
+            '<span class="fm-enc-page-text"></span>' +
+            '<button type="button" class="fm-enc-page-btn fm-enc-page-next" aria-label="Next page">\u203a</button></span>' +
+            '</div>' +
             '<div class="fm-enc-list-wrap"><table class="fm-enc-list"><thead><tr>' +
-            '<th class="fm-enc-col-check"><input type="checkbox" class="fm-enc-all" checked aria-label="Check all files"></th>' +
+            '<th class="fm-enc-col-check"><input type="checkbox" class="fm-enc-all" checked aria-label="Check all files in the list (all pages)" title="All files in the list (all pages)"></th>' +
             '<th>File</th><th>Encoding</th><th>Line endings</th><th class="fm-enc-col-size">Size</th><th>Result</th>' +
             '</tr></thead><tbody class="fm-enc-tbody"></tbody></table></div>' +
             '<p class="fm-enc-direction"></p>' +
@@ -20163,6 +21337,8 @@ class FmConvertEncodingPopup extends FmPopup {
         this._files = [];
         this._byName = new Map();
         this._filter = '';
+        this._nameFilter = '';
+        this._page = 0;
         this._previewName = null;
         this._previewSeq = 0;
         this._changed = false;
@@ -20195,15 +21371,28 @@ class FmConvertEncodingPopup extends FmPopup {
             }
         });
         on('.fm-enc-stop-btn', 'click', () => { this._stop = true; });
-        on('.fm-enc-all', 'change', (e) => {
-            const want = !!e.target.checked;
+        const checkVisible = (want) => {
             this._visibleFiles().forEach((f) => { if (!f.skip) f.checked = want; });
             this._render();
+        };
+        on('.fm-enc-all', 'change', (e) => checkVisible(!!e.target.checked));
+        on('.fm-enc-check-all', 'click', () => checkVisible(true));
+        on('.fm-enc-check-none', 'click', () => checkVisible(false));
+        on('.fm-enc-name-filter', 'input', (e) => {
+            this._nameFilter = String(e.target.value || '').trim().toLowerCase();
+            this._page = 0;
+            this._render();
         });
+        on('.fm-enc-name-filter', 'keydown', (e) => {
+            if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); }
+        });
+        on('.fm-enc-page-prev', 'click', () => { this._page -= 1; this._render(); });
+        on('.fm-enc-page-next', 'click', () => { this._page += 1; this._render(); });
         on('.fm-enc-summary', 'click', (e) => {
             const chip = e.target.closest('[data-enc-filter]');
             if (!chip) return;
             this._filter = chip.getAttribute('data-enc-filter') || '';
+            this._page = 0;
             this._render();
         });
         on('.fm-enc-tbody', 'click', (e) => {
@@ -20338,6 +21527,7 @@ class FmConvertEncodingPopup extends FmPopup {
         this._byName = new Map(this._files.map((f) => [f.name, f]));
         if (this._previewName && !this._byName.has(this._previewName)) this._clearPreview();
         this._filter = '';
+        this._page = 0;
         this._statusText = '';
         this._errorText = '';
         this._scan = { running: true, stopped: false, done: null, error: '', scanned: 0 };
@@ -20419,8 +21609,11 @@ class FmConvertEncodingPopup extends FmPopup {
         this._syncScanBtn();
     }
 
+    /** Files of the list after the encoding chip and the name filter (all pages). */
     _visibleFiles() {
-        return this._filter ? this._files.filter((f) => f.encoding === this._filter) : this._files;
+        const name = this._nameFilter;
+        if (!this._filter && !name) return this._files;
+        return this._files.filter((f) => (!this._filter || f.encoding === this._filter) && (!name || f.name.toLowerCase().includes(name)));
     }
 
     _renderSoon() {
@@ -20456,7 +21649,11 @@ class FmConvertEncodingPopup extends FmPopup {
         const esc = FmPopup.escapeHtml;
         const tbody = this._q('.fm-enc-tbody');
         const vis = this._visibleFiles();
-        const shown = vis.slice(0, FmConvertEncodingPopup.MAX_ROWS);
+        const per = FmConvertEncodingPopup.MAX_ROWS;
+        const pages = Math.max(1, Math.ceil(vis.length / per));
+        this._page = Math.min(Math.max(0, this._page || 0), pages - 1);
+        const first = this._page * per;
+        const shown = vis.slice(first, first + per);
         let html = '';
         shown.forEach((f) => {
             const i = this._files.indexOf(f);
@@ -20470,14 +21667,29 @@ class FmConvertEncodingPopup extends FmPopup {
                 `<td class="fm-enc-col-size">${esc(size)}</td>` +
                 `<td class="fm-enc-result">${this._resultHtml(f)}</td></tr>`;
         });
-        if (vis.length > shown.length) {
-            html += '<tr class="fm-enc-more"><td colspan="6">… and ' + (vis.length - shown.length).toLocaleString() +
-                ' more files (checked as shown in the summary; they are converted too)</td></tr>';
-        }
         if (!vis.length) {
-            html = '<tr class="fm-enc-more fm-enc-empty"><td colspan="6">' + (this._scan.running ? 'Scanning…' : 'No files to convert.') + '</td></tr>';
+            const why = this._files.length && (this._filter || this._nameFilter) ? 'No files match the filter.' : (this._scan.running ? 'Scanning…' : 'No files to convert.');
+            html = '<tr class="fm-enc-more fm-enc-empty"><td colspan="6">' + esc(why) + '</td></tr>';
         }
-        if (tbody) tbody.innerHTML = html;
+        if (tbody) {
+            const changedPage = this._shownPage !== this._page;
+            tbody.innerHTML = html;
+            if (changedPage) {
+                const wrap = this._q('.fm-enc-list-wrap');
+                if (wrap) wrap.scrollTop = 0;
+                this._shownPage = this._page;
+            }
+        }
+        const pageText = this._q('.fm-enc-page-text');
+        if (pageText) {
+            pageText.textContent = vis.length > per
+                ? (first + 1).toLocaleString() + '\u2013' + (first + shown.length).toLocaleString() + ' of ' + vis.length.toLocaleString()
+                : (vis.length && (this._filter || this._nameFilter) ? vis.length.toLocaleString() + ' shown' : '');
+        }
+        const prev = this._q('.fm-enc-page-prev');
+        const next = this._q('.fm-enc-page-next');
+        if (prev) { prev.hidden = pages < 2; prev.disabled = this._page === 0; }
+        if (next) { next.hidden = pages < 2; next.disabled = this._page >= pages - 1; }
 
         const counts = new Map();
         let skipped = 0;
@@ -20768,6 +21980,7 @@ class FmBulkRenamePopup extends FmPopup {
             '<div class="fm-br-find-opts">' +
             '<label class="fm-br-check"><input type="checkbox" class="fm-br-regex"> Regular expression ' +
             '<span class="fm-br-opt-hint">use $1, $2 for groups, $&amp; for the match</span></label>' +
+            fmPatternHelpButton('bulk-rename') +
             '<label class="fm-br-check"><input type="checkbox" class="fm-br-icase"> Ignore case</label>' +
             '</div>' +
             '<p class="fm-error fm-br-regex-err" style="display:none"></p>' +
@@ -22016,8 +23229,10 @@ class FmSidebarTree extends FmTree {
         this._requestFolderTreeBranch(path)
             .then((data) => {
                 if (data && data.status === 'success' && data.tree) {
+                    // Keep the folders the user opened (this one included), not only the chain to the current folder.
+                    const open = this.getExpandedPaths();
                     this.replaceBranch(data.tree);
-                    this.render(this._currentPath);
+                    this.render(this._currentPath, open);
                     return;
                 }
                 children.classList.add('fm-tree-closed');
@@ -22415,7 +23630,7 @@ class FmTable {
         this._focusRow(index, false);
         if (e && e.shiftKey && this._selectionAnchor != null) {
             this._extendSelectionTo(index);
-        } else if (e && e.ctrlKey) {
+        } else if (e && (e.ctrlKey || e.metaKey)) {
             const idx = this.selectedRows.findIndex(r => r === row);
             if (idx >= 0) {
                 this.selectedRows.splice(idx, 1);
@@ -22757,6 +23972,7 @@ class FmFileManagerTable extends FmTable {
             rows: [
                 ['Alt + \u2190 / \u2192', 'Go back or forward in folder history'],
                 ['\u2191 \u2193 Home End PgUp PgDn', 'Move selection (Shift + arrow keys extend selection)'],
+                ['A\u2026Z 0\u20269', 'Jump to the next name that starts with what you type ("re" \u2192 report.pdf; the same letter again: the next one)'],
                 ['Enter', 'Open folder or file'],
                 ['Backspace / Alt + \u2191', 'Go to parent folder'],
             ],
@@ -22767,6 +23983,7 @@ class FmFileManagerTable extends FmTable {
                 ['Ctrl + A (\u2318 + A on Mac)', 'Select all items in the folder'],
                 ['Escape', 'Clear selection (when items are selected)'],
                 ['Ctrl + Alt + I', 'Invert selection in the current folder'],
+                ['Ctrl + Z (\u2318 + Z on Mac)', 'Undo the last Move to Trash while its note is shown at the bottom'],
             ],
         },
         {
@@ -24406,6 +25623,44 @@ class FmFileManagerTable extends FmTable {
     }
 
     /**
+     * Type-ahead like Explorer: characters typed within a second form a prefix and select the first name that starts with
+     * it (from the focused row on); the same letter pressed again goes to the next such name. Works across list pages.
+     * @param {string} ch - One typed character
+     * @returns {boolean} Whether a row was found
+     */
+    _typeAhead(ch) {
+        const now = Date.now();
+        if (now - (this._typeAheadAt || 0) > 1000) this._typeAheadBuf = '';
+        this._typeAheadAt = now;
+        const buf = (this._typeAheadBuf || '') + ch.toLowerCase();
+        this._typeAheadBuf = buf;
+        const list = Array.isArray(this._viewRows) && this._viewRows.length ? this._viewRows : (this.rows || []);
+        if (!list.length) return false;
+        const repeat = buf.length > 1 && [...buf].every((c) => c === buf[0]);
+        const prefix = repeat ? buf[0] : buf;
+        const current = this._focusedIndex >= 0 ? this.rows[this._focusedIndex] : this.getSelected();
+        const at = current ? list.indexOf(current) : -1;
+        // A new letter or the same letter again looks after the current row; a longer prefix may stay on it.
+        const from = buf.length === 1 || repeat ? at + 1 : Math.max(0, at);
+        const name = (r) => String((r && r.name) || '').split('/').pop().toLowerCase();
+        for (let k = 0; k < list.length; k++) {
+            const row = list[(from + k) % list.length];
+            if (!name(row).startsWith(prefix)) continue;
+            if (!this.rows.includes(row)) {
+                const size = this._listPageSize();
+                if (size) this._goToPage(Math.floor(list.indexOf(row) / size));
+            }
+            const idx = this.rows.indexOf(row);
+            if (idx < 0) return false;
+            this._selectionAnchor = idx;
+            this._selectRow(idx);
+            this._focusRow(idx);
+            return true;
+        }
+        return false;
+    }
+
+    /**
      * Open the page that holds the row with this name (rows on other pages are not in the table).
      * @param {string} name
      * @returns {boolean} Whether the row exists in the list
@@ -25300,7 +26555,10 @@ class FmFileManagerTable extends FmTable {
                 this.load(this._currentPath, () => {
                     this._callHook('after', 'delete', { names: deletedNames, currentPath: this._currentPath });
                 });
-            }
+            },
+            onUndo:      (restoredNames) => {
+                this.load(this._currentPath, () => this.highlightRowsByNames(restoredNames));
+            },
         }).show();
     }
 
@@ -25944,8 +27202,8 @@ class FmFileManagerTable extends FmTable {
             names,
             defaultArchiveName,
             execAvailable:       this._execAvailable,
-            onConfirm:           ({ archiveName, archiveType }) => {
-                this._postDownloadArchive(names, archiveName, archiveType);
+            onConfirm:           ({ archiveName, archiveType, rules }) => {
+                this._postDownloadArchive(names, archiveName, archiveType, rules);
             },
         }).show();
     }
@@ -25955,9 +27213,10 @@ class FmFileManagerTable extends FmTable {
      * @param {string[]} names - Basenames under the current folder
      * @param {string} archiveName - Filename with extension
      * @param {string} archiveType - zip | tar | gzip
+     * @param {{ include: string, exclude: string, regex: boolean }|null} [rules] - Archive filter
      * @returns {void}
      */
-    _postDownloadArchive(names, archiveName, archiveType) {
+    _postDownloadArchive(names, archiveName, archiveType, rules = null) {
         const relIn = this._currentPath === this._rootDir ? '' : this._currentPath.slice(this._rootDir.length + 1);
         const fields = [
             ['action', 'download-archive'],
@@ -25966,6 +27225,7 @@ class FmFileManagerTable extends FmTable {
             ['archive_type', archiveType],
         ];
         names.forEach((n) => fields.push(['names[]', n]));
+        FmArchiveFilter.appendTo(fields, rules);
         this._nativeDownload({ method: 'POST', url: this._ajaxUrl, fields, label: archiveName });
     }
 
@@ -26110,6 +27370,12 @@ class FmFileManagerTable extends FmTable {
                     e.preventDefault();
                     this._navigateFolder(parent);
                 }
+                return;
+            }
+
+            // Type-ahead: letters, digits and other printable characters jump to a matching name (shortcuts all use Ctrl / Alt).
+            if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey && (e.key !== ' ' || this._typeAheadBuf)) {
+                if (this._typeAhead(e.key)) e.preventDefault();
                 return;
             }
 
@@ -27254,9 +28520,10 @@ class FmFileManagerTable extends FmTable {
     _handleRowNav(row, e) {
         if (!e || this._inTrashView()) return;
         if (e.target.closest('.fm-table-row-action') || e.target.closest('.fm-table-folder-size-trigger')) return;
+        // Ctrl / Shift / Alt / Cmd + click only changes the selection (handleRowClick); it never opens.
+        if (e.ctrlKey || e.shiftKey || e.altKey || e.metaKey) return;
 
-        if (!e.ctrlKey && !e.shiftKey &&
-            row.type === 'file' && e.target.closest('span.fm-table-name') &&
+        if (row.type === 'file' && e.target.closest('span.fm-table-name') &&
             FmFileManagerTable.isImagePreviewExt(row.ext, row.name)) {
             this._openImageViewerForRow(row);
             return;
@@ -27845,7 +29112,9 @@ if (keyboardShortcutsBtn) {
             title:   'Keyboard shortcuts',
             content:
                 '<p class="fm-shortcuts-intro">These work when the file list is focused, not while typing in a field or when a dialog is open. The <strong>Page Up</strong> / <strong>Page Down</strong> step is set in Configuration. On macOS, <strong>Ctrl</strong> is Control and <strong>Alt</strong> is Option.</p>' +
-                '<div class="fm-shortcuts-sheet">' + body + '</div>',
+                '<div class="fm-shortcuts-sheet">' + body + '</div>' +
+                '<p class="fm-shortcuts-intro fm-shortcuts-patterns">Find, Bulk rename, the Archive filter and Convert encoding accept masks and regular expressions: ' +
+                '<button type="button" class="fm-link-btn" data-fm-help="masks">Masks and regular expressions help</button></p>',
             buttons: [{ label: 'OK', close: true, primary: true }],
             maxWidth: '840px',
         }).show();

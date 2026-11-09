@@ -2,6 +2,27 @@
 
 All notable changes to SoloFileManager are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.9.0] - 2026-11-09
+
+### Added
+
+- Include / exclude filter in Archive, Download as archive and Extract (collapsed "Filter" section). Masks work like `.gitignore`: `*.log`, `Thumbs.db` (a name at any depth), `node_modules/` (a folder with everything in it), `src/**/*.map` (a path from the top), one per line or comma separated; or one regular expression per line. Exclude wins; with Include, only matching files (and the folders on their way) are kept. "Check" shows how many items are kept and skipped (names on hover), a bad rule is shown in the popup before the job starts, and a note after the job tells how many items were left out. With a filter the archive is built / extracted in PHP, so the result is the same on every server; in OS-only file ops mode a filter is refused
+- Help for masks and regular expressions: a small "?" next to the mask and regex options in Find (name and text inside files), Bulk rename, the Archive filter and Convert encoding (file names) opens one help popup at the part for that field: what masks accept, the regex basics, examples for each place, which engine matches (PHP PCRE on the server, JavaScript in Bulk rename) and where case is ignored, with links to the PCRE syntax (php.net), JavaScript regular expressions (MDN) and regex101.com for testing. Also linked from Keyboard shortcuts
+- Type-ahead in the file list, like Explorer: typing letters quickly selects the first name that starts with them ("re" → `report-2026.pdf`), the same letter again goes to the next such name, after a second without typing a new search starts. Works across list pages and in search results (by file name); not while typing in a field or with a dialog open
+- Get info of a folder shows its file types (the most common on one line, all on hover), like Get info for several items. "Details" opens a table of every type with the number of files, their total size and the share of the size, for one folder and for several items
+- Undo after Move to Trash: a "Moved to Trash" note with an Undo button (stays while the mouse is over it; Ctrl+Z / ⌘+Z does the same while it is shown) restores exactly the items just moved, back where they were
+- Convert encoding with many files: every file of the list can be reached (pages of 500 instead of "… and N more files" that could not be unchecked), a name filter, and Check all / Check none for the files shown by the filters (all pages). Convert takes the checked files that the filters show
+
+### Changed
+
+- Short notes ("Moved to Trash", "N items were left out by the filter", "Copied N paths" when its popup is turned off…) appear at the bottom centre instead of the top right corner, where they covered the header buttons and were easy to miss: a dark bar with a coloured edge for the kind of note and the action (Undo) on the same line; at most three at a time
+- Archive (ZIP built in PHP) no longer follows links to folders inside the selection, like the other archive writers
+
+### Fixed
+
+- Ctrl / Shift / Cmd + click on a folder name opened the folder instead of only adding it to the selection (and on an image name, Alt / Cmd + click opened the viewer). A click with any of these keys now only changes the selection; a plain click still opens. On a Mac, Cmd+click now adds a row to the selection like Ctrl+click
+- Sidebar folder tree: opening a deep folder whose subfolders were not loaded yet closed every folder you had opened (the tree folded back to the current folder), so the folder you just opened was hidden. The opened folders now stay open
+
 ## [1.8.2] - 2026-11-07
 
 ### Changed

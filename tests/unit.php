@@ -481,8 +481,9 @@ check('fm_lists refused: not JSON, bad key, nested values',
     && fmUnpackPostLists(['fm_lists' => json_encode(['names' => [['nested']]])]) === null
     && fmUnpackPostLists(['fm_lists' => json_encode(['names' => 'text'])]) === null);
 
-check('Get info types: most files first, ties by name, no extension as ""',
-    fmInfoTypes(['txt' => 3, 'jpg' => 5, '' => 1, 'png' => 3]) === [['jpg', 5], ['png', 3], ['txt', 3], ['', 1]]);
+check('Get info types: most files first, ties by name, no extension as "", size per type',
+    fmInfoTypes(['txt' => 3, 'jpg' => 5, '' => 1, 'png' => 3], ['jpg' => 500, 'txt' => 30])
+        === [['jpg', 5, 500], ['png', 3, 0], ['txt', 3, 30], ['', 1, 0]]);
 
 section('Progress of OS commands');
 $osLines = [
@@ -530,6 +531,42 @@ check('relative path from search results', fmRequestItemName('docs/a.txt') === '
 check('.. refused', fmRequestItemName('docs/../x') === null);
 check('empty segment refused', fmRequestItemName('docs//a') === null && fmRequestItemName('/a') === null);
 check('backslash and colon refused', fmRequestItemName('a\\b') === null && fmRequestItemName('c:x') === null);
+
+section('Archive filter rules');
+$rules = static function (string $inc, string $exc, bool $re = false): ?array {
+    $r = fmPathRulesParse($inc, $exc, $re);
+    return $r['ok'] ? $r['rules'] : null;
+};
+$keep = static fn(?array $r, string $rel, bool $dir = false): bool => $r !== null && fmPathRulesMatch($r, $rel, $dir);
+check('no rules = null (no filter)', fmPathRulesParse(" \n# note\n", '', false) === ['ok' => true, 'rules' => null]);
+$r = $rules('', "*.log, node_modules/\nThumbs.db");
+check('mask without "/" matches the name at any depth', !$keep($r, 'a.log') && !$keep($r, 'site/logs/x.LOG') && $keep($r, 'site/a.txt'));
+check('"name/" = that folder and everything in it', !$keep($r, 'app/node_modules', true) && !$keep($r, 'app/node_modules/x/y.js') && $keep($r, 'app/node_modules.txt'));
+check('commas and new lines both separate rules', !$keep($r, 'pics/Thumbs.db'));
+$r = $rules('', "/build/\nsrc/*.tmp");
+check('"/" in front ties it to the top', !$keep($r, 'build/a.js') && $keep($r, 'site/build/a.js'));
+check('mask with "/" matches the path from the top', !$keep($r, 'src/x.tmp') && $keep($r, 'src/deep/x.tmp') && $keep($r, 'other/src/x.tmp'));
+$r = $rules('', 'src/**/*.map');
+check('"**" spans folders (also none)', !$keep($r, 'src/a.map') && !$keep($r, 'src/a/b/c.map') && $keep($r, 'lib/a.map'));
+$r = $rules('', 'file?.txt');
+check('"?" is one character', !$keep($r, 'file1.txt') && $keep($r, 'file10.txt'));
+$r = $rules('*.txt', '');
+check('Include keeps only matching files', $keep($r, 'a/b.txt') && !$keep($r, 'a/b.jpg') && !$keep($r, 'a', true));
+$r = $rules('docs/', 'docs/private/');
+check('Include of a folder keeps all in it; exclude wins', $keep($r, 'docs/a.jpg') && $keep($r, 'docs/empty', true) && !$keep($r, 'docs/private/x.txt'));
+$f = fmPathRulesFilterEntries($rules('*.txt', ''), [
+    ['name' => 'a', 'kind' => 'dir'], ['name' => 'a/x.txt', 'kind' => 'file'], ['name' => 'a/y.jpg', 'kind' => 'file'],
+    ['name' => 'empty', 'kind' => 'dir'], ['name' => 'b', 'kind' => 'dir'], ['name' => 'b/c', 'kind' => 'dir'], ['name' => 'b/c/z.txt', 'kind' => 'file'],
+]);
+check('entry list: folders kept only on the way to kept files',
+    array_column($f['kept'], 'name') === ['a', 'a/x.txt', 'b', 'b/c', 'b/c/z.txt'] && $f['skipped'] === ['a/y.jpg', 'empty'], json_encode($f));
+$r = $rules('', '^cache/' . "\n" . '\.(bak|old)$', true);
+check('regex mode: path with "/" after folders', !$keep($r, 'cache', true) && !$keep($r, 'cache/a.txt') && !$keep($r, 'x/y.BAK') && $keep($r, 'x/cache/a.txt'));
+$bad = fmPathRulesParse('', "ok\n(unclosed", true);
+check('regex mode: a bad pattern names its line', !$bad['ok'] && strpos($bad['msg'], 'Exclude, line 2') === 0, json_encode($bad));
+check('regex mode: commas are part of the pattern', $keep($rules('^a{1,2}\.txt$', '', true), 'aa.txt'));
+check('at most 100 rules', !fmPathRulesParse('', implode(',', array_fill(0, 101, '*.x')), false)['ok']);
+check('at most 4 KB per field', !fmPathRulesParse(str_repeat('a', 4097), '', false)['ok']);
 
 if ($haveSearchLink) {
     rmTree($sr . '/link-out');

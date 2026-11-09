@@ -399,6 +399,104 @@ try {
     check('.fm-state is not listed at the root', strpos($body, '.fm-state') === false, substr($body, 0, 300));
     @rmdir($dirA . '/.fm-state');
 
+    section('Archive filter (include / exclude)');
+    $zipNames = static function (string $file): array {
+        $z = new ZipArchive();
+        if ($z->open($file) !== true) return ['(not a zip)'];
+        $out = [];
+        for ($i = 0; $i < $z->numFiles; $i++) $out[] = $z->getNameIndex($i);
+        $z->close();
+        sort($out);
+        return $out;
+    };
+    $tarFiles = static function (string $file): array {
+        $out = [];
+        try {
+            foreach (new RecursiveIteratorIterator(new PharData($file)) as $f) {
+                $out[] = str_replace('\\', '/', substr($f->getPathname(), strpos($f->getPathname(), basename($file)) + strlen(basename($file)) + 1));
+            }
+        } catch (Throwable $e) {
+            $out = [$e->getMessage()];
+        }
+        sort($out);
+        return $out;
+    };
+    $makeTree = static function (string $root): void {
+        mkdir($root . '/flt/site/node_modules/x', 0775, true);
+        mkdir($root . '/flt/site/docs');
+        mkdir($root . '/flt/site/empty');
+        file_put_contents($root . '/flt/site/index.php', '<?php');
+        file_put_contents($root . '/flt/site/app.log', 'log');
+        file_put_contents($root . '/flt/site/node_modules/x/y.js', 'js');
+        file_put_contents($root . '/flt/site/docs/readme.txt', 'readme');
+        file_put_contents($root . '/flt/notes.txt', 'notes');
+    };
+    $makeTree($dirA);
+    $excludeZip = ['site/', 'site/docs/', 'site/docs/readme.txt', 'site/empty/', 'site/index.php', 'notes.txt'];
+    sort($excludeZip);
+    [, $body] = $br->post($u('a'), ['action' => 'compress', 'in' => 'flt', 'names[]' => ['site', 'notes.txt'], 'archive_name' => 'ex', 'archive_type' => 'zip',
+        'rules_exclude' => "*.log, node_modules/", 'rules_regex' => '0']);
+    $flLines = $ndjson($body); $last = end($flLines) ?: [];
+    check('Archive ZIP: excluded files and folders are left out, the rest is kept (also empty folders)',
+        $zipNames($dirA . '/flt/ex.zip') === $excludeZip && ($last['filtered'] ?? 0) === 2, json_encode($zipNames($dirA . '/flt/ex.zip')) . ' ' . $body);
+    [, $body] = $br->post($u('a'), ['action' => 'get-files-and-folders-count', 'in' => 'flt', 'names[]' => ['site', 'notes.txt'], 'rules_include' => '*.txt']);
+    check('count with a filter: only the files that will be added', strpos($body, '"files":2') !== false && strpos($body, '"total":2') !== false, $body);
+    [, $body] = $br->post($u('a'), ['action' => 'compress', 'in' => 'flt', 'names[]' => ['site', 'notes.txt'], 'archive_name' => 'inc', 'archive_type' => 'gzip',
+        'rules_include' => '*.txt']);
+    check('Archive TAR.GZ: Include keeps only matching files', $tarFiles($dirA . '/flt/inc.tar.gz') === ['notes.txt', 'site/docs/readme.txt'], json_encode($tarFiles($dirA . '/flt/inc.tar.gz')) . ' ' . $body);
+    [, $body] = $br->post($u('a'), ['action' => 'compress', 'in' => 'flt', 'names[]' => 'site', 'archive_name' => 'none', 'archive_type' => 'zip', 'rules_include' => '*.exe']);
+    check('Archive: nothing matches = error, no archive', strpos($body, 'Nothing matches the filter') !== false && !file_exists($dirA . '/flt/none.zip'), $body);
+    [, $body] = $br->post($u('a'), ['action' => 'compress', 'in' => 'flt', 'names[]' => 'site', 'archive_name' => 'bad', 'archive_type' => 'zip',
+        'rules_exclude' => '(unclosed', 'rules_regex' => '1']);
+    check('Archive: a bad regular expression is refused before anything is written', strpos($body, 'Filter: Exclude, line 1') !== false && !file_exists($dirA . '/flt/bad.zip'), $body);
+    [, $body] = $br->post($u('a'), ['action' => 'archive-filter-preview', 'mode' => 'selection', 'in' => 'flt', 'names[]' => 'site', 'rules_exclude' => '[', 'rules_regex' => '1', 'validate_only' => '1']);
+    check('rules check before the job names the bad line', strpos($body, '"error"') !== false && strpos($body, 'line 1') !== false, $body);
+    [, $body] = $br->post($u('a'), ['action' => 'archive-filter-preview', 'mode' => 'selection', 'in' => 'flt', 'names[]' => ['site', 'notes.txt'], 'rules_exclude' => "*.log\nnode_modules/"]);
+    $pv = json_decode($body, true) ?: [];
+    check('Check (selection): kept and skipped counts, size and names', ($pv['kept'] ?? 0) === 6 && ($pv['skipped'] ?? 0) === 2 && ($pv['kept_size'] ?? 0) === 16
+        && in_array('site/node_modules/', $pv['skipped_names'] ?? [], true), $body);
+    [, $body] = $br->post($u('a'), ['action' => 'download-archive', 'in' => 'flt', 'names[]' => ['site', 'notes.txt'], 'archive_name' => 'dl', 'archive_type' => 'zip',
+        'rules_exclude' => 'docs/, *.log, node_modules/']);
+    file_put_contents($dirA . '/flt/dl-got.zip', $body);
+    check('Download as archive: the filter applies to the streamed ZIP',
+        $zipNames($dirA . '/flt/dl-got.zip') === ['notes.txt', 'site/', 'site/empty/', 'site/index.php'], json_encode($zipNames($dirA . '/flt/dl-got.zip')));
+    $zip = new ZipArchive();
+    $zip->open($dirA . '/flt/pack.zip', ZipArchive::CREATE);
+    foreach (['p/a.txt', 'p/b.log', 'p/sub/c.txt', 'p/sub/d.jpg'] as $e) {
+        $zip->addFromString($e, $e);
+    }
+    $zip->close();
+    [, $body] = $br->post($u('a'), ['action' => 'archive-filter-preview', 'mode' => 'archive', 'in' => 'flt', 'names[]' => 'pack.zip', 'rules_include' => '*.txt']);
+    $pv = json_decode($body, true) ?: [];
+    check('Check (archive): entries kept and skipped', ($pv['kept'] ?? 0) === 2 && ($pv['skipped'] ?? 0) === 2, $body);
+    [, $body] = $br->post($u('a'), ['action' => 'extract', 'in' => 'flt', 'names[]' => 'pack.zip', 'separate_folders' => '1', 'rules_include' => '*.txt']);
+    $flLines = $ndjson($body); $last = end($flLines) ?: [];
+    check('Extract: only the matching entries are written', is_file($dirA . '/flt/pack/p/a.txt') && is_file($dirA . '/flt/pack/p/sub/c.txt')
+        && !file_exists($dirA . '/flt/pack/p/b.log') && !file_exists($dirA . '/flt/pack/p/sub/d.jpg') && ($last['filtered'] ?? 0) === 2, $body);
+    rmTree($dirA . '/flt/pack');
+    [, $body] = $br->post($u('a'), ['action' => 'extract', 'in' => 'flt', 'names[]' => 'pack.zip', 'separate_folders' => '1', 'rules_include' => '*.exe']);
+    check('Extract: nothing matches = error, nothing written', strpos($body, 'matches the filter') !== false && !file_exists($dirA . '/flt/pack'), $body);
+    $makeTree($dirB = $www . '/b');
+    $brAuto = new Browser();
+    $brAuto->login($u('b'), 'pass-B-new-67890');
+    [, $body] = $brAuto->post($u('b'), ['action' => 'compress', 'in' => 'flt', 'names[]' => ['site', 'notes.txt'], 'archive_name' => 'ex', 'archive_type' => 'zip',
+        'rules_exclude' => "*.log, node_modules/"]);
+    check('auto mode: a filtered archive is the same as in PHP mode (OS tools not used)', $zipNames($dirB . '/flt/ex.zip') === $excludeZip, json_encode($zipNames($dirB . '/flt/ex.zip')) . ' ' . $body);
+    rmTree($dirB . '/flt');
+    $dirE = installCopy('e', 'pass-E-12345', ["\$FM_FILE_OPS_MODE = 'auto';" => "\$FM_FILE_OPS_MODE = 'os';"]);
+    $makeTree($dirE);
+    $brE = new Browser();
+    $brE->login($u('e'), 'pass-E-12345');
+    [, $body] = $brE->post($u('e'), ['action' => 'compress', 'in' => 'flt', 'names[]' => 'site', 'archive_name' => 'os', 'archive_type' => 'zip', 'rules_exclude' => '*.log']);
+    check('OS-only mode: a filter is refused with the reason', strpos($body, 'file ops mode is OS only') !== false && !file_exists($dirE . '/flt/os.zip'), $body);
+    $zip = new ZipArchive();
+    $zip->open($dirE . '/flt/pack.zip', ZipArchive::CREATE);
+    $zip->addFromString('a.txt', 'a');
+    $zip->close();
+    [, $body] = $brE->post($u('e'), ['action' => 'extract', 'in' => 'flt', 'names[]' => 'pack.zip', 'separate_folders' => '1', 'rules_exclude' => '*.log']);
+    check('OS-only mode: a filtered extract is refused', strpos($body, 'file ops mode is OS only') !== false && !file_exists($dirE . '/flt/pack'), $body);
+    rmTree($dirA . '/flt');
+
     section('Progress of file jobs');
     // Copy A runs in PHP; copy B in auto mode, i.e. OS commands followed line by line where exec() works.
     $brB = new Browser();
@@ -494,11 +592,12 @@ try {
     check('summary: counts, size with folder contents, inside counts, location, outside path not counted',
         ($inf['count'] ?? 0) === 3 && $inf['files'] === 2 && $inf['folders'] === 1 && $inf['size'] === 380
         && $inf['inside_files'] === 2 && $inf['inside_folders'] === 1 && $inf['location'] === 'info' && $inf['missing'] === 1, $body);
-    check('summary: types most common first', ($inf['types'][0] ?? null) === ['txt', 2] && count($inf['types']) === 3, json_encode($inf['types'] ?? null));
+    check('summary: types most common first, with their size', ($inf['types'][0] ?? null) === ['txt', 2, 150] && count($inf['types']) === 3, json_encode($inf['types'] ?? null));
     [, $body] = $br->req($u('a') . '?action=get-info&path=' . rawurlencode($dirA . '/info/sub'));
     $one = json_decode($body, true) ?: [];
     check('Get info of a folder: size and what it holds in one answer (the folder itself not counted)',
         ($one['size'] ?? null) === 80 && ($one['files_count'] ?? null) === 2 && ($one['folders_count'] ?? null) === 1, $body);
+    check('Get info of a folder: file types with count and size', ($one['types'] ?? null) === [['png', 1, 30], ['txt', 1, 50]], json_encode($one['types'] ?? null));
     [, $body] = $br->post($u('a'), ['action' => 'get-info-multi', 'paths[]' => [$dirA . '/info/a.txt', $dirA . '/info/sub/c.txt']]);
     $inf = $infoOf($body);
     check('summary of items from different folders has no single location', ($inf['count'] ?? 0) === 2 && $inf['location'] === null && !empty($inf['modified_min']), $body);
@@ -563,6 +662,16 @@ try {
     check('convert: no temp files left', glob($dirA . '/enc/.fm-conv-*') === [] && glob($dirA . '/enc/deep/.fm-conv-*') === []);
     [, $body] = $br->post($u('a'), ['action' => 'search', 'in' => 'enc', 'encoding' => 'not_utf8']);
     check('Find: encoding filter after the conversion finds nothing', $found($ndjson($body)) === [], $body);
+
+    section('Undo of Move to Trash');
+    file_put_contents($dirA . '/up/undo-me.txt', 'U');
+    [, $body] = $br->post($u('a'), ['action' => 'trash-move', 'in' => 'up', 'names[]' => 'undo-me.txt']);
+    $moved = json_decode($body, true) ?: [];
+    check('Move to Trash answers the trash id of each moved item', ($moved['ok'] ?? null) === ['undo-me.txt'] && count($moved['ids'] ?? []) === 1
+        && !file_exists($dirA . '/up/undo-me.txt'), $body);
+    [, $body] = $br->post($u('a'), ['action' => 'trash-restore', 'ids[]' => $moved['ids'] ?? []]);
+    check('Undo (restore by those ids) puts the item back where it was', @file_get_contents($dirA . '/up/undo-me.txt') === 'U', $body);
+    @unlink($dirA . '/up/undo-me.txt');
 
     section('Random trash folder name');
     file_put_contents($dirA . '/up/to-trash.txt', 'T');

@@ -6,7 +6,7 @@ Manage files directly from your browser — without installing WordPress, Larave
 
 ### One PHP file. No installation. No database.
 
-Current version: **1.8.2** — see [CHANGELOG.md](CHANGELOG.md)
+Current version: **1.9.0** — see [CHANGELOG.md](CHANGELOG.md)
 
 ## Why SoloFileManager?
 
@@ -171,18 +171,21 @@ Current version: **1.8.2** — see [CHANGELOG.md](CHANGELOG.md)
 - Create folder/file, rename, bulk rename (find / replace with optional regular expressions, numbering, case), duplicate
 - Copy / move; drag and drop
 - Long jobs (copy, move, duplicate, delete forever, archive, extract) show one progress window that keeps its size: what is happening now, items done of the total with the percent, the current file and the elapsed time — also when the server uses its own commands (`cp`, `rm`, `unzip`, `tar` on Linux report every file)
-- Delete to Trash or delete forever. Trash works like the Windows Recycle Bin: a flat list showing each item's original name, the folder it came from, deletion date and size, with Restore (back to where it was, renamed to "name (restored)" if that name is taken) and Delete forever; Empty Trash (with confirm); item count on the Trash button, a reminder on Logout, and Server info shows how many items / how much space Trash holds; the `.trash` folder is removed as soon as it is empty
+- Delete to Trash or delete forever. Trash works like the Windows Recycle Bin: a flat list showing each item's original name, the folder it came from, deletion date and size, with Restore (back to where it was, renamed to "name (restored)" if that name is taken) and Delete forever; Empty Trash (with confirm); item count on the Trash button, a reminder on Logout, and Server info shows how many items / how much space Trash holds; the `.trash` folder is removed as soon as it is empty; right after Move to Trash an Undo button (or Ctrl+Z) in the note at the bottom puts the items back
 - Filter the current folder listing by name (search field in the breadcrumb bar)
 - Find in the current folder and all subfolders by name (text, wildcard or regular expression), text inside files of any encoding (Windows-1251, UTF-16… are detected; the matching line is shown), encoding (e.g. everything that is not UTF-8), type, size and modified date; results show where each item is and can be opened, downloaded, copied, moved, deleted, bulk renamed or have their permissions changed; Back returns to the results without searching again. Uses `find` on Linux / macOS when OS file ops are allowed, PHP otherwise
 - Compress / extract archives; big archives show files done and keep going when the hosting drops a long request (the dialog then waits for the result); entries that would land outside the root folder (links, `..`, absolute paths) are skipped and listed
+- Include / exclude filter in Archive, Download as archive and Extract: masks like `.gitignore` (`*.log`, `node_modules/`, `src/**/*.map`, one per line or comma separated) or regular expressions; "Check" shows how many items the filter keeps and skips before the job runs. With a filter the work is done in PHP, so the result is the same on every server
+- Help for masks and regular expressions: "?" next to the fields (Find, Bulk rename, Archive filter, Convert encoding) opens a help popup with the syntax, examples for that place and links to the official docs
 - Change permissions (chmod) for folders and files, including recursive 0755 / 0644 style fixes
-- Convert encoding of text files (selected files, search results, or every text file in a folder with a name mask and "only not UTF-8"): detects BOM, UTF-8, UTF-16 and guesses legacy encodings (Windows-1251, KOI8-R, CP866, Windows-1252, ARMSCII-8), shows the file before and after, converts to UTF-8 or another encoding with optional BOM and LF / CRLF line endings, replacing the file or saving a copy next to it. Needs the `iconv` or `mbstring` PHP extension
+- Convert encoding of text files (selected files, search results, or every text file in a folder with a name mask and "only not UTF-8"): detects BOM, UTF-8, UTF-16 and guesses legacy encodings (Windows-1251, KOI8-R, CP866, Windows-1252, ARMSCII-8), shows the file before and after, converts to UTF-8 or another encoding with optional BOM and LF / CRLF line endings, replacing the file or saving a copy next to it; long lists in pages with a name filter and Check all / none. Needs the `iconv` or `mbstring` PHP extension
 - Upload (large files in parts, with retries on connection problems; asks Replace / Skip / Keep both when names already exist), get info (for several selected items: count, total size with everything inside, file types, modified range, permissions), copy paths
 - Popups can be moved by dragging their title bar (mouse or touch); double-click the title bar to centre a popup again
 - Download files, or folders and multiple items as ZIP / TAR / TAR.GZ — the browser download starts immediately while the archive is built; failures show the real reason
 - Configuration popup (columns, permissions display, folder-size behavior, heavy file-ops mode)
 - Change password from the UI (updates `$PASSWORD_HASH` in the same PHP file when writable)
-- Keyboard shortcuts, server info
+- Keyboard shortcuts (and type-ahead: type the first letters of a name to jump to it), server info
+- Get info for one item, a folder (size, files, folders, file types) or several items (summary with file types); "Details" lists every type with its number of files and size
 - Optional terminal-here (disabled by default — open the terminal icon for Terminal settings: Standard / Manual / Advanced, password to save; gear inside the terminal popup; or edit the `$FM_ENABLE_TERMINAL_*` flags; trusted hosts only)
 
 ## Configuration
@@ -226,7 +229,7 @@ The `tests/` folder is for development only (it is not included in release archi
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). Latest: **1.8.2** — security fix: a copy that was not renamed yet answered file actions without a password; the first run is simpler (rename, then set your password, no login with `admin`).
+See [CHANGELOG.md](CHANGELOG.md). Latest: **1.9.0** — include / exclude filter for Archive, Download as archive and Extract; help for masks and regular expressions; type-ahead in the list; file types in Get info of a folder; Undo after Move to Trash; Convert encoding for any number of files; notes at the bottom centre; fixes for Ctrl / Cmd + click on a folder name and for the sidebar tree folding back.
 
 ## License
 
